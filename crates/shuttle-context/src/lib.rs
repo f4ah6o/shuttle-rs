@@ -15,6 +15,8 @@ pub struct Context {
     pub open_tasks: Vec<Event>,
     pub recent_decisions: Vec<Event>,
     pub related_memories: Vec<Event>,
+    pub recent_messages: Vec<Event>,
+    pub pending_handoffs: Vec<Event>,
     pub inbox: Vec<Event>,
 }
 
@@ -74,6 +76,22 @@ pub async fn assemble_context(
             ..EventFilter::default()
         })
         .await?;
+    let recent_messages = store
+        .list(EventFilter {
+            event_type: Some(EventType::Message),
+            workspace_id: Some(workspace_id.to_owned()),
+            limit: Some(20),
+            ..EventFilter::default()
+        })
+        .await?;
+    let pending_handoffs = store
+        .list(EventFilter {
+            event_type: Some(EventType::Handoff),
+            workspace_id: Some(workspace_id.to_owned()),
+            limit: Some(20),
+            ..EventFilter::default()
+        })
+        .await?;
     let inbox = inbox_events(store, workspace_id, agent).await?;
 
     Ok(Context {
@@ -86,6 +104,8 @@ pub async fn assemble_context(
         open_tasks,
         recent_decisions,
         related_memories,
+        recent_messages,
+        pending_handoffs,
         inbox,
     })
 }

@@ -117,6 +117,8 @@ async fn dashboard(State(runtime): State<AppRuntime>) -> impl IntoResponse {
             open_tasks: Vec::new(),
             recent_decisions: Vec::new(),
             related_memories: Vec::new(),
+            recent_messages: Vec::new(),
+            pending_handoffs: Vec::new(),
             inbox: Vec::new(),
         }),
     })

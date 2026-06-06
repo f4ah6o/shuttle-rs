@@ -14,6 +14,9 @@ pub enum EventType {
     Task,
     Handoff,
     Observation,
+    Pattern,
+    Fact,
+    Bug,
     Artifact,
 }
 
@@ -26,6 +29,9 @@ impl EventType {
             Self::Task => "task",
             Self::Handoff => "handoff",
             Self::Observation => "observation",
+            Self::Pattern => "pattern",
+            Self::Fact => "fact",
+            Self::Bug => "bug",
             Self::Artifact => "artifact",
         }
     }
@@ -42,6 +48,9 @@ impl TryFrom<&str> for EventType {
             "task" => Ok(Self::Task),
             "handoff" => Ok(Self::Handoff),
             "observation" => Ok(Self::Observation),
+            "pattern" => Ok(Self::Pattern),
+            "fact" => Ok(Self::Fact),
+            "bug" => Ok(Self::Bug),
             "artifact" => Ok(Self::Artifact),
             other => Err(ShuttleError::InvalidEventType(other.to_owned())),
         }
@@ -149,6 +158,9 @@ mod tests {
     #[test]
     fn event_type_round_trips_through_string_values() {
         assert_eq!(EventType::try_from("memory").unwrap(), EventType::Memory);
+        assert_eq!(EventType::try_from("pattern").unwrap(), EventType::Pattern);
+        assert_eq!(EventType::Fact.as_str(), "fact");
+        assert_eq!(EventType::Bug.as_str(), "bug");
         assert_eq!(EventType::Message.as_str(), "message");
         assert!(EventType::try_from("unknown").is_err());
     }
