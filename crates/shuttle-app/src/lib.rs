@@ -1,9 +1,10 @@
+use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use axum::extract::State;
-use axum::http::{HeaderValue, StatusCode};
-use axum::response::{Html, IntoResponse};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
@@ -163,22 +164,32 @@ async fn context(State(runtime): State<AppRuntime>) -> impl IntoResponse {
     )
 }
 
-async fn mcp_health() -> impl IntoResponse {
+async fn mcp_health(headers: HeaderMap) -> Response {
+    if !is_mcp_authorized(&headers) {
+        return with_cors(StatusCode::UNAUTHORIZED);
+    }
     with_cors((StatusCode::OK, "Shuttle MCP server"))
 }
 
-async fn mcp_delete() -> impl IntoResponse {
+async fn mcp_delete(headers: HeaderMap) -> Response {
+    if !is_mcp_authorized(&headers) {
+        return with_cors(StatusCode::UNAUTHORIZED);
+    }
     with_cors((StatusCode::OK, "OK"))
 }
 
-async fn mcp_options() -> impl IntoResponse {
+async fn mcp_options() -> Response {
     with_cors(StatusCode::NO_CONTENT)
 }
 
 async fn mcp_post(
+    headers: HeaderMap,
     State(runtime): State<AppRuntime>,
     Json(request): Json<shuttle_mcp::Request>,
-) -> impl IntoResponse {
+) -> Response {
+    if !is_mcp_authorized(&headers) {
+        return with_cors(StatusCode::UNAUTHORIZED);
+    }
     let response = shuttle_mcp::handle_request(
         &shuttle_mcp::McpRuntime {
             store: runtime.store,
@@ -193,7 +204,31 @@ async fn mcp_post(
     with_cors(Json(response))
 }
 
-fn with_cors(response: impl IntoResponse) -> impl IntoResponse {
+fn is_mcp_authorized(headers: &HeaderMap) -> bool {
+    let Some(token) = env::var("SHUTTLE_MCP_BEARER_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
+    else {
+        return true;
+    };
+    let expected = format!("Bearer {token}");
+    headers
+        .get("authorization")
+        .and_then(|header| header.to_str().ok())
+        .is_some_and(|actual| constant_time_eq(actual.as_bytes(), expected.as_bytes()))
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut diff = left.len() ^ right.len();
+    for index in 0..left.len().max(right.len()) {
+        let left = *left.get(index).unwrap_or(&0);
+        let right = *right.get(index).unwrap_or(&0);
+        diff |= (left ^ right) as usize;
+    }
+    diff == 0
+}
+
+fn with_cors(response: impl IntoResponse) -> Response {
     let (mut parts, body) = response.into_response().into_parts();
     parts
         .headers
@@ -204,11 +239,11 @@ fn with_cors(response: impl IntoResponse) -> impl IntoResponse {
     );
     parts.headers.insert(
         "access-control-allow-headers",
-        HeaderValue::from_static("content-type,mcp-session-id"),
+        HeaderValue::from_static("authorization,content-type,mcp-session-id"),
     );
     parts.headers.insert(
         "access-control-expose-headers",
         HeaderValue::from_static("mcp-session-id"),
     );
-    (parts, body)
+    Response::from_parts(parts, body)
 }

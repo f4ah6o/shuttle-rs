@@ -38,11 +38,24 @@ stl handoff done <handoff-id>
 
 ## MCP
 
-When Claude Code is configured with MCP servers, use Shuttle with:
+Start Shuttle's HTTP MCP server from the repository root:
 
 ```bash
-stl mcp serve
+stl app serve --addr 127.0.0.1:8787
 ```
 
-Configure the server to run from the repository root. If MCP configuration is
-not available, use the CLI fallback commands above.
+When Claude Code is configured with MCP servers, use Shuttle with:
+
+```json
+{
+  "mcpServers": {
+    "shuttle": {
+      "url": "http://127.0.0.1:8787/mcp"
+    }
+  }
+}
+```
+
+Set `SHUTTLE_MCP_BEARER_TOKEN` before starting the app server to require
+`Authorization: Bearer <token>` on MCP requests. If MCP configuration is not
+available, use the CLI fallback commands above.

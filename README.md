@@ -62,12 +62,27 @@ stl handoff accept <handoff-id>
 stl handoff done <handoff-id>
 ```
 
-Expose Shuttle over MCP:
+Expose Shuttle over HTTP MCP:
 
 ```bash
-stl mcp serve
 stl app serve --addr 127.0.0.1:8787
 ```
+
+Configure MCP clients to use the `/mcp` endpoint:
+
+```json
+{
+  "mcpServers": {
+    "shuttle": {
+      "url": "http://127.0.0.1:8787/mcp"
+    }
+  }
+}
+```
+
+Set `SHUTTLE_MCP_BEARER_TOKEN` before starting `stl app serve` to require
+`Authorization: Bearer <token>` on MCP requests. When the variable is unset,
+local MCP remains unauthenticated.
 
 Synchronize event logs between Shuttle instances:
 

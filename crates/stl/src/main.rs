@@ -74,10 +74,6 @@ enum Command {
         #[arg(long)]
         branch: bool,
     },
-    Mcp {
-        #[command(subcommand)]
-        command: McpCommand,
-    },
     App {
         #[command(subcommand)]
         command: AppCommand,
@@ -106,11 +102,6 @@ enum MeshCommand {
     Export { path: PathBuf },
     Import { path: PathBuf },
     Sync { peer_database: PathBuf },
-}
-
-#[derive(Debug, Subcommand)]
-enum McpCommand {
-    Serve,
 }
 
 #[derive(Debug, Subcommand)]
@@ -481,18 +472,6 @@ fn main() -> Result<()> {
                 }
             })?;
         }
-        Command::Mcp { command } => match command {
-            McpCommand::Serve => {
-                let store = open_store(&env)?;
-                shuttle_mcp::serve_stdio(shuttle_mcp::McpRuntime {
-                    store,
-                    cwd: env.cwd,
-                    workspace_id: env.workspace_id,
-                    agent: env.agent,
-                    session_id: env.session_id,
-                })?;
-            }
-        },
         Command::App { command } => match command {
             AppCommand::Serve { addr } => {
                 let store = open_store(&env)?;

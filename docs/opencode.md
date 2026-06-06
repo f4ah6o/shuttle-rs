@@ -11,14 +11,28 @@ cargo build
 cargo run -p stl -- init
 ```
 
-Register Shuttle as an MCP server with this command:
+Start Shuttle's HTTP MCP server from the repository root:
 
 ```bash
-stl mcp serve
+stl app serve --addr 127.0.0.1:8787
 ```
 
-Use the repository root as the working directory for the MCP server. That lets
-Shuttle attach repository metadata and store events in `.shuttle/shuttle.db`.
+Register Shuttle as an MCP server with this endpoint:
+
+```json
+{
+  "mcpServers": {
+    "shuttle": {
+      "url": "http://127.0.0.1:8787/mcp"
+    }
+  }
+}
+```
+
+Set `SHUTTLE_MCP_BEARER_TOKEN` before starting the app server to require
+`Authorization: Bearer <token>` on MCP requests. Use the repository root as the
+working directory for the MCP server. That lets Shuttle attach repository
+metadata and store events in `.shuttle/shuttle.db`.
 
 Recommended startup workflow:
 

@@ -1,4 +1,3 @@
-use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -32,32 +31,6 @@ struct Tool {
     description: &'static str,
     #[serde(rename = "inputSchema")]
     input_schema: Value,
-}
-
-pub fn serve_stdio(runtime: McpRuntime) -> Result<()> {
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-
-    for line in stdin.lock().lines() {
-        let line = line.map_err(|err| ShuttleError::Store(err.to_string()))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let response = match serde_json::from_str::<Request>(&line) {
-            Ok(request) => futures_executor::block_on(handle_request(&runtime, request)),
-            Err(err) => json!({
-                "jsonrpc": "2.0",
-                "id": null,
-                "error": { "code": -32700, "message": err.to_string() }
-            }),
-        };
-        writeln!(stdout, "{response}").map_err(|err| ShuttleError::Store(err.to_string()))?;
-        stdout
-            .flush()
-            .map_err(|err| ShuttleError::Store(err.to_string()))?;
-    }
-
-    Ok(())
 }
 
 pub async fn handle_request(runtime: &McpRuntime, request: Request) -> Value {

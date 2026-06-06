@@ -104,15 +104,27 @@ stl history
 
 ## MCP
 
-Start the Shuttle MCP server over stdio:
+Start the Shuttle HTTP MCP server:
 
 ```bash
-stl mcp serve
+stl app serve --addr 127.0.0.1:8787
 ```
 
-Use this command as the server command in MCP-compatible coding agents. The MCP
-server exposes memory, recall, messages, context, task, handoff, and repository
-tools with stable machine-readable responses.
+Configure MCP-compatible coding agents with the HTTP endpoint:
+
+```json
+{
+  "mcpServers": {
+    "shuttle": {
+      "url": "http://127.0.0.1:8787/mcp"
+    }
+  }
+}
+```
+
+Set `SHUTTLE_MCP_BEARER_TOKEN` before starting the app server to require
+`Authorization: Bearer <token>` on MCP requests. When unset, local MCP remains
+unauthenticated.
 
 ## Mesh Sync
 
