@@ -6,7 +6,7 @@ use std::process::Command as ProcessCommand;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use futures_executor::block_on;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -37,9 +37,23 @@ enum Command {
     },
     Recall {
         query: String,
+        #[arg(long = "type")]
+        kind: Option<MemoryKindArg>,
     },
     Memories,
     Decide {
+        content: String,
+    },
+    Observe {
+        content: String,
+    },
+    Pattern {
+        content: String,
+    },
+    Fact {
+        content: String,
+    },
+    Bug {
         content: String,
     },
     Task {
@@ -50,7 +64,12 @@ enum Command {
         agent: String,
         content: String,
     },
-    Context,
+    Context {
+        #[arg(long)]
+        repo: bool,
+        #[arg(long)]
+        branch: bool,
+    },
     Mcp {
         #[command(subcommand)]
         command: McpCommand,
@@ -79,6 +98,31 @@ enum AppCommand {
         #[arg(long, default_value = "127.0.0.1:8787")]
         addr: SocketAddr,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum MemoryKindArg {
+    Memory,
+    Decision,
+    Observation,
+    Pattern,
+    Fact,
+    Bug,
+    Handoff,
+}
+
+impl MemoryKindArg {
+    fn event_type(self) -> EventType {
+        match self {
+            Self::Memory => EventType::Memory,
+            Self::Decision => EventType::Decision,
+            Self::Observation => EventType::Observation,
+            Self::Pattern => EventType::Pattern,
+            Self::Fact => EventType::Fact,
+            Self::Bug => EventType::Bug,
+            Self::Handoff => EventType::Handoff,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -142,10 +186,20 @@ fn main() -> Result<()> {
                 format!("remembered: {}", event.content)
             })?;
         }
-        Command::Recall { query } => {
+        Command::Recall { query, kind } => {
             let store = open_store(&env)?;
-            let events = block_on(shuttle_memory::recall(&store, &query))?;
-            output_events(cli.json, &events, "recall")?;
+            let status = shuttle_context::repo_status(&env.cwd).ok();
+            let repo_id = status.as_ref().map(shuttle_context::repo_id);
+            let branch = status.as_ref().map(|status| status.branch.as_str());
+            let results = block_on(shuttle_memory::ranked_recall(
+                &store,
+                &query,
+                kind.map(MemoryKindArg::event_type),
+                Some(&env.workspace_id),
+                repo_id.as_deref(),
+                branch,
+            ))?;
+            output_recall(cli.json, &results)?;
         }
         Command::Memories => {
             let store = open_store(&env)?;
@@ -154,28 +208,34 @@ fn main() -> Result<()> {
         }
         Command::Decide { content } => {
             let store = open_store(&env)?;
-            let event = with_repo_metadata(
-                Event::new(NewEvent {
-                    event_type: EventType::Decision,
-                    workspace_id: env.workspace_id.clone(),
-                    repo_id: None,
-                    repo_path: None,
-                    git_remote: None,
-                    bit_repo_id: None,
-                    branch: None,
-                    commit: None,
-                    repo_dirty: None,
-                    agent: env.agent.clone(),
-                    session_id: env.session_id.clone(),
-                    title: Some("decision".to_owned()),
-                    content,
-                    tags: Vec::new(),
-                    metadata_json: json!({}),
-                }),
-                &env,
-            );
-            let event = block_on(store.append(event))?;
+            let event = append_typed_memory(&store, &env, EventType::Decision, content)?;
             output(cli.json, &event, || format!("decided: {}", event.content))?;
+        }
+        Command::Observe { content } => {
+            let store = open_store(&env)?;
+            let event = append_typed_memory(&store, &env, EventType::Observation, content)?;
+            output(cli.json, &event, || format!("observed: {}", event.content))?;
+        }
+        Command::Pattern { content } => {
+            let store = open_store(&env)?;
+            let event = append_typed_memory(&store, &env, EventType::Pattern, content)?;
+            output(cli.json, &event, || {
+                format!("recorded pattern: {}", event.content)
+            })?;
+        }
+        Command::Fact { content } => {
+            let store = open_store(&env)?;
+            let event = append_typed_memory(&store, &env, EventType::Fact, content)?;
+            output(cli.json, &event, || {
+                format!("recorded fact: {}", event.content)
+            })?;
+        }
+        Command::Bug { content } => {
+            let store = open_store(&env)?;
+            let event = append_typed_memory(&store, &env, EventType::Bug, content)?;
+            output(cli.json, &event, || {
+                format!("recorded bug: {}", event.content)
+            })?;
         }
         Command::Task { command } => {
             let store = open_store(&env)?;
@@ -239,7 +299,10 @@ fn main() -> Result<()> {
                 format!("handed off to {agent}: {}", event.content)
             })?;
         }
-        Command::Context => {
+        Command::Context { repo, branch } => {
+            if repo && branch {
+                anyhow::bail!("--repo and --branch cannot be used together");
+            }
             let store = open_store(&env)?;
             let context = block_on(shuttle_context::assemble_context(
                 &store,
@@ -247,7 +310,15 @@ fn main() -> Result<()> {
                 &env.workspace_id,
                 &env.agent,
             ))?;
-            output(cli.json, &context, || format_context(&context))?;
+            output(cli.json, &context, || {
+                if repo {
+                    context.repo.clone()
+                } else if branch {
+                    context.branch.clone()
+                } else {
+                    format_context(&context)
+                }
+            })?;
         }
         Command::Mcp { command } => match command {
             McpCommand::Serve => {
@@ -391,6 +462,25 @@ fn open_store(env: &RuntimeEnv) -> Result<SqliteEventStore> {
         .with_context(|| format!("failed to open {}", env.database_path.display()))
 }
 
+fn append_typed_memory(
+    store: &SqliteEventStore,
+    env: &RuntimeEnv,
+    event_type: EventType,
+    content: String,
+) -> Result<Event> {
+    let event = with_repo_metadata(
+        shuttle_memory::new_typed_memory(
+            event_type,
+            env.workspace_id.clone(),
+            env.agent.clone(),
+            env.session_id.clone(),
+            content,
+        ),
+        env,
+    );
+    Ok(block_on(store.append(event))?)
+}
+
 fn with_repo_metadata(mut event: Event, env: &RuntimeEnv) -> Event {
     if let Ok(status) = shuttle_context::repo_status(&env.cwd) {
         let repo_id = shuttle_context::repo_id(&status);
@@ -430,6 +520,8 @@ fn format_context(context: &shuttle_context::Context) -> String {
     push_event_section(&mut output, "Open Tasks", &context.open_tasks);
     push_event_section(&mut output, "Recent Decisions", &context.recent_decisions);
     push_event_section(&mut output, "Related Memories", &context.related_memories);
+    push_event_section(&mut output, "Recent Messages", &context.recent_messages);
+    push_event_section(&mut output, "Pending Handoffs", &context.pending_handoffs);
     push_event_section(&mut output, "Inbox", &context.inbox);
     output.trim_end().to_owned()
 }
@@ -479,6 +571,41 @@ fn output_events(json: bool, events: &[Event], label: &str) -> Result<()> {
             event.created_at.format("%Y-%m-%d %H:%M:%S UTC"),
             title,
             event.content
+        );
+    }
+
+    Ok(())
+}
+
+fn output_recall(json: bool, results: &[shuttle_memory::RecallResult]) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(results)?);
+        return Ok(());
+    }
+
+    if results.is_empty() {
+        println!("no recall");
+        return Ok(());
+    }
+
+    for result in results {
+        let title = result
+            .event
+            .title
+            .as_deref()
+            .unwrap_or(result.event.event_type.as_str());
+        let reasons = if result.reasons.is_empty() {
+            "no ranking signals".to_owned()
+        } else {
+            result.reasons.join(", ")
+        };
+        println!(
+            "- [{}] {}: {} (score {}, {})",
+            result.event.created_at.format("%Y-%m-%d %H:%M:%S UTC"),
+            title,
+            result.event.content,
+            result.score,
+            reasons
         );
     }
 
