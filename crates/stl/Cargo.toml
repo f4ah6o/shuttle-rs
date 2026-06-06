@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 clap.workspace = true
 futures-executor.workspace = true
 serde.workspace = true
@@ -25,3 +26,6 @@ shuttle-store = { path = "../shuttle-store" }
 shuttle-task = { path = "../shuttle-task" }
 tokio.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

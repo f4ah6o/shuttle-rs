@@ -6,5 +6,6 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+serde_json.workspace = true
 shuttle-core = { path = "../shuttle-core" }
 uuid.workspace = true

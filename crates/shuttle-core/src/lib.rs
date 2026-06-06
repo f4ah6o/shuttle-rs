@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -63,6 +64,7 @@ pub struct Event {
     pub title: Option<String>,
     pub content: String,
     pub tags: Vec<String>,
+    pub metadata_json: Value,
     pub created_at: DateTime<Utc>,
 }
 
@@ -83,6 +85,7 @@ impl Event {
             title: input.title,
             content: input.content,
             tags: input.tags,
+            metadata_json: input.metadata_json,
             created_at: Utc::now(),
         }
     }
@@ -103,13 +106,15 @@ pub struct NewEvent {
     pub title: Option<String>,
     pub content: String,
     pub tags: Vec<String>,
+    pub metadata_json: Value,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct EventFilter {
     pub event_type: Option<EventType>,
     pub workspace_id: Option<String>,
     pub agent: Option<String>,
+    pub recipient: Option<String>,
     pub tag: Option<String>,
     pub query: Option<String>,
     pub limit: Option<u32>,

@@ -1,12 +1,15 @@
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use futures_executor::block_on;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 use shuttle_core::{Event, EventStore, EventType, NewEvent};
 use shuttle_store::SqliteEventStore;
 use uuid::Uuid;
@@ -166,6 +169,7 @@ fn main() -> Result<()> {
                     title: Some("decision".to_owned()),
                     content,
                     tags: Vec::new(),
+                    metadata_json: json!({}),
                 }),
                 &env,
             );
@@ -223,7 +227,8 @@ fn main() -> Result<()> {
                     session_id: env.session_id.clone(),
                     title: Some("handoff".to_owned()),
                     content,
-                    tags: vec![shuttle_message::recipient_tag(&agent)],
+                    tags: Vec::new(),
+                    metadata_json: json!({ "to": agent }),
                 }),
                 &env,
             );
@@ -240,12 +245,7 @@ fn main() -> Result<()> {
                 &env.workspace_id,
                 &env.agent,
             ))?;
-            output(cli.json, &context, || {
-                format!(
-                    "{} {} {} dirty={}",
-                    context.repo, context.branch, context.commit, context.dirty
-                )
-            })?;
+            output(cli.json, &context, || format_context(&context))?;
         }
         Command::Mcp { command } => match command {
             McpCommand::Serve => {
@@ -293,16 +293,12 @@ struct RuntimeEnv {
 impl RuntimeEnv {
     fn load() -> Result<Self> {
         let cwd = env::current_dir().context("failed to read current directory")?;
-        let shuttle_dir = cwd.join(".shuttle");
+        let root = repo_root(&cwd).unwrap_or_else(|| cwd.clone());
+        let shuttle_dir = root.join(".shuttle");
         let database_path = shuttle_dir.join("shuttle.db");
-        let workspace_id = cwd
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("workspace")
-            .to_owned();
+        let workspace_id = load_or_create_workspace_id(&shuttle_dir, &root)?;
         let agent = env::var("SHUTTLE_AGENT").unwrap_or_else(|_| "unknown".to_owned());
-        let session_id =
-            env::var("SHUTTLE_SESSION_ID").unwrap_or_else(|_| Uuid::new_v4().to_string());
+        let session_id = load_or_create_session_id(&shuttle_dir)?;
 
         Ok(Self {
             cwd,
@@ -315,9 +311,74 @@ impl RuntimeEnv {
     }
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct WorkspaceFile {
+    workspace_id: String,
+    repo_path: String,
+    created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Serialize)]
 struct InitOutput {
     database: String,
+}
+
+fn repo_root(cwd: &Path) -> Option<PathBuf> {
+    let output = ProcessCommand::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if root.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(root))
+    }
+}
+
+fn load_or_create_workspace_id(shuttle_dir: &Path, root: &Path) -> Result<String> {
+    let path = shuttle_dir.join("workspace.json");
+    if let Ok(contents) = fs::read_to_string(&path) {
+        let workspace: WorkspaceFile = serde_json::from_str(&contents)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        return Ok(workspace.workspace_id);
+    }
+
+    fs::create_dir_all(shuttle_dir)
+        .with_context(|| format!("failed to create {}", shuttle_dir.display()))?;
+    let workspace = WorkspaceFile {
+        workspace_id: Uuid::new_v4().to_string(),
+        repo_path: root.display().to_string(),
+        created_at: Utc::now(),
+    };
+    fs::write(&path, serde_json::to_string_pretty(&workspace)?)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(workspace.workspace_id)
+}
+
+fn load_or_create_session_id(shuttle_dir: &Path) -> Result<String> {
+    if let Ok(session_id) = env::var("SHUTTLE_SESSION_ID") {
+        return Ok(session_id);
+    }
+
+    let path = shuttle_dir.join("session");
+    if let Ok(contents) = fs::read_to_string(&path) {
+        let session_id = contents.trim();
+        if !session_id.is_empty() {
+            return Ok(session_id.to_owned());
+        }
+    }
+
+    fs::create_dir_all(shuttle_dir)
+        .with_context(|| format!("failed to create {}", shuttle_dir.display()))?;
+    let session_id = Uuid::new_v4().to_string();
+    fs::write(&path, format!("{session_id}\n"))
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(session_id)
 }
 
 fn open_store(env: &RuntimeEnv) -> Result<SqliteEventStore> {
@@ -335,6 +396,32 @@ fn with_repo_metadata(mut event: Event, env: &RuntimeEnv) -> Event {
         event.commit = Some(status.commit);
     }
     event
+}
+
+fn format_context(context: &shuttle_context::Context) -> String {
+    let mut output = format!(
+        "Repository\n- path: {}\n- branch: {}\n- commit: {}\n- dirty: {}\n\n",
+        context.repo, context.branch, context.commit, context.dirty
+    );
+    push_event_section(&mut output, "Open Tasks", &context.open_tasks);
+    push_event_section(&mut output, "Recent Decisions", &context.recent_decisions);
+    push_event_section(&mut output, "Related Memories", &context.related_memories);
+    push_event_section(&mut output, "Inbox", &context.inbox);
+    output.trim_end().to_owned()
+}
+
+fn push_event_section(output: &mut String, title: &str, events: &[Event]) {
+    output.push_str(title);
+    output.push('\n');
+    if events.is_empty() {
+        output.push_str("- none\n\n");
+        return;
+    }
+    for event in events {
+        let title = event.title.as_deref().unwrap_or(event.event_type.as_str());
+        output.push_str(&format!("- {}: {}\n", title, event.content));
+    }
+    output.push('\n');
 }
 
 fn output<T, F>(json: bool, value: &T, text: F) -> Result<()>
@@ -372,4 +459,73 @@ fn output_events(json: bool, events: &[Event], label: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    #[test]
+    fn workspace_id_is_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let shuttle_dir = dir.path().join(".shuttle");
+
+        let first = load_or_create_workspace_id(&shuttle_dir, dir.path()).unwrap();
+        let second = load_or_create_workspace_id(&shuttle_dir, dir.path()).unwrap();
+
+        assert_eq!(first, second);
+        assert!(shuttle_dir.join("workspace.json").exists());
+    }
+
+    #[test]
+    fn session_id_is_persisted_without_env_override() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let shuttle_dir = dir.path().join(".shuttle");
+
+        env::remove_var("SHUTTLE_SESSION_ID");
+        let first = load_or_create_session_id(&shuttle_dir).unwrap();
+        let second = load_or_create_session_id(&shuttle_dir).unwrap();
+
+        assert_eq!(first, second);
+        assert!(shuttle_dir.join("session").exists());
+    }
+
+    #[test]
+    fn session_env_overrides_persisted_value() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let shuttle_dir = dir.path().join(".shuttle");
+        fs::create_dir_all(&shuttle_dir).unwrap();
+        fs::write(shuttle_dir.join("session"), "persisted\n").unwrap();
+
+        env::set_var("SHUTTLE_SESSION_ID", "override");
+        let session_id = load_or_create_session_id(&shuttle_dir).unwrap();
+        env::remove_var("SHUTTLE_SESSION_ID");
+
+        assert_eq!(session_id, "override");
+    }
+
+    #[test]
+    fn repo_root_is_stable_from_nested_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        ProcessCommand::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let nested = dir.path().join("crates/example");
+        fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(
+            repo_root(&nested).unwrap().canonicalize().unwrap(),
+            dir.path().canonicalize().unwrap()
+        );
+    }
 }
