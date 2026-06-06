@@ -16,6 +16,7 @@ pub struct AppRuntime {
     pub cwd: PathBuf,
     pub workspace_id: String,
     pub agent: String,
+    pub session_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -93,7 +94,9 @@ async fn dashboard(State(runtime): State<AppRuntime>) -> impl IntoResponse {
         inbox: shuttle_message::inbox(&runtime.store, &runtime.agent)
             .await
             .unwrap_or_default(),
-        tasks: shuttle_task::list(&runtime.store).await.unwrap_or_default(),
+        tasks: shuttle_task::open_tasks(&runtime.store, &runtime.workspace_id, Some(20))
+            .await
+            .unwrap_or_default(),
         memories: shuttle_memory::memories(&runtime.store)
             .await
             .unwrap_or_default(),
@@ -128,7 +131,11 @@ async fn inbox(State(runtime): State<AppRuntime>) -> impl IntoResponse {
 }
 
 async fn tasks(State(runtime): State<AppRuntime>) -> impl IntoResponse {
-    Json(shuttle_task::list(&runtime.store).await.unwrap_or_default())
+    Json(
+        shuttle_task::open_tasks(&runtime.store, &runtime.workspace_id, Some(20))
+            .await
+            .unwrap_or_default(),
+    )
 }
 
 async fn memories(State(runtime): State<AppRuntime>) -> impl IntoResponse {
@@ -174,7 +181,7 @@ async fn mcp_post(
             cwd: runtime.cwd,
             workspace_id: runtime.workspace_id,
             agent: runtime.agent,
-            session_id: "http".to_owned(),
+            session_id: runtime.session_id,
         },
         request,
     )

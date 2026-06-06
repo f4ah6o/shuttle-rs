@@ -829,8 +829,11 @@ dependencies = [
 name = "shuttle-context"
 version = "0.1.0"
 dependencies = [
+ "futures-executor",
  "serde",
  "shuttle-core",
+ "shuttle-store",
+ "shuttle-task",
  "tempfile",
 ]
 
@@ -901,8 +904,11 @@ dependencies = [
 name = "shuttle-task"
 version = "0.1.0"
 dependencies = [
+ "futures-executor",
  "serde_json",
  "shuttle-core",
+ "shuttle-store",
+ "tempfile",
  "uuid",
 ]
 
