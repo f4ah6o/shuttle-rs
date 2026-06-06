@@ -41,14 +41,28 @@ stl handoff request opencode "Please review the latest diff"
 
 ## MCP
 
+Start Shuttle's HTTP MCP server from the repository root:
+
+```bash
+stl app serve --addr 127.0.0.1:8787
+```
+
 If the Codex environment supports MCP server configuration, register Shuttle
 with:
 
-```bash
-stl mcp serve
+```json
+{
+  "mcpServers": {
+    "shuttle": {
+      "url": "http://127.0.0.1:8787/mcp"
+    }
+  }
+}
 ```
 
-Run the MCP server from the repository root so context, recall, task, handoff,
-message, and repo tools use the same local `.shuttle/shuttle.db`.
+Set `SHUTTLE_MCP_BEARER_TOKEN` before starting the app server to require
+`Authorization: Bearer <token>` on MCP requests. Run the MCP server from the
+repository root so context, recall, task, handoff, message, and repo tools use
+the same local `.shuttle/shuttle.db`.
 
 If MCP is unavailable, use the CLI workflow directly.
