@@ -40,6 +40,31 @@ stl context --branch
 stl --json context
 ```
 
+Coordinate tasks and handoffs:
+
+```bash
+stl task create "Implement stl context"
+stl task list
+stl task claim <task-id>
+stl task update <task-id> "Narrowed the implementation"
+stl task done <task-id>
+
+stl handoff request claude "Please continue this branch"
+stl handoff list
+stl handoff accept <handoff-id>
+stl handoff done <handoff-id>
+```
+
+Expose Shuttle over MCP:
+
+```bash
+stl mcp serve
+stl app serve --addr 127.0.0.1:8787
+```
+
 When commands run inside a Git repository, Shuttle attaches repository metadata
 to captured events: repository path, remote-derived repository id when present,
 branch, commit, dirty status, and dirty file names.
+
+Task and handoff state is projected from append-only events. No separate task
+table is required, and JSON output remains suitable for MCP clients.
