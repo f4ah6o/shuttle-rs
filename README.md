@@ -4,6 +4,13 @@
 context, and coordination. The `stl` CLI stores data in `.shuttle/shuttle.db`
 under the current Git repository.
 
+## Agent Onboarding
+
+Use [AGENTS.md](./AGENTS.md) as the canonical workflow guide for coding agents.
+Tool-specific setup paths are available for [opencode](./docs/opencode.md),
+[Claude Code](./docs/claude-code.md), and [Codex](./docs/codex.md). Claude Code
+can also use [CLAUDE.md](./CLAUDE.md) as its conventional entrypoint.
+
 ## Phase 1 Commands
 
 Initialize local storage:
