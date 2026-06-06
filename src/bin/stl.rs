@@ -2,7 +2,7 @@ use std::env;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
+use std::process::{Child, Command as ProcessCommand};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -109,6 +109,18 @@ enum AppCommand {
     Serve {
         #[arg(long, default_value = "127.0.0.1:8787")]
         addr: SocketAddr,
+        #[arg(long)]
+        public_url: Option<String>,
+    },
+    Tunnel {
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        addr: SocketAddr,
+        #[arg(long)]
+        public_url: String,
+        #[arg(long, default_value = "CLOUDFLARE_TUNNEL_TOKEN")]
+        cloudflare_token_env: String,
+        #[arg(long, default_value = "cloudflared")]
+        cloudflared: PathBuf,
     },
 }
 
@@ -476,9 +488,10 @@ fn main() -> Result<()> {
             })?;
         }
         Command::App { command } => match command {
-            AppCommand::Serve { addr } => {
+            AppCommand::Serve { addr, public_url } => {
                 let store = open_store(&env)?;
                 println!("serving shuttle app at http://{addr}");
+                let oauth = app_oauth(&env, public_url)?;
                 let runtime = tokio::runtime::Runtime::new()?;
                 runtime.block_on(shuttle_rs::app::serve(
                     shuttle_rs::app::AppRuntime {
@@ -487,9 +500,43 @@ fn main() -> Result<()> {
                         workspace_id: env.workspace_id,
                         agent: env.agent,
                         session_id: env.session_id,
+                        oauth,
                     },
                     addr,
                 ))?;
+            }
+            AppCommand::Tunnel {
+                addr,
+                public_url,
+                cloudflare_token_env,
+                cloudflared,
+            } => {
+                let store = open_store(&env)?;
+                let public_url = shuttle_rs::oauth::OAuthConfig::normalize_public_url(public_url);
+                let oauth = app_oauth(&env, Some(public_url.clone()))?;
+                let token = env::var(&cloudflare_token_env).with_context(|| {
+                    format!("failed to read Cloudflare tunnel token from {cloudflare_token_env}")
+                })?;
+                if token.trim().is_empty() {
+                    anyhow::bail!("Cloudflare tunnel token environment variable is empty");
+                }
+                let mut tunnel = start_cloudflared(&cloudflared, &token)?;
+                println!("serving shuttle app at http://{addr} through {public_url}");
+                println!("configure remote MCP clients with {public_url}/mcp");
+                let runtime = tokio::runtime::Runtime::new()?;
+                let result = runtime.block_on(shuttle_rs::app::serve(
+                    shuttle_rs::app::AppRuntime {
+                        store,
+                        cwd: env.cwd,
+                        workspace_id: env.workspace_id,
+                        agent: env.agent,
+                        session_id: env.session_id,
+                        oauth,
+                    },
+                    addr,
+                ));
+                stop_child(&mut tunnel);
+                result?;
             }
         },
     }
@@ -610,6 +657,45 @@ fn open_store(env: &RuntimeEnv) -> Result<SqliteEventStore> {
         .with_context(|| format!("failed to create {}", env.shuttle_dir.display()))?;
     SqliteEventStore::open(&env.database_path)
         .with_context(|| format!("failed to open {}", env.database_path.display()))
+}
+
+fn app_oauth(
+    env: &RuntimeEnv,
+    public_url: Option<String>,
+) -> Result<Option<shuttle_rs::app::OAuthRuntime>> {
+    let Some(public_url) = public_url
+        .or_else(|| env::var("SHUTTLE_PUBLIC_URL").ok())
+        .filter(|url| !url.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    let public_url = shuttle_rs::oauth::OAuthConfig::normalize_public_url(public_url);
+    Ok(Some(shuttle_rs::app::OAuthRuntime {
+        config: shuttle_rs::oauth::OAuthConfig {
+            public_url,
+            admin_token: env::var("SHUTTLE_OAUTH_ADMIN_TOKEN")
+                .ok()
+                .filter(|token| !token.is_empty()),
+        },
+        store: shuttle_rs::oauth::OAuthStore::open(&env.database_path).with_context(|| {
+            format!("failed to open OAuth store {}", env.database_path.display())
+        })?,
+    }))
+}
+
+fn start_cloudflared(cloudflared: &Path, token: &str) -> Result<Child> {
+    ProcessCommand::new(cloudflared)
+        .args(["tunnel", "run", "--token"])
+        .arg(token)
+        .spawn()
+        .with_context(|| format!("failed to start {}", cloudflared.display()))
+}
+
+fn stop_child(child: &mut Child) {
+    if let Ok(None) = child.try_wait() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 fn open_peer_store(path: &Path) -> Result<SqliteEventStore> {

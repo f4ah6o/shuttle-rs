@@ -59,3 +59,16 @@ When Claude Code is configured with MCP servers, use Shuttle with:
 Set `SHUTTLE_MCP_BEARER_TOKEN` before starting the app server to require
 `Authorization: Bearer <token>` on MCP requests. If MCP configuration is not
 available, use the CLI fallback commands above.
+
+For Claude web chat custom connectors, expose Shuttle through a Cloudflare
+Named Tunnel and OAuth:
+
+```bash
+SHUTTLE_OAUTH_ADMIN_TOKEN=<admin-token> \
+CLOUDFLARE_TUNNEL_TOKEN=<cloudflare-tunnel-token> \
+stl app tunnel --public-url https://shuttle.example.com
+```
+
+Use `https://shuttle.example.com/mcp` as the remote MCP URL. The Cloudflare
+token is read from the environment only; inject it at runtime rather than
+printing or committing it.
