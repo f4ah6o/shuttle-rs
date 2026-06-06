@@ -352,16 +352,24 @@ pub fn protected_resource_metadata(config: &OAuthConfig) -> Value {
     })
 }
 
+/// Build the OAuth 2.0 authorization-code redirect URL (RFC 6749 §4.1.2).
+///
+/// `code` and `state` are appended **verbatim** without percent-encoding. The
+/// `code` we issue is `stl_<UUID simple>` (URL-safe alphanumerics), and `state`
+/// is whatever the client originally provided — the OAuth spec requires us to
+/// echo it back unchanged. Re-encoding values that already came through axum's
+/// `Query` decoder would silently mutate the bytes claude.ai expects to receive,
+/// which is one known cause of the hosted-Claude callback returning 405.
 pub fn authorize_redirect(redirect_uri: &str, code: &str, state: Option<&str>) -> String {
     let mut target = format!(
         "{}{}code={}",
         redirect_uri,
         if redirect_uri.contains('?') { "&" } else { "?" },
-        urlencoding::encode(code)
+        code
     );
     if let Some(state) = state {
         target.push_str("&state=");
-        target.push_str(&urlencoding::encode(state));
+        target.push_str(state);
     }
     target
 }
@@ -461,6 +469,33 @@ mod tests {
             authorization_server_metadata(&config)["token_endpoint"],
             "https://shuttle.example.test/oauth/token"
         );
+    }
+
+    #[test]
+    fn authorize_redirect_echoes_state_verbatim() {
+        let url = authorize_redirect(
+            "https://claude.ai/api/mcp/auth_callback",
+            "stl_abc123",
+            Some("opaque=value+with/special"),
+        );
+        assert_eq!(
+            url,
+            "https://claude.ai/api/mcp/auth_callback?code=stl_abc123&state=opaque=value+with/special"
+        );
+    }
+
+    #[test]
+    fn authorize_redirect_omits_state_when_absent() {
+        let url = authorize_redirect(
+            "https://claude.ai/api/mcp/auth_callback",
+            "stl_abc123",
+            None,
+        );
+        assert_eq!(
+            url,
+            "https://claude.ai/api/mcp/auth_callback?code=stl_abc123"
+        );
+        assert!(!url.contains("state="));
     }
 
     #[test]

@@ -352,7 +352,7 @@ async fn oauth_authorize_submit(
         );
     }
     match oauth.store.create_code(request.clone()) {
-        Ok(code) => Redirect::temporary(&oauth::authorize_redirect(
+        Ok(code) => Redirect::to(&oauth::authorize_redirect(
             &request.redirect_uri,
             &code,
             request.state.as_deref(),
@@ -670,6 +670,73 @@ mod tests {
         .await;
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn oauth_authorize_submit_redirects_callback_with_get() {
+        let oauth = oauth_runtime();
+        let client = oauth
+            .store
+            .register_client(oauth::RegisterRequest {
+                redirect_uris: vec!["https://claude.ai/api/mcp/auth_callback".to_owned()],
+                client_name: Some("Claude".to_owned()),
+            })
+            .unwrap();
+        let body = format!(
+            "admin_token=admin-token&response_type=code&client_id={}&redirect_uri=https%3A%2F%2Fclaude.ai%2Fapi%2Fmcp%2Fauth_callback&state=state-123&scope=mcp&code_challenge=challenge&code_challenge_method=S256",
+            client.client_id
+        );
+        let response = router(runtime(Some(oauth)))
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/oauth/authorize")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        assert!(location.starts_with("https://claude.ai/api/mcp/auth_callback?code=stl_"));
+        assert!(location.contains("&state=state-123"));
+        assert!(!location.contains("&iss="));
+        assert!(!location.contains("?iss="));
+    }
+
+    #[tokio::test]
+    async fn oauth_authorize_rejects_redirect_uri_with_trailing_slash() {
+        let oauth = oauth_runtime();
+        let client = oauth
+            .store
+            .register_client(oauth::RegisterRequest {
+                redirect_uris: vec!["https://claude.ai/api/mcp/auth_callback".to_owned()],
+                client_name: Some("Claude".to_owned()),
+            })
+            .unwrap();
+        let body = format!(
+            "admin_token=admin-token&response_type=code&client_id={}&redirect_uri=https%3A%2F%2Fclaude.ai%2Fapi%2Fmcp%2Fauth_callback%2F&state=state-123&scope=mcp&code_challenge=challenge&code_challenge_method=S256",
+            client.client_id
+        );
+        let response = router(runtime(Some(oauth)))
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/oauth/authorize")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
