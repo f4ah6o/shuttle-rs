@@ -164,6 +164,7 @@ fn main() -> Result<()> {
                     bit_repo_id: None,
                     branch: None,
                     commit: None,
+                    repo_dirty: None,
                     agent: env.agent.clone(),
                     session_id: env.session_id.clone(),
                     title: Some("decision".to_owned()),
@@ -223,6 +224,7 @@ fn main() -> Result<()> {
                     bit_repo_id: None,
                     branch: None,
                     commit: None,
+                    repo_dirty: None,
                     agent: env.agent.clone(),
                     session_id: env.session_id.clone(),
                     title: Some("handoff".to_owned()),
@@ -390,19 +392,40 @@ fn open_store(env: &RuntimeEnv) -> Result<SqliteEventStore> {
 
 fn with_repo_metadata(mut event: Event, env: &RuntimeEnv) -> Event {
     if let Ok(status) = shuttle_context::repo_status(&env.cwd) {
-        event.repo_path = Some(status.repo_path);
-        event.git_remote = status.git_remote;
-        event.branch = Some(status.branch);
-        event.commit = Some(status.commit);
+        let repo_id = shuttle_context::repo_id(&status);
+        event.repo_id = Some(repo_id.clone());
+        event.repo_path = Some(status.repo_path.clone());
+        event.git_remote = status.git_remote.clone();
+        event.branch = Some(status.branch.clone());
+        event.commit = Some(status.commit.clone());
+        event.repo_dirty = Some(status.dirty);
+        if let Some(metadata) = event.metadata_json.as_object_mut() {
+            metadata.insert("repo_id".to_owned(), json!(repo_id));
+            metadata.insert("repo_path".to_owned(), json!(status.repo_path));
+            metadata.insert("git_remote".to_owned(), json!(status.git_remote));
+            metadata.insert("branch".to_owned(), json!(status.branch));
+            metadata.insert("commit".to_owned(), json!(status.commit));
+            metadata.insert("repo_dirty".to_owned(), json!(status.dirty));
+            metadata.insert("dirty_files".to_owned(), json!(status.dirty_files));
+        }
     }
     event
 }
 
 fn format_context(context: &shuttle_context::Context) -> String {
     let mut output = format!(
-        "Repository\n- path: {}\n- branch: {}\n- commit: {}\n- dirty: {}\n\n",
+        "Repository\n- path: {}\n- branch: {}\n- commit: {}\n- dirty: {}\n",
         context.repo, context.branch, context.commit, context.dirty
     );
+    if context.dirty_files.is_empty() {
+        output.push_str("- dirty files: none\n\n");
+    } else {
+        output.push_str("- dirty files:\n");
+        for file in &context.dirty_files {
+            output.push_str(&format!("  - {file}\n"));
+        }
+        output.push('\n');
+    }
     push_event_section(&mut output, "Open Tasks", &context.open_tasks);
     push_event_section(&mut output, "Recent Decisions", &context.recent_decisions);
     push_event_section(&mut output, "Related Memories", &context.related_memories);

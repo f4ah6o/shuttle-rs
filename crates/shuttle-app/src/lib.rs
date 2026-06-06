@@ -110,6 +110,7 @@ async fn dashboard(State(runtime): State<AppRuntime>) -> impl IntoResponse {
             commit: "unknown".to_owned(),
             git_remote: None,
             dirty: false,
+            dirty_files: Vec::new(),
             open_tasks: Vec::new(),
             recent_decisions: Vec::new(),
             related_memories: Vec::new(),
