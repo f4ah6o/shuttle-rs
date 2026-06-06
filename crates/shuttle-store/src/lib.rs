@@ -72,6 +72,14 @@ impl SqliteEventStore {
         backfill_event_tags(&conn)?;
         Ok(())
     }
+
+    pub fn append_if_absent(&self, event: Event) -> Result<bool> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|err| ShuttleError::Store(err.to_string()))?;
+        insert_event(&mut conn, event, InsertMode::IgnoreDuplicates)
+    }
 }
 
 #[async_trait]
@@ -81,49 +89,7 @@ impl EventStore for SqliteEventStore {
             .conn
             .lock()
             .map_err(|err| ShuttleError::Store(err.to_string()))?;
-        let tags = serde_json::to_string(&event.tags)
-            .map_err(|err| ShuttleError::Serialization(err.to_string()))?;
-        let metadata_json = serde_json::to_string(&event.metadata_json)
-            .map_err(|err| ShuttleError::Serialization(err.to_string()))?;
-
-        let tx = conn.transaction().map_err(to_store_error)?;
-        tx.execute(
-            r#"
-            INSERT INTO events (
-                id, event_type, workspace_id, repo_id, repo_path, git_remote, bit_repo_id, branch, commit_hash, repo_dirty,
-                agent, session_id, title, content, tags, metadata_json, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
-            "#,
-            params![
-                event.id.to_string(),
-                event.event_type.as_str(),
-                &event.workspace_id,
-                &event.repo_id,
-                &event.repo_path,
-                &event.git_remote,
-                &event.bit_repo_id,
-                &event.branch,
-                &event.commit,
-                event.repo_dirty,
-                &event.agent,
-                &event.session_id,
-                &event.title,
-                &event.content,
-                tags,
-                metadata_json,
-                event.created_at.to_rfc3339(),
-            ],
-        )
-        .map_err(to_store_error)?;
-        for tag in &event.tags {
-            tx.execute(
-                "INSERT OR IGNORE INTO event_tags (event_id, tag) VALUES (?1, ?2)",
-                params![event.id.to_string(), tag],
-            )
-            .map_err(to_store_error)?;
-        }
-        tx.commit().map_err(to_store_error)?;
-
+        insert_event(&mut conn, event.clone(), InsertMode::Strict)?;
         Ok(event)
     }
 
@@ -197,6 +163,70 @@ impl EventStore for SqliteEventStore {
 
         Ok(events)
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InsertMode {
+    Strict,
+    IgnoreDuplicates,
+}
+
+fn insert_event(conn: &mut Connection, event: Event, mode: InsertMode) -> Result<bool> {
+    let tags = serde_json::to_string(&event.tags)
+        .map_err(|err| ShuttleError::Serialization(err.to_string()))?;
+    let metadata_json = serde_json::to_string(&event.metadata_json)
+        .map_err(|err| ShuttleError::Serialization(err.to_string()))?;
+    let insert = match mode {
+        InsertMode::Strict => "INSERT INTO events",
+        InsertMode::IgnoreDuplicates => "INSERT OR IGNORE INTO events",
+    };
+
+    let tx = conn.transaction().map_err(to_store_error)?;
+    let inserted = tx
+        .execute(
+            &format!(
+                r#"
+            {insert} (
+                id, event_type, workspace_id, repo_id, repo_path, git_remote, bit_repo_id, branch, commit_hash, repo_dirty,
+                agent, session_id, title, content, tags, metadata_json, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            "#
+            ),
+            params![
+                event.id.to_string(),
+                event.event_type.as_str(),
+                &event.workspace_id,
+                &event.repo_id,
+                &event.repo_path,
+                &event.git_remote,
+                &event.bit_repo_id,
+                &event.branch,
+                &event.commit,
+                event.repo_dirty,
+                &event.agent,
+                &event.session_id,
+                &event.title,
+                &event.content,
+                tags,
+                metadata_json,
+                event.created_at.to_rfc3339(),
+            ],
+        )
+        .map_err(to_store_error)?
+        > 0;
+
+    if inserted {
+        for tag in &event.tags {
+            tx.execute(
+                "INSERT OR IGNORE INTO event_tags (event_id, tag) VALUES (?1, ?2)",
+                params![event.id.to_string(), tag],
+            )
+            .map_err(to_store_error)?;
+        }
+    }
+    tx.commit().map_err(to_store_error)?;
+
+    Ok(inserted)
 }
 
 fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
@@ -531,6 +561,40 @@ mod tests {
         .unwrap();
 
         assert_eq!(events[0].repo_dirty, Some(true));
+    }
+
+    #[test]
+    fn append_if_absent_skips_duplicate_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(dir.path().join("shuttle.db")).unwrap();
+        let event = Event::new(NewEvent {
+            event_type: EventType::Memory,
+            workspace_id: "workspace".into(),
+            repo_id: None,
+            repo_path: None,
+            git_remote: None,
+            bit_repo_id: None,
+            branch: None,
+            commit: None,
+            repo_dirty: None,
+            agent: "codex".into(),
+            session_id: "session".into(),
+            title: None,
+            content: "replicated memory".into(),
+            tags: vec!["sync".into()],
+            metadata_json: json!({}),
+        });
+
+        assert!(store.append_if_absent(event.clone()).unwrap());
+        assert!(!store.append_if_absent(event).unwrap());
+        let events = futures_executor::block_on(store.list(EventFilter {
+            event_type: Some(EventType::Memory),
+            ..EventFilter::default()
+        }))
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tags, vec!["sync"]);
     }
 
     #[test]
