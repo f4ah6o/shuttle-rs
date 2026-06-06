@@ -72,12 +72,12 @@ async fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
         .unwrap_or_else(|| json!({}));
 
     match name {
-        "shuttle.memory.search" | "recall" => {
+        "shuttle_memory_search" | "recall" => {
             let query = string_arg(&args, "query")?;
             let events = shuttle_memory::recall(&runtime.store, &query).await?;
             serde_json::to_value(events).map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
-        "shuttle.memory.store" | "remember" => {
+        "shuttle_memory_store" | "remember" => {
             let content = string_arg(&args, "content")?;
             let event = with_repo_metadata(
                 shuttle_memory::new_memory(
@@ -91,7 +91,7 @@ async fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
             let event = runtime.store.append(event).await?;
             serde_json::to_value(event).map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
-        "shuttle.message.inbox" | "inbox" => {
+        "shuttle_message_inbox" | "inbox" => {
             let agent = args
                 .get("agent")
                 .and_then(Value::as_str)
@@ -99,11 +99,11 @@ async fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
             let events = shuttle_message::inbox(&runtime.store, agent).await?;
             serde_json::to_value(events).map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
-        "shuttle.message.history" | "history" => {
+        "shuttle_message_history" | "history" => {
             let events = shuttle_message::history(&runtime.store).await?;
             serde_json::to_value(events).map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
-        "shuttle.message.send" | "send" => {
+        "shuttle_message_send" | "send" => {
             let to_agent = string_arg(&args, "agent")?;
             let content = string_arg(&args, "content")?;
             let event = with_repo_metadata(
@@ -119,12 +119,12 @@ async fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
             let event = runtime.store.append(event).await?;
             serde_json::to_value(event).map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
-        "shuttle.task.list" | "tasks" => {
+        "shuttle_task_list" | "tasks" => {
             let tasks =
                 shuttle_task::tasks(&runtime.store, Some(&runtime.workspace_id), None).await?;
             serde_json::to_value(tasks).map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
-        "shuttle.task.create" => {
+        "shuttle_task_create" => {
             let content = string_arg(&args, "content")?;
             let event = with_repo_metadata(
                 shuttle_task::new_task(
@@ -138,7 +138,7 @@ async fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
             let event = runtime.store.append(event).await?;
             serde_json::to_value(event).map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
-        "shuttle.task.claim" => {
+        "shuttle_task_claim" => {
             let id = Uuid::parse_str(&string_arg(&args, "id")?)
                 .map_err(|err| ShuttleError::Store(err.to_string()))?;
             shuttle_task::ensure_task_exists(&runtime.store, &runtime.workspace_id, id).await?;
@@ -154,7 +154,7 @@ async fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
             let event = runtime.store.append(event).await?;
             serde_json::to_value(event).map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
-        "shuttle.task.update" => {
+        "shuttle_task_update" => {
             let id = Uuid::parse_str(&string_arg(&args, "id")?)
                 .map_err(|err| ShuttleError::Store(err.to_string()))?;
             let content = string_arg(&args, "content")?;
@@ -172,7 +172,7 @@ async fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
             let event = runtime.store.append(event).await?;
             serde_json::to_value(event).map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
-        "shuttle.task.done" => {
+        "shuttle_task_done" => {
             let id = Uuid::parse_str(&string_arg(&args, "id")?)
                 .map_err(|err| ShuttleError::Store(err.to_string()))?;
             shuttle_task::ensure_task_exists(&runtime.store, &runtime.workspace_id, id).await?;
@@ -188,7 +188,7 @@ async fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
             let event = runtime.store.append(event).await?;
             serde_json::to_value(event).map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
-        "shuttle.handoff.request" => {
+        "shuttle_handoff_request" => {
             let to_agent = string_arg(&args, "agent")?;
             let content = string_arg(&args, "content")?;
             let event = with_repo_metadata(
@@ -204,13 +204,13 @@ async fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
             let event = runtime.store.append(event).await?;
             serde_json::to_value(event).map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
-        "shuttle.handoff.list" => {
+        "shuttle_handoff_list" => {
             let handoffs =
                 shuttle_task::handoffs(&runtime.store, Some(&runtime.workspace_id), None).await?;
             serde_json::to_value(handoffs)
                 .map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
-        "shuttle.handoff.accept" => {
+        "shuttle_handoff_accept" => {
             let id = Uuid::parse_str(&string_arg(&args, "id")?)
                 .map_err(|err| ShuttleError::Store(err.to_string()))?;
             shuttle_task::ensure_handoff_exists(&runtime.store, &runtime.workspace_id, id).await?;
@@ -226,7 +226,7 @@ async fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
             let event = runtime.store.append(event).await?;
             serde_json::to_value(event).map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
-        "shuttle.handoff.done" => {
+        "shuttle_handoff_done" => {
             let id = Uuid::parse_str(&string_arg(&args, "id")?)
                 .map_err(|err| ShuttleError::Store(err.to_string()))?;
             shuttle_task::ensure_handoff_exists(&runtime.store, &runtime.workspace_id, id).await?;
@@ -242,7 +242,7 @@ async fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
             let event = runtime.store.append(event).await?;
             serde_json::to_value(event).map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
-        "shuttle.repo.context" | "context" => {
+        "shuttle_repo_context" | "context" => {
             let context = shuttle_context::assemble_context(
                 &runtime.store,
                 &runtime.cwd,
@@ -253,17 +253,17 @@ async fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
             serde_json::to_value(context)
                 .map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
-        "shuttle.repo.status" => {
+        "shuttle_repo_status" => {
             let status = shuttle_context::repo_status(&runtime.cwd)?;
             serde_json::to_value(status).map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
-        "shuttle.repo.changed_files" => {
+        "shuttle_repo_changed_files" => {
             let files = git(&runtime.cwd, ["diff", "--name-only"])?;
             Ok(json!({
                 "files": files.lines().filter(|line| !line.trim().is_empty()).collect::<Vec<_>>()
             }))
         }
-        "shuttle.repo.diff" => {
+        "shuttle_repo_diff" => {
             let max_bytes = args
                 .get("max_bytes")
                 .and_then(Value::as_u64)
@@ -325,28 +325,28 @@ fn tools() -> Vec<Tool> {
         tool("history", "Read message history"),
         tool("context", "Read assembled repo context"),
         tool("tasks", "List Shuttle task state"),
-        tool("shuttle.memory.search", "Search local Shuttle memories"),
-        tool("shuttle.memory.store", "Store a local Shuttle memory"),
-        tool("shuttle.message.inbox", "Read an agent inbox"),
-        tool("shuttle.message.history", "Read message history"),
-        tool("shuttle.message.send", "Send a message to an agent"),
-        tool("shuttle.task.list", "List Shuttle task state"),
-        tool("shuttle.task.create", "Create a Shuttle task"),
-        tool("shuttle.task.claim", "Claim a Shuttle task"),
-        tool("shuttle.task.update", "Update a Shuttle task"),
-        tool("shuttle.task.done", "Complete a Shuttle task"),
-        tool("shuttle.handoff.request", "Request a Shuttle handoff"),
-        tool("shuttle.handoff.list", "List Shuttle handoff state"),
-        tool("shuttle.handoff.accept", "Accept a Shuttle handoff"),
-        tool("shuttle.handoff.done", "Complete a Shuttle handoff"),
-        tool("shuttle.repo.context", "Read assembled repo context"),
-        tool("shuttle.repo.status", "Read Git repo status"),
+        tool("shuttle_memory_search", "Search local Shuttle memories"),
+        tool("shuttle_memory_store", "Store a local Shuttle memory"),
+        tool("shuttle_message_inbox", "Read an agent inbox"),
+        tool("shuttle_message_history", "Read message history"),
+        tool("shuttle_message_send", "Send a message to an agent"),
+        tool("shuttle_task_list", "List Shuttle task state"),
+        tool("shuttle_task_create", "Create a Shuttle task"),
+        tool("shuttle_task_claim", "Claim a Shuttle task"),
+        tool("shuttle_task_update", "Update a Shuttle task"),
+        tool("shuttle_task_done", "Complete a Shuttle task"),
+        tool("shuttle_handoff_request", "Request a Shuttle handoff"),
+        tool("shuttle_handoff_list", "List Shuttle handoff state"),
+        tool("shuttle_handoff_accept", "Accept a Shuttle handoff"),
+        tool("shuttle_handoff_done", "Complete a Shuttle handoff"),
+        tool("shuttle_repo_context", "Read assembled repo context"),
+        tool("shuttle_repo_status", "Read Git repo status"),
         tool(
-            "shuttle.repo.changed_files",
+            "shuttle_repo_changed_files",
             "List changed files in the current Git repo",
         ),
         tool(
-            "shuttle.repo.diff",
+            "shuttle_repo_diff",
             "Read the current Git diff, optionally for one path",
         ),
     ]
@@ -414,7 +414,7 @@ mod tests {
             id: Some(json!(1)),
             method: "tools/call".into(),
             params: json!({
-                "name": "shuttle.memory.store",
+                "name": "shuttle_memory_store",
                 "arguments": { "content": "repo-aware memory" }
             }),
         };
@@ -444,13 +444,13 @@ mod tests {
             .map(|tool| tool.name)
             .collect::<Vec<_>>();
 
-        assert!(names.contains(&"shuttle.message.history"));
-        assert!(names.contains(&"shuttle.task.update"));
-        assert!(names.contains(&"shuttle.task.done"));
-        assert!(names.contains(&"shuttle.handoff.request"));
-        assert!(names.contains(&"shuttle.handoff.list"));
-        assert!(names.contains(&"shuttle.handoff.accept"));
-        assert!(names.contains(&"shuttle.handoff.done"));
+        assert!(names.contains(&"shuttle_message_history"));
+        assert!(names.contains(&"shuttle_task_update"));
+        assert!(names.contains(&"shuttle_task_done"));
+        assert!(names.contains(&"shuttle_handoff_request"));
+        assert!(names.contains(&"shuttle_handoff_list"));
+        assert!(names.contains(&"shuttle_handoff_accept"));
+        assert!(names.contains(&"shuttle_handoff_done"));
     }
 
     #[test]
@@ -470,7 +470,7 @@ mod tests {
         let task_response = futures_executor::block_on(handle_request(
             &runtime,
             tool_request(
-                "shuttle.task.create",
+                "shuttle_task_create",
                 json!({ "content": "ship task tools" }),
             ),
         ));
@@ -480,22 +480,22 @@ mod tests {
             .to_owned();
         futures_executor::block_on(handle_request(
             &runtime,
-            tool_request("shuttle.task.claim", json!({ "id": task_id })),
+            tool_request("shuttle_task_claim", json!({ "id": task_id })),
         ));
         futures_executor::block_on(handle_request(
             &runtime,
             tool_request(
-                "shuttle.task.update",
+                "shuttle_task_update",
                 json!({ "id": task_id, "content": "updated task tools" }),
             ),
         ));
         futures_executor::block_on(handle_request(
             &runtime,
-            tool_request("shuttle.task.done", json!({ "id": task_id })),
+            tool_request("shuttle_task_done", json!({ "id": task_id })),
         ));
         let task_list = futures_executor::block_on(handle_request(
             &runtime,
-            tool_request("shuttle.task.list", json!({})),
+            tool_request("shuttle_task_list", json!({})),
         ));
         let task_json = response_text_json(&task_list);
         assert_eq!(task_json[0]["status"], "completed");
@@ -504,13 +504,13 @@ mod tests {
         futures_executor::block_on(handle_request(
             &runtime,
             tool_request(
-                "shuttle.message.send",
+                "shuttle_message_send",
                 json!({ "agent": "claude", "content": "review this" }),
             ),
         ));
         let history = futures_executor::block_on(handle_request(
             &runtime,
-            tool_request("shuttle.message.history", json!({})),
+            tool_request("shuttle_message_history", json!({})),
         ));
         let history_json = response_text_json(&history);
         assert_eq!(history_json[0]["content"], "review this");
@@ -518,7 +518,7 @@ mod tests {
         let handoff_response = futures_executor::block_on(handle_request(
             &runtime,
             tool_request(
-                "shuttle.handoff.request",
+                "shuttle_handoff_request",
                 json!({ "agent": "claude", "content": "continue this" }),
             ),
         ));
@@ -528,11 +528,11 @@ mod tests {
             .to_owned();
         futures_executor::block_on(handle_request(
             &runtime,
-            tool_request("shuttle.handoff.accept", json!({ "id": handoff_id })),
+            tool_request("shuttle_handoff_accept", json!({ "id": handoff_id })),
         ));
         let handoff_list = futures_executor::block_on(handle_request(
             &runtime,
-            tool_request("shuttle.handoff.list", json!({})),
+            tool_request("shuttle_handoff_list", json!({})),
         ));
         let handoff_json = response_text_json(&handoff_list);
         assert_eq!(handoff_json[0]["status"], "accepted");
