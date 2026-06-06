@@ -878,6 +878,18 @@ dependencies = [
 [[package]]
 name = "shuttle-mesh"
 version = "0.1.0"
+dependencies = [
+ "chrono",
+ "futures-executor",
+ "serde",
+ "serde_json",
+ "shuttle-core",
+ "shuttle-memory",
+ "shuttle-message",
+ "shuttle-store",
+ "shuttle-task",
+ "tempfile",
+]
 
 [[package]]
 name = "shuttle-message"
@@ -962,6 +974,7 @@ dependencies = [
  "shuttle-core",
  "shuttle-mcp",
  "shuttle-memory",
+ "shuttle-mesh",
  "shuttle-message",
  "shuttle-store",
  "shuttle-task",

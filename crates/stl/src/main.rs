@@ -64,6 +64,10 @@ enum Command {
         #[command(subcommand)]
         command: HandoffCommand,
     },
+    Mesh {
+        #[command(subcommand)]
+        command: MeshCommand,
+    },
     Context {
         #[arg(long)]
         repo: bool,
@@ -95,6 +99,13 @@ enum HandoffCommand {
     List,
     Accept { id: Uuid },
     Done { id: Uuid },
+}
+
+#[derive(Debug, Subcommand)]
+enum MeshCommand {
+    Export { path: PathBuf },
+    Import { path: PathBuf },
+    Sync { peer_database: PathBuf },
 }
 
 #[derive(Debug, Subcommand)]
@@ -390,6 +401,65 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Command::Mesh { command } => {
+            let store = open_store(&env)?;
+            match command {
+                MeshCommand::Export { path } => {
+                    let archive = block_on(shuttle_mesh::export_archive(&store))?;
+                    shuttle_mesh::write_archive(&path, &archive)?;
+                    output(
+                        cli.json,
+                        &MeshExportOutput {
+                            path: path.display().to_string(),
+                            event_count: archive.event_count,
+                            exported_at: archive.exported_at,
+                        },
+                        || {
+                            format!(
+                                "exported {} event(s) to {}",
+                                archive.event_count,
+                                path.display()
+                            )
+                        },
+                    )?;
+                }
+                MeshCommand::Import { path } => {
+                    let archive = shuttle_mesh::read_archive(&path)?;
+                    let report = block_on(shuttle_mesh::import_archive_into_workspace(
+                        &store,
+                        archive,
+                        &env.workspace_id,
+                    ))?;
+                    output(cli.json, &report, || {
+                        format!(
+                            "imported {} event(s) from {} ({} duplicate)",
+                            report.imported,
+                            path.display(),
+                            report.skipped_duplicates
+                        )
+                    })?;
+                }
+                MeshCommand::Sync { peer_database } => {
+                    let peer = open_peer_store(&peer_database)?;
+                    let peer_workspace_id = load_peer_workspace_id(&peer_database);
+                    let report = block_on(shuttle_mesh::sync_bidirectional_into_workspaces(
+                        &store,
+                        &env.workspace_id,
+                        &peer,
+                        peer_workspace_id.as_deref(),
+                    ))?;
+                    output(cli.json, &report, || {
+                        format!(
+                            "synced with {}: local imported {}, peer imported {}, {} duplicate",
+                            peer_database.display(),
+                            report.local_imported,
+                            report.peer_imported,
+                            report.skipped_duplicates
+                        )
+                    })?;
+                }
+            }
+        }
         Command::Context { repo, branch } => {
             if repo && branch {
                 anyhow::bail!("--repo and --branch cannot be used together");
@@ -488,6 +558,13 @@ struct InitOutput {
     database: String,
 }
 
+#[derive(Debug, Serialize)]
+struct MeshExportOutput {
+    path: String,
+    event_count: usize,
+    exported_at: DateTime<Utc>,
+}
+
 fn repo_root(cwd: &Path) -> Option<PathBuf> {
     let output = ProcessCommand::new("git")
         .args(["rev-parse", "--show-toplevel"])
@@ -551,6 +628,25 @@ fn open_store(env: &RuntimeEnv) -> Result<SqliteEventStore> {
         .with_context(|| format!("failed to create {}", env.shuttle_dir.display()))?;
     SqliteEventStore::open(&env.database_path)
         .with_context(|| format!("failed to open {}", env.database_path.display()))
+}
+
+fn open_peer_store(path: &Path) -> Result<SqliteEventStore> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    SqliteEventStore::open(path).with_context(|| format!("failed to open {}", path.display()))
+}
+
+fn load_peer_workspace_id(database_path: &Path) -> Option<String> {
+    let workspace_path = database_path.parent()?.join("workspace.json");
+    let contents = fs::read_to_string(workspace_path).ok()?;
+    serde_json::from_str::<WorkspaceFile>(&contents)
+        .ok()
+        .map(|workspace| workspace.workspace_id)
 }
 
 fn append_typed_memory(
