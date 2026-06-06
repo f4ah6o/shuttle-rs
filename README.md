@@ -89,3 +89,8 @@ re-running a sync after an offline period only transfers events that the other
 store has not seen yet. The CLI normalizes imported events to the receiving
 workspace id and records the source workspace in event metadata, which keeps
 synced tasks, handoffs, messages, and memories visible to local commands.
+
+## Acknowledgements
+
+Shuttle is inspired by [kioku-mesh](https://github.com/h-wata/kioku-mesh), a
+shared memory system for AI coding agents across tools and machines.
