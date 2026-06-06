@@ -112,6 +112,8 @@ fn parse_dirty_files(status: &str) -> Vec<String> {
             let path = line.get(3..)?.trim();
             if path.is_empty() {
                 None
+            } else if let Some((_, destination)) = path.split_once(" -> ") {
+                Some(destination.to_owned())
             } else {
                 Some(path.to_owned())
             }
@@ -201,6 +203,13 @@ mod tests {
         };
 
         assert_eq!(repo_id(&status), "https://example.test/repo.git");
+    }
+
+    #[test]
+    fn dirty_file_parser_normalizes_rename_destinations() {
+        let files = parse_dirty_files("R  old-name.txt -> new-name.txt\nC  old.rs -> copy.rs\n");
+
+        assert_eq!(files, vec!["new-name.txt", "copy.rs"]);
     }
 }
 

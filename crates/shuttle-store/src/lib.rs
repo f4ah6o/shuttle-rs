@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::types::Value;
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use shuttle_core::{Event, EventFilter, EventStore, EventType, Result, ShuttleError};
 use uuid::Uuid;
 
@@ -134,15 +135,13 @@ impl EventStore for SqliteEventStore {
         let limit = filter.limit.unwrap_or(50).min(500);
         let event_type = filter
             .event_type
-            .map(|event_type| event_type.as_str().to_owned());
+            .map(|event_type| Value::Text(event_type.as_str().to_owned()));
         let query = filter
             .query
             .as_ref()
-            .map(|query| format!("%{}%", query.to_lowercase()));
-        let tags = filter_tags(&filter)?;
-        let mut stmt = conn
-            .prepare(
-                r#"
+            .map(|query| Value::Text(format!("%{}%", query.to_lowercase())));
+        let tags = filter_tags(&filter);
+        let mut sql = r#"
                 SELECT id, event_type, workspace_id, repo_id, repo_path, git_remote, bit_repo_id, branch, commit_hash, repo_dirty,
                        agent, session_id, title, content, tags, metadata_json, created_at
                 FROM events
@@ -150,49 +149,44 @@ impl EventStore for SqliteEventStore {
                   AND (?2 IS NULL OR workspace_id = ?2)
                   AND (?3 IS NULL OR agent = ?3)
                   AND (
-                    ?4 = '[]'
-                    OR NOT EXISTS (
-                      SELECT 1 FROM json_each(?4) AS wanted
-                      WHERE NOT EXISTS (
-                        SELECT 1 FROM event_tags
-                        WHERE event_tags.event_id = events.id AND event_tags.tag = wanted.value
-                      )
+                    ?4 IS NULL
+                    OR json_extract(metadata_json, '$.to') = ?4
+                    OR EXISTS (
+                      SELECT 1 FROM event_tags
+                      WHERE event_tags.event_id = events.id AND event_tags.tag = ('to:' || ?4)
                     )
                   )
                   AND (
                     ?5 IS NULL
-                    OR json_extract(metadata_json, '$.to') = ?5
-                    OR EXISTS (
-                      SELECT 1 FROM event_tags
-                      WHERE event_tags.event_id = events.id AND event_tags.tag = ('to:' || ?5)
-                    )
+                    OR lower(coalesce(title, '')) LIKE ?5
+                    OR lower(content) LIKE ?5
+                    OR lower(tags) LIKE ?5
+                    OR lower(metadata_json) LIKE ?5
                   )
-                  AND (
-                    ?6 IS NULL
-                    OR lower(coalesce(title, '')) LIKE ?6
-                    OR lower(content) LIKE ?6
-                    OR lower(tags) LIKE ?6
-                    OR lower(metadata_json) LIKE ?6
-                  )
-                ORDER BY created_at DESC
-                LIMIT ?7
-                "#,
-            )
-            .map_err(to_store_error)?;
+        "#
+        .to_owned();
+        let mut values = vec![
+            event_type.unwrap_or(Value::Null),
+            filter.workspace_id.map(Value::Text).unwrap_or(Value::Null),
+            filter.agent.map(Value::Text).unwrap_or(Value::Null),
+            filter.recipient.map(Value::Text).unwrap_or(Value::Null),
+            query.unwrap_or(Value::Null),
+        ];
+        for tag in tags {
+            let index = values.len() + 1;
+            sql.push_str(&format!(
+                " AND EXISTS (SELECT 1 FROM event_tags WHERE event_tags.event_id = events.id AND event_tags.tag = ?{index})"
+            ));
+            values.push(Value::Text(tag));
+        }
+        let limit_index = values.len() + 1;
+        sql.push_str(&format!(" ORDER BY created_at DESC LIMIT ?{limit_index}"));
+        values.push(Value::Integer(i64::from(limit)));
+
+        let mut stmt = conn.prepare(&sql).map_err(to_store_error)?;
 
         let rows = stmt
-            .query_map(
-                params![
-                    event_type,
-                    filter.workspace_id,
-                    filter.agent,
-                    tags,
-                    filter.recipient,
-                    query,
-                    limit
-                ],
-                row_to_event,
-            )
+            .query_map(params_from_iter(values.iter()), row_to_event)
             .map_err(to_store_error)?;
 
         let mut events = Vec::new();
@@ -239,14 +233,14 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
     })
 }
 
-fn filter_tags(filter: &EventFilter) -> Result<String> {
+fn filter_tags(filter: &EventFilter) -> Vec<String> {
     let mut tags = filter.tags.clone();
     if let Some(tag) = &filter.tag {
         tags.push(tag.clone());
     }
     tags.sort();
     tags.dedup();
-    serde_json::to_string(&tags).map_err(|err| ShuttleError::Serialization(err.to_string()))
+    tags
 }
 
 fn ensure_column(conn: &Connection, column: &str, column_type: &str) -> Result<()> {
