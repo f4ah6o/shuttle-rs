@@ -17,6 +17,11 @@ const MCP_SCOPE: &str = "mcp";
 #[derive(Clone)]
 pub struct OAuthConfig {
     pub public_url: String,
+    /// Owner-approval token for authorization-code issuance.
+    ///
+    /// CLI public URL mode requires this to be `Some`; `None` is reserved for
+    /// programmatic or local-only runtimes that intentionally skip owner
+    /// approval.
     pub admin_token: Option<String>,
 }
 
