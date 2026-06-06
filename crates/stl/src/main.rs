@@ -272,6 +272,7 @@ fn main() -> Result<()> {
                         cwd: env.cwd,
                         workspace_id: env.workspace_id,
                         agent: env.agent,
+                        session_id: env.session_id,
                     },
                     addr,
                 ))?;
