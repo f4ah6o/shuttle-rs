@@ -163,6 +163,24 @@ async fn inbox_events(
     Ok(events)
 }
 
+fn git<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|err| ShuttleError::Store(format!("failed to run git: {err}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(ShuttleError::Store(format!(
+            "git command failed: {}",
+            stderr.trim()
+        )));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,22 +298,4 @@ mod tests {
             .output()
             .unwrap();
     }
-}
-
-fn git<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .map_err(|err| ShuttleError::Store(format!("failed to run git: {err}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(ShuttleError::Store(format!(
-            "git command failed: {}",
-            stderr.trim()
-        )));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
