@@ -15,6 +15,9 @@ pub fn new_message(
         event_type: EventType::Message,
         workspace_id,
         repo_id: None,
+        repo_path: None,
+        git_remote: None,
+        bit_repo_id: None,
         branch: None,
         commit: None,
         agent: from_agent,
@@ -26,13 +29,24 @@ pub fn new_message(
 }
 
 pub async fn inbox(store: &impl EventStore, agent: &str) -> Result<Vec<Event>> {
-    store
+    let mut events = store
         .list(EventFilter {
             event_type: Some(EventType::Message),
             tag: Some(recipient_tag(agent)),
             ..EventFilter::default()
         })
-        .await
+        .await?;
+    events.extend(
+        store
+            .list(EventFilter {
+                event_type: Some(EventType::Handoff),
+                tag: Some(recipient_tag(agent)),
+                ..EventFilter::default()
+            })
+            .await?,
+    );
+    events.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    Ok(events)
 }
 
 pub async fn history(store: &impl EventStore) -> Result<Vec<Event>> {
@@ -59,5 +73,10 @@ mod tests {
         );
         assert_eq!(event.event_type, EventType::Message);
         assert_eq!(event.tags, vec!["to:claude"]);
+    }
+
+    #[test]
+    fn recipient_tag_is_shared_by_messages_and_handoffs() {
+        assert_eq!(recipient_tag("codex"), "to:codex");
     }
 }
