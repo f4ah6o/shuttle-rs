@@ -1,29 +1,37 @@
-[workspace]
-members = [
-    "crates/shuttle-core",
-    "crates/shuttle-store",
-    "crates/shuttle-message",
-    "crates/shuttle-memory",
-    "crates/shuttle-task",
-    "crates/shuttle-context",
-    "crates/shuttle-mcp",
-    "crates/shuttle-app",
-    "crates/shuttle-mesh",
-    "crates/stl",
-]
-resolver = "2"
-
-[workspace.package]
+[package]
+name = "shuttle-rs"
+version = "2026.6.0"
 edition = "2021"
+description = "Local-first event log CLI for agent memory, repository context, task coordination, handoffs, messaging, mesh sync, and MCP access."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/shuttle-rs/shuttle-rs"
+readme = "README.md"
+keywords = ["agents", "cli", "memory", "mcp", "sqlite"]
+categories = ["command-line-utilities", "development-tools"]
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "src/**/*.rs",
+]
 
-[workspace.dependencies]
+[lib]
+name = "shuttle_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "stl"
+path = "src/bin/stl.rs"
+
+[dependencies]
 anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
+futures-executor = "0.3"
 rmcp = { version = "1.7", features = ["server", "transport-io"] }
 rusqlite = { version = "0.31", features = ["bundled", "chrono", "uuid"] }
 serde = { version = "1", features = ["derive"] }
@@ -32,4 +40,3 @@ tempfile = "3"
 thiserror = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
 uuid = { version = "1", features = ["serde", "v4"] }
-futures-executor = "0.3"
