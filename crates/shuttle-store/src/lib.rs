@@ -34,6 +34,9 @@ impl SqliteEventStore {
                 event_type TEXT NOT NULL,
                 workspace_id TEXT NOT NULL,
                 repo_id TEXT,
+                repo_path TEXT,
+                git_remote TEXT,
+                bit_repo_id TEXT,
                 branch TEXT,
                 commit_hash TEXT,
                 agent TEXT NOT NULL,
@@ -45,10 +48,14 @@ impl SqliteEventStore {
             );
 
             CREATE INDEX IF NOT EXISTS idx_events_type_created ON events(event_type, created_at);
+            CREATE INDEX IF NOT EXISTS idx_events_workspace_created ON events(workspace_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_events_agent_created ON events(agent, created_at);
             "#,
         )
         .map_err(to_store_error)?;
+        ensure_column(&conn, "repo_path", "TEXT")?;
+        ensure_column(&conn, "git_remote", "TEXT")?;
+        ensure_column(&conn, "bit_repo_id", "TEXT")?;
         Ok(())
     }
 }
@@ -66,15 +73,18 @@ impl EventStore for SqliteEventStore {
         conn.execute(
             r#"
             INSERT INTO events (
-                id, event_type, workspace_id, repo_id, branch, commit_hash,
+                id, event_type, workspace_id, repo_id, repo_path, git_remote, bit_repo_id, branch, commit_hash,
                 agent, session_id, title, content, tags, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
             "#,
             params![
                 event.id.to_string(),
                 event.event_type.as_str(),
                 &event.workspace_id,
                 &event.repo_id,
+                &event.repo_path,
+                &event.git_remote,
+                &event.bit_repo_id,
                 &event.branch,
                 &event.commit,
                 &event.agent,
@@ -96,49 +106,53 @@ impl EventStore for SqliteEventStore {
             .lock()
             .map_err(|err| ShuttleError::Store(err.to_string()))?;
         let limit = filter.limit.unwrap_or(50).min(500);
+        let event_type = filter
+            .event_type
+            .map(|event_type| event_type.as_str().to_owned());
+        let tag = filter.tag.as_ref().map(|tag| format!("%\"{tag}\"%"));
+        let query = filter
+            .query
+            .as_ref()
+            .map(|query| format!("%{}%", query.to_lowercase()));
         let mut stmt = conn
             .prepare(
                 r#"
-                SELECT id, event_type, workspace_id, repo_id, branch, commit_hash,
+                SELECT id, event_type, workspace_id, repo_id, repo_path, git_remote, bit_repo_id, branch, commit_hash,
                        agent, session_id, title, content, tags, created_at
                 FROM events
+                WHERE (?1 IS NULL OR event_type = ?1)
+                  AND (?2 IS NULL OR workspace_id = ?2)
+                  AND (?3 IS NULL OR agent = ?3)
+                  AND (?4 IS NULL OR tags LIKE ?4)
+                  AND (
+                    ?5 IS NULL
+                    OR lower(coalesce(title, '')) LIKE ?5
+                    OR lower(content) LIKE ?5
+                    OR lower(tags) LIKE ?5
+                  )
                 ORDER BY created_at DESC
-                LIMIT ?1
+                LIMIT ?6
                 "#,
             )
             .map_err(to_store_error)?;
 
         let rows = stmt
-            .query_map([limit], row_to_event)
+            .query_map(
+                params![
+                    event_type,
+                    filter.workspace_id,
+                    filter.agent,
+                    tag,
+                    query,
+                    limit
+                ],
+                row_to_event,
+            )
             .map_err(to_store_error)?;
 
         let mut events = Vec::new();
         for row in rows {
             let event = row.map_err(to_store_error)?;
-            if let Some(event_type) = filter.event_type {
-                if event.event_type != event_type {
-                    continue;
-                }
-            }
-            if let Some(agent) = &filter.agent {
-                if &event.agent != agent {
-                    continue;
-                }
-            }
-            if let Some(tag) = &filter.tag {
-                if !event.tags.iter().any(|candidate| candidate == tag) {
-                    continue;
-                }
-            }
-            if let Some(query) = &filter.query {
-                let query = query.to_lowercase();
-                let title = event.title.as_deref().unwrap_or_default().to_lowercase();
-                let content = event.content.to_lowercase();
-                let tags = event.tags.join(" ").to_lowercase();
-                if !title.contains(&query) && !content.contains(&query) && !tags.contains(&query) {
-                    continue;
-                }
-            }
             events.push(event);
         }
 
@@ -148,8 +162,8 @@ impl EventStore for SqliteEventStore {
 
 fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
     let event_type: String = row.get(1)?;
-    let tags: String = row.get(10)?;
-    let created_at: String = row.get(11)?;
+    let tags: String = row.get(13)?;
+    let created_at: String = row.get(14)?;
 
     let event_type = EventType::try_from(event_type.as_str()).map_err(to_sql_error)?;
     let tags = serde_json::from_str(&tags).map_err(to_sql_error)?;
@@ -162,15 +176,39 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
         event_type,
         workspace_id: row.get(2)?,
         repo_id: row.get(3)?,
-        branch: row.get(4)?,
-        commit: row.get(5)?,
-        agent: row.get(6)?,
-        session_id: row.get(7)?,
-        title: row.get(8)?,
-        content: row.get(9)?,
+        repo_path: row.get(4)?,
+        git_remote: row.get(5)?,
+        bit_repo_id: row.get(6)?,
+        branch: row.get(7)?,
+        commit: row.get(8)?,
+        agent: row.get(9)?,
+        session_id: row.get(10)?,
+        title: row.get(11)?,
+        content: row.get(12)?,
         tags,
         created_at,
     })
+}
+
+fn ensure_column(conn: &Connection, column: &str, column_type: &str) -> Result<()> {
+    let exists = conn
+        .prepare("PRAGMA table_info(events)")
+        .map_err(to_store_error)?
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(to_store_error)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(to_store_error)?
+        .iter()
+        .any(|name| name == column);
+
+    if !exists {
+        conn.execute(
+            &format!("ALTER TABLE events ADD COLUMN {column} {column_type}"),
+            [],
+        )
+        .map_err(to_store_error)?;
+    }
+    Ok(())
 }
 
 fn to_store_error(err: rusqlite::Error) -> ShuttleError {
@@ -212,6 +250,9 @@ mod tests {
             event_type: EventType::Memory,
             workspace_id: "workspace".into(),
             repo_id: None,
+            repo_path: None,
+            git_remote: None,
+            bit_repo_id: None,
             branch: None,
             commit: None,
             agent: "codex".into(),
