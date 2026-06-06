@@ -16,6 +16,7 @@ pub fn new_memory(
         bit_repo_id: None,
         branch: None,
         commit: None,
+        repo_dirty: None,
         agent,
         session_id,
         title: None,

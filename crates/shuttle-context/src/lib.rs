@@ -11,6 +11,7 @@ pub struct Context {
     pub commit: String,
     pub git_remote: Option<String>,
     pub dirty: bool,
+    pub dirty_files: Vec<String>,
     pub open_tasks: Vec<Event>,
     pub recent_decisions: Vec<Event>,
     pub related_memories: Vec<Event>,
@@ -24,6 +25,7 @@ pub struct RepoStatus {
     pub branch: String,
     pub commit: String,
     pub dirty: bool,
+    pub dirty_files: Vec<String>,
 }
 
 pub fn repo_status(path: impl AsRef<Path>) -> Result<RepoStatus> {
@@ -34,6 +36,7 @@ pub fn repo_status(path: impl AsRef<Path>) -> Result<RepoStatus> {
     let commit = git(&repo_path_buf, ["rev-parse", "HEAD"])?;
     let remote = git(&repo_path_buf, ["config", "--get", "remote.origin.url"]).ok();
     let status = git(&repo_path_buf, ["status", "--porcelain"])?;
+    let dirty_files = parse_dirty_files(&status);
 
     Ok(RepoStatus {
         repo_path: repo_path.trim().to_owned(),
@@ -42,7 +45,8 @@ pub fn repo_status(path: impl AsRef<Path>) -> Result<RepoStatus> {
             .filter(|value| !value.is_empty()),
         branch: branch.trim().to_owned(),
         commit: commit.trim().to_owned(),
-        dirty: !status.trim().is_empty(),
+        dirty: !dirty_files.is_empty(),
+        dirty_files,
     })
 }
 
@@ -86,11 +90,35 @@ pub async fn assemble_context(
         commit: status.commit,
         git_remote: status.git_remote,
         dirty: status.dirty,
+        dirty_files: status.dirty_files,
         open_tasks,
         recent_decisions,
         related_memories,
         inbox,
     })
+}
+
+pub fn repo_id(status: &RepoStatus) -> String {
+    status
+        .git_remote
+        .clone()
+        .unwrap_or_else(|| status.repo_path.clone())
+}
+
+fn parse_dirty_files(status: &str) -> Vec<String> {
+    status
+        .lines()
+        .filter_map(|line| {
+            let path = line.get(3..)?.trim();
+            if path.is_empty() {
+                None
+            } else if let Some((_, destination)) = path.split_once(" -> ") {
+                Some(destination.to_owned())
+            } else {
+                Some(path.to_owned())
+            }
+        })
+        .collect()
 }
 
 async fn inbox_events(
@@ -121,6 +149,68 @@ async fn inbox_events(
     events.sort_by(|left, right| right.created_at.cmp(&left.created_at));
     events.truncate(20);
     Ok(events)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn repo_status_reports_dirty_files() {
+        let dir = tempfile::tempdir().unwrap();
+        Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        fs::write(dir.path().join("README.md"), "repo").unwrap();
+        Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=Shuttle Test",
+                "-c",
+                "user.email=shuttle@example.test",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        fs::write(dir.path().join("note.txt"), "dirty").unwrap();
+
+        let status = repo_status(dir.path()).unwrap();
+
+        assert!(status.dirty);
+        assert_eq!(status.dirty_files, vec!["note.txt"]);
+    }
+
+    #[test]
+    fn repo_id_prefers_remote_over_path() {
+        let status = RepoStatus {
+            repo_path: "/tmp/repo".into(),
+            git_remote: Some("https://example.test/repo.git".into()),
+            branch: "main".into(),
+            commit: "abc".into(),
+            dirty: false,
+            dirty_files: Vec::new(),
+        };
+
+        assert_eq!(repo_id(&status), "https://example.test/repo.git");
+    }
+
+    #[test]
+    fn dirty_file_parser_normalizes_rename_destinations() {
+        let files = parse_dirty_files("R  old-name.txt -> new-name.txt\nC  old.rs -> copy.rs\n");
+
+        assert_eq!(files, vec!["new-name.txt", "copy.rs"]);
+    }
 }
 
 fn git<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<String> {

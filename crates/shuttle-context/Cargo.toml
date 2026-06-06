@@ -8,3 +8,6 @@ repository.workspace = true
 [dependencies]
 serde.workspace = true
 shuttle-core = { path = "../shuttle-core" }
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,10 +1,6 @@
 use serde_json::json;
 use shuttle_core::{Event, EventFilter, EventStore, EventType, NewEvent, Result};
 
-pub fn recipient_tag(agent: &str) -> String {
-    format!("to:{agent}")
-}
-
 pub fn new_message(
     workspace_id: String,
     from_agent: String,
@@ -21,6 +17,7 @@ pub fn new_message(
         bit_repo_id: None,
         branch: None,
         commit: None,
+        repo_dirty: None,
         agent: from_agent,
         session_id,
         title: None,
@@ -76,10 +73,5 @@ mod tests {
         assert_eq!(event.event_type, EventType::Message);
         assert!(event.tags.is_empty());
         assert_eq!(event.metadata_json["to"], "claude");
-    }
-
-    #[test]
-    fn recipient_tag_is_shared_by_messages_and_handoffs() {
-        assert_eq!(recipient_tag("codex"), "to:codex");
     }
 }

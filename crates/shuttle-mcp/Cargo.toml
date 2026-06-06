@@ -16,3 +16,6 @@ shuttle-message = { path = "../shuttle-message" }
 shuttle-store = { path = "../shuttle-store" }
 shuttle-task = { path = "../shuttle-task" }
 uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

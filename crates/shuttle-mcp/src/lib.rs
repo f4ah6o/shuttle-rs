@@ -4,7 +4,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use shuttle_core::{EventStore, Result, ShuttleError};
+use shuttle_core::{Event, EventStore, Result, ShuttleError};
 use shuttle_store::SqliteEventStore;
 use uuid::Uuid;
 
@@ -106,11 +106,14 @@ async fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
         }
         "shuttle.memory.store" => {
             let content = string_arg(&args, "content")?;
-            let event = shuttle_memory::new_memory(
-                runtime.workspace_id.clone(),
-                runtime.agent.clone(),
-                runtime.session_id.clone(),
-                content,
+            let event = with_repo_metadata(
+                shuttle_memory::new_memory(
+                    runtime.workspace_id.clone(),
+                    runtime.agent.clone(),
+                    runtime.session_id.clone(),
+                    content,
+                ),
+                runtime,
             );
             let event = runtime.store.append(event).await?;
             serde_json::to_value(event).map_err(|err| ShuttleError::Serialization(err.to_string()))
@@ -126,12 +129,15 @@ async fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
         "shuttle.message.send" => {
             let to_agent = string_arg(&args, "agent")?;
             let content = string_arg(&args, "content")?;
-            let event = shuttle_message::new_message(
-                runtime.workspace_id.clone(),
-                runtime.agent.clone(),
-                runtime.session_id.clone(),
-                to_agent,
-                content,
+            let event = with_repo_metadata(
+                shuttle_message::new_message(
+                    runtime.workspace_id.clone(),
+                    runtime.agent.clone(),
+                    runtime.session_id.clone(),
+                    to_agent,
+                    content,
+                ),
+                runtime,
             );
             let event = runtime.store.append(event).await?;
             serde_json::to_value(event).map_err(|err| ShuttleError::Serialization(err.to_string()))
@@ -142,11 +148,14 @@ async fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
         }
         "shuttle.task.create" => {
             let content = string_arg(&args, "content")?;
-            let event = shuttle_task::new_task(
-                runtime.workspace_id.clone(),
-                runtime.agent.clone(),
-                runtime.session_id.clone(),
-                content,
+            let event = with_repo_metadata(
+                shuttle_task::new_task(
+                    runtime.workspace_id.clone(),
+                    runtime.agent.clone(),
+                    runtime.session_id.clone(),
+                    content,
+                ),
+                runtime,
             );
             let event = runtime.store.append(event).await?;
             serde_json::to_value(event).map_err(|err| ShuttleError::Serialization(err.to_string()))
@@ -154,11 +163,14 @@ async fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
         "shuttle.task.claim" => {
             let id = Uuid::parse_str(&string_arg(&args, "id")?)
                 .map_err(|err| ShuttleError::Store(err.to_string()))?;
-            let event = shuttle_task::new_claim(
-                runtime.workspace_id.clone(),
-                runtime.agent.clone(),
-                runtime.session_id.clone(),
-                id,
+            let event = with_repo_metadata(
+                shuttle_task::new_claim(
+                    runtime.workspace_id.clone(),
+                    runtime.agent.clone(),
+                    runtime.session_id.clone(),
+                    id,
+                ),
+                runtime,
             );
             let event = runtime.store.append(event).await?;
             serde_json::to_value(event).map_err(|err| ShuttleError::Serialization(err.to_string()))
@@ -206,6 +218,28 @@ async fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
         }
         _ => Err(ShuttleError::Store(format!("unknown tool: {name}"))),
     }
+}
+
+fn with_repo_metadata(mut event: Event, runtime: &McpRuntime) -> Event {
+    if let Ok(status) = shuttle_context::repo_status(&runtime.cwd) {
+        let repo_id = shuttle_context::repo_id(&status);
+        event.repo_id = Some(repo_id.clone());
+        event.repo_path = Some(status.repo_path.clone());
+        event.git_remote = status.git_remote.clone();
+        event.branch = Some(status.branch.clone());
+        event.commit = Some(status.commit.clone());
+        event.repo_dirty = Some(status.dirty);
+        if let Some(metadata) = event.metadata_json.as_object_mut() {
+            metadata.insert("repo_id".to_owned(), json!(repo_id));
+            metadata.insert("repo_path".to_owned(), json!(status.repo_path));
+            metadata.insert("git_remote".to_owned(), json!(status.git_remote));
+            metadata.insert("branch".to_owned(), json!(status.branch));
+            metadata.insert("commit".to_owned(), json!(status.commit));
+            metadata.insert("repo_dirty".to_owned(), json!(status.dirty));
+            metadata.insert("dirty_files".to_owned(), json!(status.dirty_files));
+        }
+    }
+    event
 }
 
 fn string_arg(args: &Value, name: &str) -> Result<String> {
@@ -272,4 +306,80 @@ fn git_vec(cwd: &PathBuf, args: Vec<&str>) -> Result<String> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shuttle_core::{EventFilter, EventStore, EventType};
+    use std::fs;
+
+    #[test]
+    fn memory_store_tool_adds_repo_metadata() {
+        let repo = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        init_git_repo(repo.path());
+        fs::write(repo.path().join("dirty.txt"), "dirty").unwrap();
+        let store = SqliteEventStore::open(data.path().join("shuttle.db")).unwrap();
+        let runtime = McpRuntime {
+            store: store.clone(),
+            cwd: repo.path().to_path_buf(),
+            workspace_id: "workspace".into(),
+            agent: "codex".into(),
+            session_id: "session".into(),
+        };
+        let request = Request {
+            jsonrpc: Some("2.0".into()),
+            id: Some(json!(1)),
+            method: "tools/call".into(),
+            params: json!({
+                "name": "shuttle.memory.store",
+                "arguments": { "content": "repo-aware memory" }
+            }),
+        };
+
+        let response = futures_executor::block_on(handle_request(&runtime, request));
+        assert!(response.get("error").is_none());
+        let events = futures_executor::block_on(store.list(EventFilter {
+            event_type: Some(EventType::Memory),
+            ..EventFilter::default()
+        }))
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].repo_dirty, Some(true));
+        assert_eq!(events[0].metadata_json["repo_dirty"], true);
+        assert_eq!(events[0].metadata_json["dirty_files"], json!(["dirty.txt"]));
+        assert!(events[0].repo_id.is_some());
+        assert!(events[0].repo_path.is_some());
+        assert!(events[0].branch.is_some());
+        assert!(events[0].commit.is_some());
+    }
+
+    fn init_git_repo(path: &std::path::Path) {
+        Command::new("git")
+            .arg("init")
+            .current_dir(path)
+            .output()
+            .unwrap();
+        fs::write(path.join("README.md"), "repo").unwrap();
+        Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=Shuttle Test",
+                "-c",
+                "user.email=shuttle@example.test",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(path)
+            .output()
+            .unwrap();
+    }
 }
