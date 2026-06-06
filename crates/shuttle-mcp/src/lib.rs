@@ -2,7 +2,6 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::process::Command;
 
-use futures_executor::block_on;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use shuttle_core::{EventStore, Result, ShuttleError};
@@ -45,7 +44,7 @@ pub fn serve_stdio(runtime: McpRuntime) -> Result<()> {
             continue;
         }
         let response = match serde_json::from_str::<Request>(&line) {
-            Ok(request) => handle_request(&runtime, request),
+            Ok(request) => futures_executor::block_on(handle_request(&runtime, request)),
             Err(err) => json!({
                 "jsonrpc": "2.0",
                 "id": null,
@@ -61,7 +60,7 @@ pub fn serve_stdio(runtime: McpRuntime) -> Result<()> {
     Ok(())
 }
 
-pub fn handle_request(runtime: &McpRuntime, request: Request) -> Value {
+pub async fn handle_request(runtime: &McpRuntime, request: Request) -> Value {
     let id = request.id.clone().unwrap_or(Value::Null);
     if request.jsonrpc.as_deref() != Some("2.0") {
         return error(id, -32600, "invalid jsonrpc version");
@@ -78,7 +77,7 @@ pub fn handle_request(runtime: &McpRuntime, request: Request) -> Value {
         ),
         "notifications/initialized" => json!({"jsonrpc": "2.0"}),
         "tools/list" => ok(id, json!({ "tools": tools() })),
-        "tools/call" => match call_tool(runtime, request.params) {
+        "tools/call" => match call_tool(runtime, request.params).await {
             Ok(value) => ok(
                 id,
                 json!({ "content": [{ "type": "text", "text": value.to_string() }] }),
@@ -89,7 +88,7 @@ pub fn handle_request(runtime: &McpRuntime, request: Request) -> Value {
     }
 }
 
-fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
+async fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
@@ -102,7 +101,7 @@ fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
     match name {
         "shuttle.memory.search" => {
             let query = string_arg(&args, "query")?;
-            let events = block_on(shuttle_memory::recall(&runtime.store, &query))?;
+            let events = shuttle_memory::recall(&runtime.store, &query).await?;
             serde_json::to_value(events).map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
         "shuttle.memory.store" => {
@@ -113,7 +112,7 @@ fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
                 runtime.session_id.clone(),
                 content,
             );
-            let event = block_on(runtime.store.append(event))?;
+            let event = runtime.store.append(event).await?;
             serde_json::to_value(event).map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
         "shuttle.message.inbox" => {
@@ -121,7 +120,7 @@ fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
                 .get("agent")
                 .and_then(Value::as_str)
                 .unwrap_or(&runtime.agent);
-            let events = block_on(shuttle_message::inbox(&runtime.store, agent))?;
+            let events = shuttle_message::inbox(&runtime.store, agent).await?;
             serde_json::to_value(events).map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
         "shuttle.message.send" => {
@@ -134,11 +133,11 @@ fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
                 to_agent,
                 content,
             );
-            let event = block_on(runtime.store.append(event))?;
+            let event = runtime.store.append(event).await?;
             serde_json::to_value(event).map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
         "shuttle.task.list" => {
-            let events = block_on(shuttle_task::list(&runtime.store))?;
+            let events = shuttle_task::list(&runtime.store).await?;
             serde_json::to_value(events).map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
         "shuttle.task.create" => {
@@ -149,7 +148,7 @@ fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
                 runtime.session_id.clone(),
                 content,
             );
-            let event = block_on(runtime.store.append(event))?;
+            let event = runtime.store.append(event).await?;
             serde_json::to_value(event).map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
         "shuttle.task.claim" => {
@@ -161,16 +160,17 @@ fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
                 runtime.session_id.clone(),
                 id,
             );
-            let event = block_on(runtime.store.append(event))?;
+            let event = runtime.store.append(event).await?;
             serde_json::to_value(event).map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
         "shuttle.repo.context" => {
-            let context = block_on(shuttle_context::assemble_context(
+            let context = shuttle_context::assemble_context(
                 &runtime.store,
                 &runtime.cwd,
                 &runtime.workspace_id,
                 &runtime.agent,
-            ))?;
+            )
+            .await?;
             serde_json::to_value(context)
                 .map_err(|err| ShuttleError::Serialization(err.to_string()))
         }

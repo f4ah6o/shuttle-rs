@@ -6,7 +6,6 @@ use axum::http::{HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::{Json, Router};
-use futures_executor::block_on;
 use serde::Serialize;
 use shuttle_core::{Event, Result, ShuttleError};
 use shuttle_store::SqliteEventStore;
@@ -91,15 +90,20 @@ async fn index() -> Html<&'static str> {
 
 async fn dashboard(State(runtime): State<AppRuntime>) -> impl IntoResponse {
     Json(Dashboard {
-        inbox: block_on(shuttle_message::inbox(&runtime.store, &runtime.agent)).unwrap_or_default(),
-        tasks: block_on(shuttle_task::list(&runtime.store)).unwrap_or_default(),
-        memories: block_on(shuttle_memory::memories(&runtime.store)).unwrap_or_default(),
-        context: block_on(shuttle_context::assemble_context(
+        inbox: shuttle_message::inbox(&runtime.store, &runtime.agent)
+            .await
+            .unwrap_or_default(),
+        tasks: shuttle_task::list(&runtime.store).await.unwrap_or_default(),
+        memories: shuttle_memory::memories(&runtime.store)
+            .await
+            .unwrap_or_default(),
+        context: shuttle_context::assemble_context(
             &runtime.store,
             &runtime.cwd,
             &runtime.workspace_id,
             &runtime.agent,
-        ))
+        )
+        .await
         .unwrap_or_else(|_| shuttle_context::Context {
             repo: runtime.cwd.display().to_string(),
             branch: "unknown".to_owned(),
@@ -115,25 +119,34 @@ async fn dashboard(State(runtime): State<AppRuntime>) -> impl IntoResponse {
 }
 
 async fn inbox(State(runtime): State<AppRuntime>) -> impl IntoResponse {
-    Json(block_on(shuttle_message::inbox(&runtime.store, &runtime.agent)).unwrap_or_default())
+    Json(
+        shuttle_message::inbox(&runtime.store, &runtime.agent)
+            .await
+            .unwrap_or_default(),
+    )
 }
 
 async fn tasks(State(runtime): State<AppRuntime>) -> impl IntoResponse {
-    Json(block_on(shuttle_task::list(&runtime.store)).unwrap_or_default())
+    Json(shuttle_task::list(&runtime.store).await.unwrap_or_default())
 }
 
 async fn memories(State(runtime): State<AppRuntime>) -> impl IntoResponse {
-    Json(block_on(shuttle_memory::memories(&runtime.store)).unwrap_or_default())
+    Json(
+        shuttle_memory::memories(&runtime.store)
+            .await
+            .unwrap_or_default(),
+    )
 }
 
 async fn context(State(runtime): State<AppRuntime>) -> impl IntoResponse {
     Json(
-        block_on(shuttle_context::assemble_context(
+        shuttle_context::assemble_context(
             &runtime.store,
             &runtime.cwd,
             &runtime.workspace_id,
             &runtime.agent,
-        ))
+        )
+        .await
         .ok(),
     )
 }
@@ -163,7 +176,8 @@ async fn mcp_post(
             session_id: "http".to_owned(),
         },
         request,
-    );
+    )
+    .await;
     with_cors(Json(response))
 }
 
