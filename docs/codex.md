@@ -65,4 +65,16 @@ Set `SHUTTLE_MCP_BEARER_TOKEN` before starting the app server to require
 repository root so context, recall, task, handoff, message, and repo tools use
 the same local `.shuttle/shuttle.db`.
 
+For web chat clients that require a public remote MCP URL, run Shuttle through a
+Cloudflare Named Tunnel:
+
+```bash
+SHUTTLE_OAUTH_ADMIN_TOKEN=<admin-token> \
+CLOUDFLARE_TUNNEL_TOKEN=<cloudflare-tunnel-token> \
+stl app tunnel --public-url https://shuttle.example.com
+```
+
+Register `https://shuttle.example.com/mcp` as the remote MCP endpoint. Keep the
+Cloudflare token in a secret manager or runtime-injected environment variable.
+
 If MCP is unavailable, use the CLI workflow directly.

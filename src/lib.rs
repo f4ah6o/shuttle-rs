@@ -5,5 +5,6 @@ pub mod mcp;
 pub mod memory;
 pub mod mesh;
 pub mod message;
+pub mod oauth;
 pub mod store;
 pub mod task;
