@@ -1,3 +1,4 @@
+use serde_json::json;
 use shuttle_core::{Event, EventFilter, EventStore, EventType, NewEvent, Result};
 
 pub fn recipient_tag(agent: &str) -> String {
@@ -24,7 +25,8 @@ pub fn new_message(
         session_id,
         title: None,
         content,
-        tags: vec![recipient_tag(&to_agent)],
+        tags: Vec::new(),
+        metadata_json: json!({ "to": to_agent }),
     })
 }
 
@@ -32,7 +34,7 @@ pub async fn inbox(store: &impl EventStore, agent: &str) -> Result<Vec<Event>> {
     let mut events = store
         .list(EventFilter {
             event_type: Some(EventType::Message),
-            tag: Some(recipient_tag(agent)),
+            recipient: Some(agent.to_owned()),
             ..EventFilter::default()
         })
         .await?;
@@ -40,7 +42,7 @@ pub async fn inbox(store: &impl EventStore, agent: &str) -> Result<Vec<Event>> {
         store
             .list(EventFilter {
                 event_type: Some(EventType::Handoff),
-                tag: Some(recipient_tag(agent)),
+                recipient: Some(agent.to_owned()),
                 ..EventFilter::default()
             })
             .await?,
@@ -63,7 +65,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn message_uses_recipient_tag() {
+    fn message_uses_recipient_metadata() {
         let event = new_message(
             "workspace".into(),
             "codex".into(),
@@ -72,7 +74,8 @@ mod tests {
             "review this".into(),
         );
         assert_eq!(event.event_type, EventType::Message);
-        assert_eq!(event.tags, vec!["to:claude"]);
+        assert!(event.tags.is_empty());
+        assert_eq!(event.metadata_json["to"], "claude");
     }
 
     #[test]

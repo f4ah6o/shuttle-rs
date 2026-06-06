@@ -1,3 +1,4 @@
+use serde_json::json;
 use shuttle_core::{Event, EventFilter, EventStore, EventType, NewEvent, Result};
 
 pub fn new_memory(
@@ -20,6 +21,7 @@ pub fn new_memory(
         title: None,
         content,
         tags: Vec::new(),
+        metadata_json: json!({}),
     })
 }
 
