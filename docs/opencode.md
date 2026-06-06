@@ -34,6 +34,17 @@ Set `SHUTTLE_MCP_BEARER_TOKEN` before starting the app server to require
 working directory for the MCP server. That lets Shuttle attach repository
 metadata and store events in `.shuttle/shuttle.db`.
 
+For remote MCP clients such as web chat connectors, expose the same server
+through a Cloudflare Named Tunnel:
+
+```bash
+SHUTTLE_OAUTH_ADMIN_TOKEN=<admin-token> \
+CLOUDFLARE_TUNNEL_TOKEN=<cloudflare-tunnel-token> \
+stl app tunnel --public-url https://shuttle.example.com
+```
+
+Register `https://shuttle.example.com/mcp` with the remote client.
+
 Recommended startup workflow:
 
 ```text

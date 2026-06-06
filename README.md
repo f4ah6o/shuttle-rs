@@ -84,6 +84,20 @@ Set `SHUTTLE_MCP_BEARER_TOKEN` before starting `stl app serve` to require
 `Authorization: Bearer <token>` on MCP requests. When the variable is unset,
 local MCP remains unauthenticated.
 
+Expose Shuttle as a remote MCP server for web chat clients with a Cloudflare
+Named Tunnel:
+
+```bash
+SHUTTLE_OAUTH_ADMIN_TOKEN=<admin-token> \
+CLOUDFLARE_TUNNEL_TOKEN=<cloudflare-tunnel-token> \
+stl app tunnel --public-url https://shuttle.example.com
+```
+
+Configure ChatGPT or Claude with `https://shuttle.example.com/mcp`. The tunnel
+token is read only from the environment, so use a secret manager or runtime
+injection instead of putting it in shell history. The public URL must match the
+Cloudflare Tunnel hostname that forwards to `http://127.0.0.1:8787`.
+
 Synchronize event logs between Shuttle instances:
 
 ```bash
