@@ -22,7 +22,7 @@ pub struct AppRuntime {
 #[derive(Debug, Serialize)]
 struct Dashboard {
     inbox: Vec<Event>,
-    tasks: Vec<Event>,
+    tasks: Vec<shuttle_task::TaskSummary>,
     memories: Vec<Event>,
     context: shuttle_context::Context,
 }
@@ -115,10 +115,12 @@ async fn dashboard(State(runtime): State<AppRuntime>) -> impl IntoResponse {
             dirty: false,
             dirty_files: Vec::new(),
             open_tasks: Vec::new(),
+            claimed_tasks: Vec::new(),
             recent_decisions: Vec::new(),
             related_memories: Vec::new(),
             recent_messages: Vec::new(),
             pending_handoffs: Vec::new(),
+            recent_completed_handoffs: Vec::new(),
             inbox: Vec::new(),
         }),
     })
