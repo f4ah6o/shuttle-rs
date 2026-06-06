@@ -99,12 +99,12 @@ async fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
         .unwrap_or_else(|| json!({}));
 
     match name {
-        "shuttle.memory.search" => {
+        "shuttle.memory.search" | "recall" => {
             let query = string_arg(&args, "query")?;
             let events = shuttle_memory::recall(&runtime.store, &query).await?;
             serde_json::to_value(events).map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
-        "shuttle.memory.store" => {
+        "shuttle.memory.store" | "remember" => {
             let content = string_arg(&args, "content")?;
             let event = with_repo_metadata(
                 shuttle_memory::new_memory(
@@ -118,7 +118,7 @@ async fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
             let event = runtime.store.append(event).await?;
             serde_json::to_value(event).map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
-        "shuttle.message.inbox" => {
+        "shuttle.message.inbox" | "inbox" => {
             let agent = args
                 .get("agent")
                 .and_then(Value::as_str)
@@ -126,11 +126,11 @@ async fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
             let events = shuttle_message::inbox(&runtime.store, agent).await?;
             serde_json::to_value(events).map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
-        "shuttle.message.history" => {
+        "shuttle.message.history" | "history" => {
             let events = shuttle_message::history(&runtime.store).await?;
             serde_json::to_value(events).map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
-        "shuttle.message.send" => {
+        "shuttle.message.send" | "send" => {
             let to_agent = string_arg(&args, "agent")?;
             let content = string_arg(&args, "content")?;
             let event = with_repo_metadata(
@@ -146,7 +146,7 @@ async fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
             let event = runtime.store.append(event).await?;
             serde_json::to_value(event).map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
-        "shuttle.task.list" => {
+        "shuttle.task.list" | "tasks" => {
             let tasks =
                 shuttle_task::tasks(&runtime.store, Some(&runtime.workspace_id), None).await?;
             serde_json::to_value(tasks).map_err(|err| ShuttleError::Serialization(err.to_string()))
@@ -269,7 +269,7 @@ async fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
             let event = runtime.store.append(event).await?;
             serde_json::to_value(event).map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
-        "shuttle.repo.context" => {
+        "shuttle.repo.context" | "context" => {
             let context = shuttle_context::assemble_context(
                 &runtime.store,
                 &runtime.cwd,
@@ -345,6 +345,13 @@ fn string_arg(args: &Value, name: &str) -> Result<String> {
 
 fn tools() -> Vec<Tool> {
     vec![
+        tool("remember", "Store a local Shuttle memory"),
+        tool("recall", "Search local Shuttle memories"),
+        tool("inbox", "Read an agent inbox"),
+        tool("send", "Send a message to an agent"),
+        tool("history", "Read message history"),
+        tool("context", "Read assembled repo context"),
+        tool("tasks", "List Shuttle task state"),
         tool("shuttle.memory.search", "Search local Shuttle memories"),
         tool("shuttle.memory.store", "Store a local Shuttle memory"),
         tool("shuttle.message.inbox", "Read an agent inbox"),
