@@ -679,4 +679,182 @@ mod tests {
             dir.path().canonicalize().unwrap()
         );
     }
+
+    #[test]
+    fn repo_metadata_is_added_to_phase_one_events() {
+        let repo = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        init_git_repo(repo.path());
+        fs::write(repo.path().join("dirty.txt"), "dirty").unwrap();
+        let env = test_env(repo.path(), data.path());
+        let store = open_store(&env).unwrap();
+
+        let memory = with_repo_metadata(
+            shuttle_memory::new_memory(
+                env.workspace_id.clone(),
+                env.agent.clone(),
+                env.session_id.clone(),
+                "repo memory".into(),
+            ),
+            &env,
+        );
+        let message = with_repo_metadata(
+            shuttle_message::new_message(
+                env.workspace_id.clone(),
+                env.agent.clone(),
+                env.session_id.clone(),
+                "reviewer".into(),
+                "repo message".into(),
+            ),
+            &env,
+        );
+        let decision =
+            append_typed_memory(&store, &env, EventType::Decision, "repo decision".into()).unwrap();
+        let repo_path = repo.path().canonicalize().unwrap();
+
+        for event in [memory, message, decision] {
+            assert!(event.repo_id.is_some());
+            assert_eq!(
+                PathBuf::from(event.repo_path.as_deref().unwrap())
+                    .canonicalize()
+                    .unwrap(),
+                repo_path
+            );
+            assert!(event.branch.is_some());
+            assert!(event.commit.is_some());
+            assert_eq!(event.repo_dirty, Some(true));
+            assert_eq!(event.metadata_json["repo_dirty"], true);
+            assert_eq!(event.metadata_json["dirty_files"], json!(["dirty.txt"]));
+        }
+    }
+
+    #[test]
+    fn typed_recall_filters_and_preserves_ranked_json_shape() {
+        let repo = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        init_git_repo(repo.path());
+        let env = test_env(repo.path(), data.path());
+        let store = open_store(&env).unwrap();
+        let memory = with_repo_metadata(
+            shuttle_memory::new_memory(
+                env.workspace_id.clone(),
+                env.agent.clone(),
+                env.session_id.clone(),
+                "SQLite storage note".into(),
+            ),
+            &env,
+        );
+        let decision = append_typed_memory(
+            &store,
+            &env,
+            EventType::Decision,
+            "SQLite storage decision".into(),
+        )
+        .unwrap();
+        block_on(store.append(memory)).unwrap();
+
+        let status = shuttle_context::repo_status(repo.path()).unwrap();
+        let repo_id = shuttle_context::repo_id(&status);
+        let results = block_on(shuttle_memory::ranked_recall(
+            &store,
+            "SQLite storage",
+            Some(EventType::Decision),
+            Some(&env.workspace_id),
+            Some(&repo_id),
+            Some(&status.branch),
+        ))
+        .unwrap();
+        let json = serde_json::to_value(&results).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].event.id, decision.id);
+        assert_eq!(json[0]["event"]["event_type"], "decision");
+        assert_eq!(json[0]["event"]["metadata_json"]["kind"], "decision");
+        assert!(json[0]["score"].as_i64().unwrap() > 0);
+        assert!(json[0]["reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|reason| reason == "decision event"));
+    }
+
+    #[test]
+    fn ranked_recall_prefers_same_repo_branch_decisions() {
+        let repo = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        init_git_repo(repo.path());
+        let env = test_env(repo.path(), data.path());
+        let store = open_store(&env).unwrap();
+        let status = shuttle_context::repo_status(repo.path()).unwrap();
+        let repo_id = shuttle_context::repo_id(&status);
+        let mut generic = shuttle_memory::new_memory(
+            env.workspace_id.clone(),
+            env.agent.clone(),
+            env.session_id.clone(),
+            "SQLite storage decision".into(),
+        );
+        generic.repo_id = Some("other-repo".into());
+        generic.branch = Some("other-branch".into());
+        let decision = append_typed_memory(
+            &store,
+            &env,
+            EventType::Decision,
+            "SQLite storage decision".into(),
+        )
+        .unwrap();
+        block_on(store.append(generic)).unwrap();
+
+        let results = block_on(shuttle_memory::ranked_recall(
+            &store,
+            "SQLite storage decision",
+            None,
+            Some(&env.workspace_id),
+            Some(&repo_id),
+            Some(&status.branch),
+        ))
+        .unwrap();
+
+        assert_eq!(results[0].event.id, decision.id);
+        assert!(results[0].reasons.contains(&"decision event".to_owned()));
+        assert!(results[0].reasons.contains(&"same repo".to_owned()));
+        assert!(results[0].reasons.contains(&"same branch".to_owned()));
+    }
+
+    fn test_env(repo: &Path, data: &Path) -> RuntimeEnv {
+        RuntimeEnv {
+            cwd: repo.to_path_buf(),
+            shuttle_dir: data.join(".shuttle"),
+            database_path: data.join(".shuttle/shuttle.db"),
+            workspace_id: "workspace".into(),
+            agent: "codex".into(),
+            session_id: "session".into(),
+        }
+    }
+
+    fn init_git_repo(path: &Path) {
+        ProcessCommand::new("git")
+            .arg("init")
+            .current_dir(path)
+            .output()
+            .unwrap();
+        fs::write(path.join("README.md"), "repo").unwrap();
+        ProcessCommand::new("git")
+            .args(["add", "README.md"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        ProcessCommand::new("git")
+            .args([
+                "-c",
+                "user.name=Shuttle Test",
+                "-c",
+                "user.email=shuttle@example.test",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(path)
+            .output()
+            .unwrap();
+    }
 }
