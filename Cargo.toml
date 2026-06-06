@@ -4,9 +4,11 @@ members = [
     "crates/shuttle-store",
     "crates/shuttle-message",
     "crates/shuttle-memory",
+    "crates/shuttle-task",
     "crates/shuttle-context",
     "crates/shuttle-mcp",
-    "crates/shuttle-sync",
+    "crates/shuttle-app",
+    "crates/shuttle-mesh",
     "crates/stl",
 ]
 resolver = "2"
@@ -19,12 +21,15 @@ repository = "https://github.com/shuttle-rs/shuttle-rs"
 [workspace.dependencies]
 anyhow = "1"
 async-trait = "0.1"
+axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
+rmcp = { version = "1.7", features = ["server", "transport-io"] }
 rusqlite = { version = "0.31", features = ["bundled", "chrono", "uuid"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 thiserror = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 futures-executor = "0.3"

@@ -1,11 +1,12 @@
 [package]
-name = "shuttle-mcp"
+name = "shuttle-app"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
+axum.workspace = true
 futures-executor.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -13,6 +14,7 @@ shuttle-context = { path = "../shuttle-context" }
 shuttle-core = { path = "../shuttle-core" }
 shuttle-memory = { path = "../shuttle-memory" }
 shuttle-message = { path = "../shuttle-message" }
+shuttle-mcp = { path = "../shuttle-mcp" }
 shuttle-store = { path = "../shuttle-store" }
 shuttle-task = { path = "../shuttle-task" }
-uuid.workspace = true
+tokio.workspace = true
