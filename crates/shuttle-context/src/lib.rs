@@ -102,7 +102,7 @@ async fn inbox_events(
         .list(EventFilter {
             event_type: Some(EventType::Message),
             workspace_id: Some(workspace_id.to_owned()),
-            tag: Some(format!("to:{agent}")),
+            recipient: Some(agent.to_owned()),
             limit: Some(20),
             ..EventFilter::default()
         })
@@ -112,7 +112,7 @@ async fn inbox_events(
             .list(EventFilter {
                 event_type: Some(EventType::Handoff),
                 workspace_id: Some(workspace_id.to_owned()),
-                tag: Some(format!("to:{agent}")),
+                recipient: Some(agent.to_owned()),
                 limit: Some(20),
                 ..EventFilter::default()
             })

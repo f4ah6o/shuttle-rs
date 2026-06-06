@@ -840,6 +840,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "serde",
+ "serde_json",
  "thiserror",
  "uuid",
 ]
@@ -864,6 +865,7 @@ dependencies = [
 name = "shuttle-memory"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "shuttle-core",
 ]
 
@@ -875,6 +877,7 @@ version = "0.1.0"
 name = "shuttle-message"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "shuttle-core",
 ]
 
@@ -896,6 +899,7 @@ dependencies = [
 name = "shuttle-task"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "shuttle-core",
  "uuid",
 ]
@@ -937,6 +941,7 @@ name = "stl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "futures-executor",
  "serde",
@@ -949,6 +954,7 @@ dependencies = [
  "shuttle-message",
  "shuttle-store",
  "shuttle-task",
+ "tempfile",
  "tokio",
  "uuid",
 ]

@@ -1,3 +1,4 @@
+use serde_json::json;
 use shuttle_core::{Event, EventFilter, EventStore, EventType, NewEvent, Result};
 use uuid::Uuid;
 
@@ -27,6 +28,7 @@ pub fn new_task(workspace_id: String, agent: String, session_id: String, content
         title: Some("task".to_owned()),
         content,
         tags: vec![TAG_OPEN.to_owned()],
+        metadata_json: json!({}),
     })
 }
 
@@ -49,6 +51,7 @@ pub fn new_claim(workspace_id: String, agent: String, session_id: String, task_i
             claim_tag(&agent),
             task_ref_tag(task_id),
         ],
+        metadata_json: json!({}),
     })
 }
 
