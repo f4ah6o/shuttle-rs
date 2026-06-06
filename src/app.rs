@@ -83,7 +83,10 @@ pub fn router(runtime: AppRuntime) -> Router {
         .with_state(runtime)
 }
 
-async fn index() -> Html<&'static str> {
+async fn index(headers: HeaderMap, State(runtime): State<AppRuntime>) -> Response {
+    if let Some(response) = mcp_unauthorized_response(runtime.oauth.as_ref(), &headers) {
+        return response;
+    }
     Html(
         r#"<!doctype html>
 <html>
@@ -107,17 +110,25 @@ async fn index() -> Html<&'static str> {
       const root = document.getElementById('dashboard');
       for (const [name, value] of Object.entries(data)) {
         const section = document.createElement('section');
-        section.innerHTML = `<h2>${name}</h2><pre>${JSON.stringify(value, null, 2)}</pre>`;
-        root.appendChild(section);
+        const heading = document.createElement('h2');
+        heading.textContent = name;
+        const pre = document.createElement('pre');
+        pre.textContent = JSON.stringify(value, null, 2);
+        section.append(heading, pre);
+        root.append(section);
       }
     });
   </script>
 </body>
 </html>"#,
     )
+    .into_response()
 }
 
-async fn dashboard(State(runtime): State<AppRuntime>) -> impl IntoResponse {
+async fn dashboard(headers: HeaderMap, State(runtime): State<AppRuntime>) -> Response {
+    if let Some(response) = mcp_unauthorized_response(runtime.oauth.as_ref(), &headers) {
+        return response;
+    }
     Json(Dashboard {
         inbox: crate::message::inbox(&runtime.store, &runtime.agent)
             .await
@@ -152,33 +163,49 @@ async fn dashboard(State(runtime): State<AppRuntime>) -> impl IntoResponse {
             inbox: Vec::new(),
         }),
     })
+    .into_response()
 }
 
-async fn inbox(State(runtime): State<AppRuntime>) -> impl IntoResponse {
+async fn inbox(headers: HeaderMap, State(runtime): State<AppRuntime>) -> Response {
+    if let Some(response) = mcp_unauthorized_response(runtime.oauth.as_ref(), &headers) {
+        return response;
+    }
     Json(
         crate::message::inbox(&runtime.store, &runtime.agent)
             .await
             .unwrap_or_default(),
     )
+    .into_response()
 }
 
-async fn tasks(State(runtime): State<AppRuntime>) -> impl IntoResponse {
+async fn tasks(headers: HeaderMap, State(runtime): State<AppRuntime>) -> Response {
+    if let Some(response) = mcp_unauthorized_response(runtime.oauth.as_ref(), &headers) {
+        return response;
+    }
     Json(
         crate::task::open_tasks(&runtime.store, &runtime.workspace_id, Some(20))
             .await
             .unwrap_or_default(),
     )
+    .into_response()
 }
 
-async fn memories(State(runtime): State<AppRuntime>) -> impl IntoResponse {
+async fn memories(headers: HeaderMap, State(runtime): State<AppRuntime>) -> Response {
+    if let Some(response) = mcp_unauthorized_response(runtime.oauth.as_ref(), &headers) {
+        return response;
+    }
     Json(
         crate::memory::memories(&runtime.store)
             .await
             .unwrap_or_default(),
     )
+    .into_response()
 }
 
-async fn context(State(runtime): State<AppRuntime>) -> impl IntoResponse {
+async fn context(headers: HeaderMap, State(runtime): State<AppRuntime>) -> Response {
+    if let Some(response) = mcp_unauthorized_response(runtime.oauth.as_ref(), &headers) {
+        return response;
+    }
     Json(
         crate::context::assemble_context(
             &runtime.store,
@@ -189,6 +216,7 @@ async fn context(State(runtime): State<AppRuntime>) -> impl IntoResponse {
         .await
         .ok(),
     )
+    .into_response()
 }
 
 async fn mcp_health(headers: HeaderMap, State(runtime): State<AppRuntime>) -> Response {
@@ -510,4 +538,148 @@ fn html_escape(value: &str) -> String {
 
 fn quoted_header_value(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Method, Request};
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use http_body_util::BodyExt;
+    use sha2::{Digest, Sha256};
+    use tower::ServiceExt;
+
+    fn runtime(oauth: Option<OAuthRuntime>) -> AppRuntime {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let db = dir.join("shuttle.db");
+        AppRuntime {
+            store: SqliteEventStore::open(&db).unwrap(),
+            cwd: dir,
+            workspace_id: "workspace".to_owned(),
+            agent: "codex".to_owned(),
+            session_id: "session".to_owned(),
+            oauth,
+        }
+    }
+
+    fn oauth_runtime() -> OAuthRuntime {
+        let dir = tempfile::tempdir().unwrap().keep();
+        OAuthRuntime {
+            config: OAuthConfig {
+                public_url: "https://shuttle.example.test".to_owned(),
+                admin_token: Some("admin-token".to_owned()),
+            },
+            store: OAuthStore::open(dir.join("oauth.db")).unwrap(),
+        }
+    }
+
+    fn issue_access_token(oauth: &OAuthRuntime) -> String {
+        let verifier = "abc123abc123abc123abc123abc123abc123abc123abc123";
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        let client = oauth
+            .store
+            .register_client(oauth::RegisterRequest {
+                redirect_uris: vec!["https://client.example.test/callback".to_owned()],
+                client_name: Some("client".to_owned()),
+            })
+            .unwrap();
+        let code = oauth
+            .store
+            .create_code(oauth::AuthorizeRequest {
+                response_type: "code".to_owned(),
+                client_id: client.client_id.clone(),
+                redirect_uri: "https://client.example.test/callback".to_owned(),
+                state: None,
+                scope: Some("mcp".to_owned()),
+                code_challenge: Some(challenge),
+                code_challenge_method: Some("S256".to_owned()),
+            })
+            .unwrap();
+        oauth
+            .store
+            .exchange_code(oauth::TokenRequest {
+                grant_type: "authorization_code".to_owned(),
+                client_id: client.client_id,
+                redirect_uri: "https://client.example.test/callback".to_owned(),
+                code: Some(code),
+                code_verifier: Some(verifier.to_owned()),
+            })
+            .unwrap()
+            .access_token
+    }
+
+    async fn request(
+        runtime: AppRuntime,
+        path: &str,
+        authorization: Option<&str>,
+    ) -> axum::response::Response {
+        let mut builder = Request::builder().method(Method::GET).uri(path);
+        if let Some(authorization) = authorization {
+            builder = builder.header(header::AUTHORIZATION, authorization);
+        }
+        router(runtime)
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn dashboard_routes_require_bearer_when_oauth_is_configured() {
+        let oauth = oauth_runtime();
+        let token = issue_access_token(&oauth);
+
+        let index = request(runtime(Some(oauth.clone())), "/", None).await;
+        let dashboard = request(runtime(Some(oauth.clone())), "/api/dashboard", None).await;
+        let authorized_index = request(
+            runtime(Some(oauth.clone())),
+            "/",
+            Some(&format!("Bearer {token}")),
+        )
+        .await;
+        let authorized_dashboard = request(
+            runtime(Some(oauth)),
+            "/api/dashboard",
+            Some(&format!("Bearer {token}")),
+        )
+        .await;
+
+        assert_eq!(index.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(dashboard.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(authorized_index.status(), StatusCode::OK);
+        assert_eq!(authorized_dashboard.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn dashboard_routes_remain_local_open_without_auth_configuration() {
+        let index = request(runtime(None), "/", None).await;
+        let dashboard = request(runtime(None), "/api/dashboard", None).await;
+
+        assert_eq!(index.status(), StatusCode::OK);
+        assert_eq!(dashboard.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn oauth_metadata_is_not_blocked_by_dashboard_auth() {
+        let response = request(
+            runtime(Some(oauth_runtime())),
+            "/.well-known/oauth-authorization-server",
+            None,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn dashboard_html_renders_json_as_text_not_inner_html() {
+        let response = request(runtime(None), "/", None).await;
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+
+        assert!(html.contains("heading.textContent = name"));
+        assert!(html.contains("pre.textContent = JSON.stringify(value, null, 2)"));
+        assert!(!html.contains("section.innerHTML"));
+    }
 }

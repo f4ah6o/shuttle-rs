@@ -670,12 +670,16 @@ fn app_oauth(
         return Ok(None);
     };
     let public_url = shuttle_rs::oauth::OAuthConfig::normalize_public_url(public_url);
+    let admin_token = env::var("SHUTTLE_OAUTH_ADMIN_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("OAuth public URL mode requires SHUTTLE_OAUTH_ADMIN_TOKEN to be set")
+        })?;
     Ok(Some(shuttle_rs::app::OAuthRuntime {
         config: shuttle_rs::oauth::OAuthConfig {
             public_url,
-            admin_token: env::var("SHUTTLE_OAUTH_ADMIN_TOKEN")
-                .ok()
-                .filter(|token| !token.is_empty()),
+            admin_token: Some(admin_token),
         },
         store: shuttle_rs::oauth::OAuthStore::open(&env.database_path).with_context(|| {
             format!("failed to open OAuth store {}", env.database_path.display())
@@ -1018,6 +1022,55 @@ mod tests {
         env::remove_var("SHUTTLE_SESSION_ID");
 
         assert_eq!(session_id, "override");
+    }
+
+    #[test]
+    fn app_oauth_requires_admin_token_for_public_url_mode() {
+        let _guard = env_lock();
+        let repo = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let env = test_env(repo.path(), data.path());
+        fs::create_dir_all(&env.shuttle_dir).unwrap();
+        env::remove_var("SHUTTLE_PUBLIC_URL");
+        env::remove_var("SHUTTLE_OAUTH_ADMIN_TOKEN");
+
+        let err = match app_oauth(&env, Some("https://shuttle.example.test".to_owned())) {
+            Ok(_) => panic!("app_oauth unexpectedly allowed public URL mode without admin token"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("SHUTTLE_OAUTH_ADMIN_TOKEN"));
+    }
+
+    #[test]
+    fn app_oauth_uses_admin_token_when_public_url_mode_is_enabled() {
+        let _guard = env_lock();
+        let repo = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let env = test_env(repo.path(), data.path());
+        fs::create_dir_all(&env.shuttle_dir).unwrap();
+        env::remove_var("SHUTTLE_PUBLIC_URL");
+        env::set_var("SHUTTLE_OAUTH_ADMIN_TOKEN", "admin-token");
+
+        let oauth = app_oauth(&env, Some("https://shuttle.example.test".to_owned()))
+            .unwrap()
+            .unwrap();
+
+        env::remove_var("SHUTTLE_OAUTH_ADMIN_TOKEN");
+        assert_eq!(oauth.config.admin_token.as_deref(), Some("admin-token"));
+    }
+
+    #[test]
+    fn app_oauth_remains_disabled_without_public_url() {
+        let _guard = env_lock();
+        let repo = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let env = test_env(repo.path(), data.path());
+        fs::create_dir_all(&env.shuttle_dir).unwrap();
+        env::remove_var("SHUTTLE_PUBLIC_URL");
+        env::remove_var("SHUTTLE_OAUTH_ADMIN_TOKEN");
+
+        assert!(app_oauth(&env, None).unwrap().is_none());
     }
 
     #[test]
