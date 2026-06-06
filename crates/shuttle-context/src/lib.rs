@@ -57,15 +57,7 @@ pub async fn assemble_context(
     agent: &str,
 ) -> Result<Context> {
     let status = repo_status(cwd)?;
-    let open_tasks = store
-        .list(EventFilter {
-            event_type: Some(EventType::Task),
-            workspace_id: Some(workspace_id.to_owned()),
-            tag: Some("task:open".to_owned()),
-            limit: Some(20),
-            ..EventFilter::default()
-        })
-        .await?;
+    let open_tasks = shuttle_task::open_tasks(store, workspace_id, Some(20)).await?;
     let recent_decisions = store
         .list(EventFilter {
             event_type: Some(EventType::Decision),
@@ -154,6 +146,8 @@ async fn inbox_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shuttle_core::EventStore;
+    use shuttle_store::SqliteEventStore;
     use std::fs;
 
     #[test]
@@ -210,6 +204,61 @@ mod tests {
         let files = parse_dirty_files("R  old-name.txt -> new-name.txt\nC  old.rs -> copy.rs\n");
 
         assert_eq!(files, vec!["new-name.txt", "copy.rs"]);
+    }
+
+    #[test]
+    fn context_excludes_claimed_tasks_from_open_tasks() {
+        let repo = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        init_git_repo(repo.path());
+        let store = SqliteEventStore::open(data.path().join("shuttle.db")).unwrap();
+        let task = shuttle_task::new_task(
+            "workspace".into(),
+            "codex".into(),
+            "session".into(),
+            "ship mvp".into(),
+        );
+        let claim = shuttle_task::new_claim(
+            "workspace".into(),
+            "claude".into(),
+            "session".into(),
+            task.id,
+        );
+        futures_executor::block_on(store.append(task)).unwrap();
+        futures_executor::block_on(store.append(claim)).unwrap();
+
+        let context =
+            futures_executor::block_on(assemble_context(&store, repo.path(), "workspace", "codex"))
+                .unwrap();
+
+        assert!(context.open_tasks.is_empty());
+    }
+
+    fn init_git_repo(path: &Path) {
+        Command::new("git")
+            .arg("init")
+            .current_dir(path)
+            .output()
+            .unwrap();
+        fs::write(path.join("README.md"), "repo").unwrap();
+        Command::new("git")
+            .args(["add", "README.md"])
+            .current_dir(path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=Shuttle Test",
+                "-c",
+                "user.email=shuttle@example.test",
+                "commit",
+                "-m",
+                "initial",
+            ])
+            .current_dir(path)
+            .output()
+            .unwrap();
     }
 }
 

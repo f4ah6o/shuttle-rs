@@ -132,7 +132,7 @@ impl EventStore for SqliteEventStore {
             .conn
             .lock()
             .map_err(|err| ShuttleError::Store(err.to_string()))?;
-        let limit = filter.limit.unwrap_or(50).min(500);
+        let limit = filter.limit.unwrap_or(50);
         let event_type = filter
             .event_type
             .map(|event_type| Value::Text(event_type.as_str().to_owned()));
