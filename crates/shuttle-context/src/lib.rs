@@ -3,6 +3,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 use shuttle_core::{Event, EventFilter, EventStore, EventType, Result, ShuttleError};
+use shuttle_task::{HandoffStatus, HandoffSummary, TaskStatus, TaskSummary};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Context {
@@ -12,11 +13,13 @@ pub struct Context {
     pub git_remote: Option<String>,
     pub dirty: bool,
     pub dirty_files: Vec<String>,
-    pub open_tasks: Vec<Event>,
+    pub open_tasks: Vec<TaskSummary>,
+    pub claimed_tasks: Vec<TaskSummary>,
     pub recent_decisions: Vec<Event>,
     pub related_memories: Vec<Event>,
     pub recent_messages: Vec<Event>,
-    pub pending_handoffs: Vec<Event>,
+    pub pending_handoffs: Vec<HandoffSummary>,
+    pub recent_completed_handoffs: Vec<HandoffSummary>,
     pub inbox: Vec<Event>,
 }
 
@@ -59,7 +62,19 @@ pub async fn assemble_context(
     agent: &str,
 ) -> Result<Context> {
     let status = repo_status(cwd)?;
-    let open_tasks = shuttle_task::open_tasks(store, workspace_id, Some(20)).await?;
+    let task_summaries = shuttle_task::tasks(store, Some(workspace_id), None).await?;
+    let open_tasks = task_summaries
+        .iter()
+        .filter(|task| task.status == TaskStatus::Open)
+        .take(20)
+        .cloned()
+        .collect();
+    let claimed_tasks = task_summaries
+        .iter()
+        .filter(|task| task.status == TaskStatus::Claimed)
+        .take(20)
+        .cloned()
+        .collect();
     let recent_decisions = store
         .list(EventFilter {
             event_type: Some(EventType::Decision),
@@ -84,14 +99,19 @@ pub async fn assemble_context(
             ..EventFilter::default()
         })
         .await?;
-    let pending_handoffs = store
-        .list(EventFilter {
-            event_type: Some(EventType::Handoff),
-            workspace_id: Some(workspace_id.to_owned()),
-            limit: Some(20),
-            ..EventFilter::default()
-        })
-        .await?;
+    let handoff_summaries = shuttle_task::handoffs(store, Some(workspace_id), None).await?;
+    let pending_handoffs = handoff_summaries
+        .iter()
+        .filter(|handoff| handoff.status == HandoffStatus::Pending)
+        .take(20)
+        .cloned()
+        .collect();
+    let recent_completed_handoffs = handoff_summaries
+        .iter()
+        .filter(|handoff| handoff.status == HandoffStatus::Completed)
+        .take(20)
+        .cloned()
+        .collect();
     let inbox = inbox_events(store, workspace_id, agent).await?;
 
     Ok(Context {
@@ -102,10 +122,12 @@ pub async fn assemble_context(
         dirty: status.dirty,
         dirty_files: status.dirty_files,
         open_tasks,
+        claimed_tasks,
         recent_decisions,
         related_memories,
         recent_messages,
         pending_handoffs,
+        recent_completed_handoffs,
         inbox,
     })
 }

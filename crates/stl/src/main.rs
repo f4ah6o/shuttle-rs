@@ -10,7 +10,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use futures_executor::block_on;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use shuttle_core::{Event, EventStore, EventType, NewEvent};
+use shuttle_core::{Event, EventStore, EventType};
 use shuttle_store::SqliteEventStore;
 use uuid::Uuid;
 
@@ -61,8 +61,8 @@ enum Command {
         command: TaskCommand,
     },
     Handoff {
-        agent: String,
-        content: String,
+        #[command(subcommand)]
+        command: HandoffCommand,
     },
     Context {
         #[arg(long)]
@@ -85,6 +85,16 @@ enum TaskCommand {
     List,
     Create { content: String },
     Claim { id: Uuid },
+    Update { id: Uuid, content: String },
+    Done { id: Uuid },
+}
+
+#[derive(Debug, Subcommand)]
+enum HandoffCommand {
+    Request { agent: String, content: String },
+    List,
+    Accept { id: Uuid },
+    Done { id: Uuid },
 }
 
 #[derive(Debug, Subcommand)]
@@ -241,8 +251,9 @@ fn main() -> Result<()> {
             let store = open_store(&env)?;
             match command {
                 TaskCommand::List => {
-                    let events = block_on(shuttle_task::list(&store))?;
-                    output_events(cli.json, &events, "tasks")?;
+                    let tasks =
+                        block_on(shuttle_task::tasks(&store, Some(&env.workspace_id), None))?;
+                    output_tasks(cli.json, &tasks)?;
                 }
                 TaskCommand::Create { content } => {
                     let event = with_repo_metadata(
@@ -258,6 +269,11 @@ fn main() -> Result<()> {
                     output(cli.json, &event, || format!("created task {}", event.id))?;
                 }
                 TaskCommand::Claim { id } => {
+                    block_on(shuttle_task::ensure_task_exists(
+                        &store,
+                        &env.workspace_id,
+                        id,
+                    ))?;
                     let event = with_repo_metadata(
                         shuttle_task::new_claim(
                             env.workspace_id.clone(),
@@ -270,34 +286,109 @@ fn main() -> Result<()> {
                     let event = block_on(store.append(event))?;
                     output(cli.json, &event, || format!("claimed task {id}"))?;
                 }
+                TaskCommand::Update { id, content } => {
+                    block_on(shuttle_task::ensure_task_exists(
+                        &store,
+                        &env.workspace_id,
+                        id,
+                    ))?;
+                    let event = with_repo_metadata(
+                        shuttle_task::new_task_update(
+                            env.workspace_id.clone(),
+                            env.agent.clone(),
+                            env.session_id.clone(),
+                            id,
+                            content,
+                        ),
+                        &env,
+                    );
+                    let event = block_on(store.append(event))?;
+                    output(cli.json, &event, || format!("updated task {id}"))?;
+                }
+                TaskCommand::Done { id } => {
+                    block_on(shuttle_task::ensure_task_exists(
+                        &store,
+                        &env.workspace_id,
+                        id,
+                    ))?;
+                    let event = with_repo_metadata(
+                        shuttle_task::new_task_done(
+                            env.workspace_id.clone(),
+                            env.agent.clone(),
+                            env.session_id.clone(),
+                            id,
+                        ),
+                        &env,
+                    );
+                    let event = block_on(store.append(event))?;
+                    output(cli.json, &event, || format!("completed task {id}"))?;
+                }
             }
         }
-        Command::Handoff { agent, content } => {
+        Command::Handoff { command } => {
             let store = open_store(&env)?;
-            let event = with_repo_metadata(
-                Event::new(NewEvent {
-                    event_type: EventType::Handoff,
-                    workspace_id: env.workspace_id.clone(),
-                    repo_id: None,
-                    repo_path: None,
-                    git_remote: None,
-                    bit_repo_id: None,
-                    branch: None,
-                    commit: None,
-                    repo_dirty: None,
-                    agent: env.agent.clone(),
-                    session_id: env.session_id.clone(),
-                    title: Some("handoff".to_owned()),
-                    content,
-                    tags: Vec::new(),
-                    metadata_json: json!({ "to": agent }),
-                }),
-                &env,
-            );
-            let event = block_on(store.append(event))?;
-            output(cli.json, &event, || {
-                format!("handed off to {agent}: {}", event.content)
-            })?;
+            match command {
+                HandoffCommand::Request { agent, content } => {
+                    let event = with_repo_metadata(
+                        shuttle_task::new_handoff(
+                            env.workspace_id.clone(),
+                            env.agent.clone(),
+                            env.session_id.clone(),
+                            agent.clone(),
+                            content,
+                        ),
+                        &env,
+                    );
+                    let event = block_on(store.append(event))?;
+                    output(cli.json, &event, || {
+                        format!("requested handoff to {agent}: {}", event.content)
+                    })?;
+                }
+                HandoffCommand::List => {
+                    let handoffs = block_on(shuttle_task::handoffs(
+                        &store,
+                        Some(&env.workspace_id),
+                        None,
+                    ))?;
+                    output_handoffs(cli.json, &handoffs)?;
+                }
+                HandoffCommand::Accept { id } => {
+                    block_on(shuttle_task::ensure_handoff_exists(
+                        &store,
+                        &env.workspace_id,
+                        id,
+                    ))?;
+                    let event = with_repo_metadata(
+                        shuttle_task::new_handoff_accept(
+                            env.workspace_id.clone(),
+                            env.agent.clone(),
+                            env.session_id.clone(),
+                            id,
+                        ),
+                        &env,
+                    );
+                    let event = block_on(store.append(event))?;
+                    output(cli.json, &event, || format!("accepted handoff {id}"))?;
+                }
+                HandoffCommand::Done { id } => {
+                    block_on(shuttle_task::ensure_handoff_exists(
+                        &store,
+                        &env.workspace_id,
+                        id,
+                    ))?;
+                    let event = with_repo_metadata(
+                        shuttle_task::new_handoff_done(
+                            env.workspace_id.clone(),
+                            env.agent.clone(),
+                            env.session_id.clone(),
+                            id,
+                        ),
+                        &env,
+                    );
+                    let event = block_on(store.append(event))?;
+                    output(cli.json, &event, || format!("completed handoff {id}"))?;
+                }
+            }
         }
         Command::Context { repo, branch } => {
             if repo && branch {
@@ -517,13 +608,67 @@ fn format_context(context: &shuttle_context::Context) -> String {
         }
         output.push('\n');
     }
-    push_event_section(&mut output, "Open Tasks", &context.open_tasks);
+    push_task_section(&mut output, "Open Tasks", &context.open_tasks);
+    push_task_section(&mut output, "Claimed Tasks", &context.claimed_tasks);
     push_event_section(&mut output, "Recent Decisions", &context.recent_decisions);
     push_event_section(&mut output, "Related Memories", &context.related_memories);
     push_event_section(&mut output, "Recent Messages", &context.recent_messages);
-    push_event_section(&mut output, "Pending Handoffs", &context.pending_handoffs);
+    push_handoff_section(&mut output, "Pending Handoffs", &context.pending_handoffs);
+    push_handoff_section(
+        &mut output,
+        "Recent Completed Handoffs",
+        &context.recent_completed_handoffs,
+    );
     push_event_section(&mut output, "Inbox", &context.inbox);
     output.trim_end().to_owned()
+}
+
+fn push_task_section(output: &mut String, title: &str, tasks: &[shuttle_task::TaskSummary]) {
+    output.push_str(title);
+    output.push('\n');
+    if tasks.is_empty() {
+        output.push_str("- none\n\n");
+        return;
+    }
+    for task in tasks {
+        let claimed_by = task
+            .claimed_by
+            .as_deref()
+            .map(|agent| format!(" claimed_by={agent}"))
+            .unwrap_or_default();
+        output.push_str(&format!(
+            "- [{}] {}{}: {}\n",
+            task.id,
+            task.status.as_str(),
+            claimed_by,
+            task.content
+        ));
+    }
+    output.push('\n');
+}
+
+fn push_handoff_section(
+    output: &mut String,
+    title: &str,
+    handoffs: &[shuttle_task::HandoffSummary],
+) {
+    output.push_str(title);
+    output.push('\n');
+    if handoffs.is_empty() {
+        output.push_str("- none\n\n");
+        return;
+    }
+    for handoff in handoffs {
+        output.push_str(&format!(
+            "- [{}] {} {} -> {}: {}\n",
+            handoff.id,
+            handoff.status.as_str(),
+            handoff.from_agent,
+            handoff.to_agent,
+            handoff.content
+        ));
+    }
+    output.push('\n');
 }
 
 fn push_event_section(output: &mut String, title: &str, events: &[Event]) {
@@ -574,6 +719,54 @@ fn output_events(json: bool, events: &[Event], label: &str) -> Result<()> {
         );
     }
 
+    Ok(())
+}
+
+fn output_tasks(json: bool, tasks: &[shuttle_task::TaskSummary]) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(tasks)?);
+        return Ok(());
+    }
+    if tasks.is_empty() {
+        println!("no tasks");
+        return Ok(());
+    }
+    for task in tasks {
+        let claimed_by = task
+            .claimed_by
+            .as_deref()
+            .map(|agent| format!(" claimed_by={agent}"))
+            .unwrap_or_default();
+        println!(
+            "- [{}] {}{}: {}",
+            task.id,
+            task.status.as_str(),
+            claimed_by,
+            task.content
+        );
+    }
+    Ok(())
+}
+
+fn output_handoffs(json: bool, handoffs: &[shuttle_task::HandoffSummary]) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(handoffs)?);
+        return Ok(());
+    }
+    if handoffs.is_empty() {
+        println!("no handoffs");
+        return Ok(());
+    }
+    for handoff in handoffs {
+        println!(
+            "- [{}] {} {} -> {}: {}",
+            handoff.id,
+            handoff.status.as_str(),
+            handoff.from_agent,
+            handoff.to_agent,
+            handoff.content
+        );
+    }
     Ok(())
 }
 

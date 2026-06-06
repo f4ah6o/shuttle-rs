@@ -905,7 +905,9 @@ dependencies = [
 name = "shuttle-task"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "futures-executor",
+ "serde",
  "serde_json",
  "shuttle-core",
  "shuttle-store",
