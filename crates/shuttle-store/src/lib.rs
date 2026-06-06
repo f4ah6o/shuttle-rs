@@ -39,6 +39,7 @@ impl SqliteEventStore {
                 bit_repo_id TEXT,
                 branch TEXT,
                 commit_hash TEXT,
+                repo_dirty INTEGER,
                 agent TEXT NOT NULL,
                 session_id TEXT NOT NULL,
                 title TEXT,
@@ -65,6 +66,7 @@ impl SqliteEventStore {
         ensure_column(&conn, "repo_path", "TEXT")?;
         ensure_column(&conn, "git_remote", "TEXT")?;
         ensure_column(&conn, "bit_repo_id", "TEXT")?;
+        ensure_column(&conn, "repo_dirty", "INTEGER")?;
         ensure_column(&conn, "metadata_json", "TEXT NOT NULL DEFAULT '{}'")?;
         backfill_event_tags(&conn)?;
         Ok(())
@@ -87,9 +89,9 @@ impl EventStore for SqliteEventStore {
         tx.execute(
             r#"
             INSERT INTO events (
-                id, event_type, workspace_id, repo_id, repo_path, git_remote, bit_repo_id, branch, commit_hash,
+                id, event_type, workspace_id, repo_id, repo_path, git_remote, bit_repo_id, branch, commit_hash, repo_dirty,
                 agent, session_id, title, content, tags, metadata_json, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
             "#,
             params![
                 event.id.to_string(),
@@ -101,6 +103,7 @@ impl EventStore for SqliteEventStore {
                 &event.bit_repo_id,
                 &event.branch,
                 &event.commit,
+                event.repo_dirty,
                 &event.agent,
                 &event.session_id,
                 &event.title,
@@ -136,20 +139,24 @@ impl EventStore for SqliteEventStore {
             .query
             .as_ref()
             .map(|query| format!("%{}%", query.to_lowercase()));
+        let tags = filter_tags(&filter)?;
         let mut stmt = conn
             .prepare(
                 r#"
-                SELECT id, event_type, workspace_id, repo_id, repo_path, git_remote, bit_repo_id, branch, commit_hash,
+                SELECT id, event_type, workspace_id, repo_id, repo_path, git_remote, bit_repo_id, branch, commit_hash, repo_dirty,
                        agent, session_id, title, content, tags, metadata_json, created_at
                 FROM events
                 WHERE (?1 IS NULL OR event_type = ?1)
                   AND (?2 IS NULL OR workspace_id = ?2)
                   AND (?3 IS NULL OR agent = ?3)
                   AND (
-                    ?4 IS NULL
-                    OR EXISTS (
-                      SELECT 1 FROM event_tags
-                      WHERE event_tags.event_id = events.id AND event_tags.tag = ?4
+                    ?4 = '[]'
+                    OR NOT EXISTS (
+                      SELECT 1 FROM json_each(?4) AS wanted
+                      WHERE NOT EXISTS (
+                        SELECT 1 FROM event_tags
+                        WHERE event_tags.event_id = events.id AND event_tags.tag = wanted.value
+                      )
                     )
                   )
                   AND (
@@ -179,7 +186,7 @@ impl EventStore for SqliteEventStore {
                     event_type,
                     filter.workspace_id,
                     filter.agent,
-                    filter.tag,
+                    tags,
                     filter.recipient,
                     query,
                     limit
@@ -200,9 +207,9 @@ impl EventStore for SqliteEventStore {
 
 fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
     let event_type: String = row.get(1)?;
-    let tags: String = row.get(13)?;
-    let metadata_json: String = row.get(14)?;
-    let created_at: String = row.get(15)?;
+    let tags: String = row.get(14)?;
+    let metadata_json: String = row.get(15)?;
+    let created_at: String = row.get(16)?;
 
     let event_type = EventType::try_from(event_type.as_str()).map_err(to_sql_error)?;
     let tags = serde_json::from_str(&tags).map_err(to_sql_error)?;
@@ -221,14 +228,25 @@ fn row_to_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
         bit_repo_id: row.get(6)?,
         branch: row.get(7)?,
         commit: row.get(8)?,
-        agent: row.get(9)?,
-        session_id: row.get(10)?,
-        title: row.get(11)?,
-        content: row.get(12)?,
+        repo_dirty: row.get(9)?,
+        agent: row.get(10)?,
+        session_id: row.get(11)?,
+        title: row.get(12)?,
+        content: row.get(13)?,
         tags,
         metadata_json,
         created_at,
     })
+}
+
+fn filter_tags(filter: &EventFilter) -> Result<String> {
+    let mut tags = filter.tags.clone();
+    if let Some(tag) = &filter.tag {
+        tags.push(tag.clone());
+    }
+    tags.sort();
+    tags.dedup();
+    serde_json::to_string(&tags).map_err(|err| ShuttleError::Serialization(err.to_string()))
 }
 
 fn ensure_column(conn: &Connection, column: &str, column_type: &str) -> Result<()> {
@@ -323,6 +341,7 @@ mod tests {
             bit_repo_id: None,
             branch: None,
             commit: None,
+            repo_dirty: None,
             agent: "codex".into(),
             session_id: "session".into(),
             title: None,
@@ -356,6 +375,7 @@ mod tests {
             bit_repo_id: None,
             branch: None,
             commit: None,
+            repo_dirty: None,
             agent: "codex".into(),
             session_id: "session".into(),
             title: None,
@@ -379,6 +399,144 @@ mod tests {
         assert_eq!(tag_events.len(), 1);
         assert_eq!(recipient_events.len(), 1);
         assert_eq!(recipient_events[0].metadata_json["to"], "claude");
+    }
+
+    #[test]
+    fn filters_by_all_requested_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(dir.path().join("shuttle.db")).unwrap();
+        let first = Event::new(NewEvent {
+            event_type: EventType::Memory,
+            workspace_id: "workspace".into(),
+            repo_id: None,
+            repo_path: None,
+            git_remote: None,
+            bit_repo_id: None,
+            branch: None,
+            commit: None,
+            repo_dirty: None,
+            agent: "codex".into(),
+            session_id: "session".into(),
+            title: None,
+            content: "storage memory".into(),
+            tags: vec!["storage".into(), "mvp".into()],
+            metadata_json: json!({}),
+        });
+        let second = Event::new(NewEvent {
+            event_type: EventType::Memory,
+            workspace_id: "workspace".into(),
+            repo_id: None,
+            repo_path: None,
+            git_remote: None,
+            bit_repo_id: None,
+            branch: None,
+            commit: None,
+            repo_dirty: None,
+            agent: "codex".into(),
+            session_id: "session".into(),
+            title: None,
+            content: "storage only".into(),
+            tags: vec!["storage".into()],
+            metadata_json: json!({}),
+        });
+
+        futures_executor::block_on(store.append(first)).unwrap();
+        futures_executor::block_on(store.append(second)).unwrap();
+        let events = futures_executor::block_on(store.list(EventFilter {
+            tags: vec!["storage".into(), "mvp".into()],
+            ..EventFilter::default()
+        }))
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].content, "storage memory");
+    }
+
+    #[test]
+    fn applies_query_filter_before_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(dir.path().join("shuttle.db")).unwrap();
+        let old_match = Event::new(NewEvent {
+            event_type: EventType::Memory,
+            workspace_id: "workspace".into(),
+            repo_id: None,
+            repo_path: None,
+            git_remote: None,
+            bit_repo_id: None,
+            branch: None,
+            commit: None,
+            repo_dirty: None,
+            agent: "codex".into(),
+            session_id: "session".into(),
+            title: None,
+            content: "needle memory".into(),
+            tags: Vec::new(),
+            metadata_json: json!({}),
+        });
+        futures_executor::block_on(store.append(old_match)).unwrap();
+        for index in 0..75 {
+            let event = Event::new(NewEvent {
+                event_type: EventType::Memory,
+                workspace_id: "workspace".into(),
+                repo_id: None,
+                repo_path: None,
+                git_remote: None,
+                bit_repo_id: None,
+                branch: None,
+                commit: None,
+                repo_dirty: None,
+                agent: "codex".into(),
+                session_id: "session".into(),
+                title: None,
+                content: format!("recent memory {index}"),
+                tags: Vec::new(),
+                metadata_json: json!({}),
+            });
+            futures_executor::block_on(store.append(event)).unwrap();
+        }
+
+        let events = futures_executor::block_on(store.list(EventFilter {
+            event_type: Some(EventType::Memory),
+            query: Some("needle".into()),
+            limit: Some(1),
+            ..EventFilter::default()
+        }))
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].content, "needle memory");
+    }
+
+    #[test]
+    fn repo_dirty_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(dir.path().join("shuttle.db")).unwrap();
+        let event = Event::new(NewEvent {
+            event_type: EventType::Decision,
+            workspace_id: "workspace".into(),
+            repo_id: Some("repo".into()),
+            repo_path: Some("/repo".into()),
+            git_remote: None,
+            bit_repo_id: None,
+            branch: Some("main".into()),
+            commit: Some("abc".into()),
+            repo_dirty: Some(true),
+            agent: "codex".into(),
+            session_id: "session".into(),
+            title: None,
+            content: "dirty decision".into(),
+            tags: Vec::new(),
+            metadata_json: json!({}),
+        });
+
+        futures_executor::block_on(store.append(event)).unwrap();
+        let events = futures_executor::block_on(store.list(EventFilter {
+            event_type: Some(EventType::Decision),
+            ..EventFilter::default()
+        }))
+        .unwrap();
+
+        assert_eq!(events[0].repo_dirty, Some(true));
     }
 
     #[test]

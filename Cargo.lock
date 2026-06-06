@@ -831,6 +831,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "shuttle-core",
+ "tempfile",
 ]
 
 [[package]]
@@ -858,6 +859,7 @@ dependencies = [
  "shuttle-message",
  "shuttle-store",
  "shuttle-task",
+ "tempfile",
  "uuid",
 ]
 
