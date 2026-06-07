@@ -4,6 +4,12 @@ addr = "127.0.0.1:8787"
 [auth]
 bearer_token_env = "SHUTTLE_GATEWAY_TOKEN"
 
+# Uncomment to expose the gateway as a remote MCP server with OAuth.
+# [oauth]
+# public_url = "https://shuttle.example.com"
+# admin_token_env = "SHUTTLE_OAUTH_ADMIN_TOKEN"
+# db_path = "/path/to/gateway-oauth.db"
+
 [defaults]
 project = "shuttle-rs"
 
