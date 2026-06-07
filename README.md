@@ -1,4 +1,9 @@
 # shuttle-rs
+<!-- bdg:begin -->
+[![crates.io](https://img.shields.io/crates/v/shuttle-rs.svg)](https://crates.io/crates/shuttle-rs)
+[![license](https://img.shields.io/github/license/shuttle-rs/shuttle-rs.svg)](https://github.com/shuttle-rs/shuttle-rs)
+[![CI](https://github.com/shuttle-rs/shuttle-rs/actions/workflows/publish.yaml/badge.svg)](https://github.com/shuttle-rs/shuttle-rs/actions/workflows/publish.yaml)
+<!-- bdg:end -->
 
 `shuttle-rs` is a local-first event log for agent memory, messaging, repository
 context, and coordination. The `stl` CLI stores data in `.shuttle/shuttle.db`
