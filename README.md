@@ -129,6 +129,28 @@ The gateway requires an explicit `project` argument for writes such as
 default project. Set `SHUTTLE_GATEWAY_TOKEN` to require
 `Authorization: Bearer <token>` at the gateway boundary.
 
+To expose the gateway to remote MCP clients such as ChatGPT or Claude web
+connectors, configure OAuth with the public URL that forwards to the gateway:
+
+```toml
+[oauth]
+public_url = "https://shuttle.example.com"
+admin_token_env = "SHUTTLE_OAUTH_ADMIN_TOKEN"
+```
+
+Then run the gateway with the owner-approval token injected at runtime:
+
+```bash
+SHUTTLE_OAUTH_ADMIN_TOKEN=<admin-token> \
+go run ./cmd/shuttle-gateway serve --config configs/projects.toml --addr 127.0.0.1:8787
+```
+
+Register `https://shuttle.example.com/mcp` with the remote MCP client. OAuth
+client registrations, authorization codes, and access tokens are stored in a
+gateway-local SQLite database, defaulting to `gateway-oauth.db` next to the
+config file unless `[oauth].db_path` is set to an absolute path. Keep the admin
+token in a secret manager or runtime-injected environment variable.
+
 Synchronize event logs between Shuttle instances:
 
 ```bash

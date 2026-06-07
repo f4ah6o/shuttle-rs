@@ -12,6 +12,7 @@ import (
 	"github.com/f4ah6o/shuttle-rs/gateway/internal/api"
 	"github.com/f4ah6o/shuttle-rs/gateway/internal/auth"
 	"github.com/f4ah6o/shuttle-rs/gateway/internal/config"
+	"github.com/f4ah6o/shuttle-rs/gateway/internal/oauth"
 	"github.com/f4ah6o/shuttle-rs/gateway/internal/project"
 	"github.com/f4ah6o/shuttle-rs/gateway/internal/router"
 	"github.com/f4ah6o/shuttle-rs/gateway/internal/subprocess"
@@ -64,7 +65,30 @@ func run(args []string) error {
 		Binary:  *stlBinary,
 		Timeout: *timeout,
 	})
-	handler := auth.Middleware(cfg.Auth.BearerTokenEnv, api.NewServer(service).Routes())
+	var oauthRuntime *auth.OAuthRuntime
+	if cfg.OAuth.PublicURL != "" {
+		adminToken := os.Getenv(cfg.OAuth.AdminTokenEnv)
+		if adminToken == "" {
+			return fmt.Errorf("%s is required when oauth public_url is configured", cfg.OAuth.AdminTokenEnv)
+		}
+		store, err := oauth.Open(cfg.OAuth.DBPath)
+		if err != nil {
+			return fmt.Errorf("open oauth store: %w", err)
+		}
+		defer store.Close()
+		oauthRuntime = &auth.OAuthRuntime{
+			Config: oauth.Config{
+				PublicURL:  oauth.NormalizePublicURL(cfg.OAuth.PublicURL),
+				AdminToken: adminToken,
+			},
+			Store: store,
+		}
+	}
+	apiServer := api.NewServer(service)
+	if oauthRuntime != nil {
+		apiServer = api.NewServerWithOAuth(service, *oauthRuntime)
+	}
+	handler := auth.Authorizer(cfg.Auth.BearerTokenEnv, oauthRuntime)(apiServer.Routes())
 	server := &http.Server{
 		Addr:              addr,
 		Handler:           handler,
