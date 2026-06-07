@@ -114,6 +114,7 @@ impl EventStore for SqliteEventStore {
                 WHERE (?1 IS NULL OR event_type = ?1)
                   AND (?2 IS NULL OR workspace_id = ?2)
                   AND (?3 IS NULL OR agent = ?3)
+                  AND (?6 IS NULL OR id = ?6)
                   AND (
                     ?4 IS NULL
                     OR json_extract(metadata_json, '$.to') = ?4
@@ -137,6 +138,10 @@ impl EventStore for SqliteEventStore {
             filter.agent.map(Value::Text).unwrap_or(Value::Null),
             filter.recipient.map(Value::Text).unwrap_or(Value::Null),
             query.unwrap_or(Value::Null),
+            filter
+                .id
+                .map(|id| Value::Text(id.to_string()))
+                .unwrap_or(Value::Null),
         ];
         for tag in tags {
             let index = values.len() + 1;
@@ -655,5 +660,59 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].content, "legacy");
         assert_eq!(tag_events.len(), 1);
+    }
+
+    #[test]
+    fn filters_by_event_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(dir.path().join("shuttle.db")).unwrap();
+        let first = Event::new(NewEvent {
+            event_type: EventType::Message,
+            workspace_id: "workspace".into(),
+            repo_id: None,
+            repo_path: None,
+            git_remote: None,
+            bit_repo_id: None,
+            branch: None,
+            commit: None,
+            repo_dirty: None,
+            agent: "codex".into(),
+            session_id: "session".into(),
+            title: None,
+            content: "first".into(),
+            tags: Vec::new(),
+            metadata_json: json!({ "to": "claude" }),
+        });
+        let second = Event::new(NewEvent {
+            event_type: EventType::Message,
+            workspace_id: "workspace".into(),
+            repo_id: None,
+            repo_path: None,
+            git_remote: None,
+            bit_repo_id: None,
+            branch: None,
+            commit: None,
+            repo_dirty: None,
+            agent: "codex".into(),
+            session_id: "session".into(),
+            title: None,
+            content: "second".into(),
+            tags: Vec::new(),
+            metadata_json: json!({ "to": "claude" }),
+        });
+        let wanted = second.id;
+
+        futures_executor::block_on(store.append(first)).unwrap();
+        futures_executor::block_on(store.append(second)).unwrap();
+        let events = futures_executor::block_on(store.list(EventFilter {
+            id: Some(wanted),
+            event_type: Some(EventType::Message),
+            ..EventFilter::default()
+        }))
+        .unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, wanted);
+        assert_eq!(events[0].content, "second");
     }
 }

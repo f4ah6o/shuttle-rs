@@ -31,6 +31,7 @@ state and coordination queue:
 
 ```bash
 stl context
+stl inbox
 stl recall "current task"
 stl task list
 ```
@@ -39,8 +40,17 @@ Use JSON output when another tool or MCP client needs structured data:
 
 ```bash
 stl --json context
+stl --json inbox
 stl --json recall "current task"
 stl --json task list
+```
+
+If `SHUTTLE_AGENT` is not set by the shell or agent runtime, set a repo-local
+identity:
+
+```bash
+stl identity set codex
+stl identity current
 ```
 
 ## During Work
@@ -99,7 +109,18 @@ Messages use the same local event store:
 ```bash
 stl send codex "Please review the latest diff"
 stl inbox
+stl inbox --watch
 stl history
+```
+
+Use `stl send` for transient communication, `stl handoff` for ownership
+transfer, `stl task` for trackable work, and typed memory commands for durable
+outcomes. Promote important messages instead of leaving them only in history:
+
+```bash
+stl decide --from-message <message-id>
+stl task create --from-message <message-id>
+stl handoff request claude --from-message <message-id>
 ```
 
 ## MCP

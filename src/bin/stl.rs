@@ -1,8 +1,11 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -10,7 +13,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use futures_executor::block_on;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use shuttle_rs::core::{Event, EventStore, EventType};
+use shuttle_rs::core::{Event, EventFilter, EventStore, EventType};
 use shuttle_rs::store::SqliteEventStore;
 use uuid::Uuid;
 
@@ -27,13 +30,28 @@ struct Cli {
 enum Command {
     Init,
     Send {
+        #[arg(long = "from")]
+        from_agent: Option<String>,
         agent: String,
         content: String,
     },
-    Inbox,
+    Inbox {
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        watch: bool,
+        #[arg(long, default_value_t = 2)]
+        interval: u64,
+    },
     History,
+    Identity {
+        #[command(subcommand)]
+        command: IdentityCommand,
+    },
     Remember {
-        content: String,
+        content: Option<String>,
+        #[arg(long)]
+        from_message: Option<Uuid>,
     },
     Recall {
         query: String,
@@ -42,19 +60,29 @@ enum Command {
     },
     Memories,
     Decide {
-        content: String,
+        content: Option<String>,
+        #[arg(long)]
+        from_message: Option<Uuid>,
     },
     Observe {
-        content: String,
+        content: Option<String>,
+        #[arg(long)]
+        from_message: Option<Uuid>,
     },
     Pattern {
-        content: String,
+        content: Option<String>,
+        #[arg(long)]
+        from_message: Option<Uuid>,
     },
     Fact {
-        content: String,
+        content: Option<String>,
+        #[arg(long)]
+        from_message: Option<Uuid>,
     },
     Bug {
-        content: String,
+        content: Option<String>,
+        #[arg(long)]
+        from_message: Option<Uuid>,
     },
     Task {
         #[command(subcommand)]
@@ -87,18 +115,38 @@ enum Command {
 #[derive(Debug, Subcommand)]
 enum TaskCommand {
     List,
-    Create { content: String },
-    Claim { id: Uuid },
-    Update { id: Uuid, content: String },
-    Done { id: Uuid },
+    Create {
+        content: Option<String>,
+        #[arg(long)]
+        from_message: Option<Uuid>,
+    },
+    Claim {
+        id: Uuid,
+    },
+    Update {
+        id: Uuid,
+        content: String,
+    },
+    Done {
+        id: Uuid,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum HandoffCommand {
-    Request { agent: String, content: String },
+    Request {
+        agent: String,
+        content: Option<String>,
+        #[arg(long)]
+        from_message: Option<Uuid>,
+    },
     List,
-    Accept { id: Uuid },
-    Done { id: Uuid },
+    Accept {
+        id: Uuid,
+    },
+    Done {
+        id: Uuid,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -106,6 +154,12 @@ enum MeshCommand {
     Export { path: PathBuf },
     Import { path: PathBuf },
     Sync { peer_database: PathBuf },
+}
+
+#[derive(Debug, Subcommand)]
+enum IdentityCommand {
+    Current,
+    Set { agent: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -182,12 +236,17 @@ fn main() -> Result<()> {
                 || format!("initialized {}", env.database_path.display()),
             )?;
         }
-        Command::Send { agent, content } => {
+        Command::Send {
+            from_agent,
+            agent,
+            content,
+        } => {
             let store = open_store(&env)?;
+            let sender = from_agent.unwrap_or_else(|| env.agent.clone());
             let event = with_repo_metadata(
                 shuttle_rs::message::new_message(
                     env.workspace_id.clone(),
-                    env.agent.clone(),
+                    sender,
                     env.session_id.clone(),
                     agent.clone(),
                     content,
@@ -199,24 +258,58 @@ fn main() -> Result<()> {
                 format!("sent message to {agent}: {}", event.content)
             })?;
         }
-        Command::Inbox => {
+        Command::Inbox {
+            agent,
+            watch,
+            interval,
+        } => {
             let store = open_store(&env)?;
-            let events = block_on(shuttle_rs::message::inbox(&store, &env.agent))?;
-            output_events(cli.json, &events, "inbox")?;
+            let agent = agent.unwrap_or_else(|| env.agent.clone());
+            if watch {
+                watch_inbox(cli.json, &store, &agent, interval)?;
+            } else {
+                let events = block_on(shuttle_rs::message::inbox(&store, &agent))?;
+                output_events(cli.json, &events, "inbox")?;
+            }
         }
         Command::History => {
             let store = open_store(&env)?;
             let events = block_on(shuttle_rs::message::history(&store))?;
             output_events(cli.json, &events, "message history")?;
         }
-        Command::Remember { content } => {
+        Command::Identity { command } => match command {
+            IdentityCommand::Current => {
+                let identity = current_identity(&env)?;
+                output(cli.json, &identity, || {
+                    format!("{} ({})", identity.agent, identity.source)
+                })?;
+            }
+            IdentityCommand::Set { agent } => {
+                set_persisted_agent(&env.shuttle_dir, &agent)?;
+                let identity = IdentityOutput {
+                    agent,
+                    source: "repo".to_owned(),
+                };
+                output(cli.json, &identity, || {
+                    format!("set repo agent identity to {}", identity.agent)
+                })?;
+            }
+        },
+        Command::Remember {
+            content,
+            from_message,
+        } => {
             let store = open_store(&env)?;
+            let source = resolve_content(&store, content, from_message)?;
             let event = with_repo_metadata(
-                shuttle_rs::memory::new_memory(
-                    env.workspace_id.clone(),
-                    env.agent.clone(),
-                    env.session_id.clone(),
-                    content,
+                with_source_message_metadata(
+                    shuttle_rs::memory::new_memory(
+                        env.workspace_id.clone(),
+                        env.agent.clone(),
+                        env.session_id.clone(),
+                        source.content,
+                    ),
+                    source.message_id,
                 ),
                 &env,
             );
@@ -245,33 +338,83 @@ fn main() -> Result<()> {
             let events = block_on(shuttle_rs::memory::memories(&store))?;
             output_events(cli.json, &events, "memories")?;
         }
-        Command::Decide { content } => {
+        Command::Decide {
+            content,
+            from_message,
+        } => {
             let store = open_store(&env)?;
-            let event = append_typed_memory(&store, &env, EventType::Decision, content)?;
+            let source = resolve_content(&store, content, from_message)?;
+            let event = append_typed_memory(
+                &store,
+                &env,
+                EventType::Decision,
+                source.content,
+                source.message_id,
+            )?;
             output(cli.json, &event, || format!("decided: {}", event.content))?;
         }
-        Command::Observe { content } => {
+        Command::Observe {
+            content,
+            from_message,
+        } => {
             let store = open_store(&env)?;
-            let event = append_typed_memory(&store, &env, EventType::Observation, content)?;
+            let source = resolve_content(&store, content, from_message)?;
+            let event = append_typed_memory(
+                &store,
+                &env,
+                EventType::Observation,
+                source.content,
+                source.message_id,
+            )?;
             output(cli.json, &event, || format!("observed: {}", event.content))?;
         }
-        Command::Pattern { content } => {
+        Command::Pattern {
+            content,
+            from_message,
+        } => {
             let store = open_store(&env)?;
-            let event = append_typed_memory(&store, &env, EventType::Pattern, content)?;
+            let source = resolve_content(&store, content, from_message)?;
+            let event = append_typed_memory(
+                &store,
+                &env,
+                EventType::Pattern,
+                source.content,
+                source.message_id,
+            )?;
             output(cli.json, &event, || {
                 format!("recorded pattern: {}", event.content)
             })?;
         }
-        Command::Fact { content } => {
+        Command::Fact {
+            content,
+            from_message,
+        } => {
             let store = open_store(&env)?;
-            let event = append_typed_memory(&store, &env, EventType::Fact, content)?;
+            let source = resolve_content(&store, content, from_message)?;
+            let event = append_typed_memory(
+                &store,
+                &env,
+                EventType::Fact,
+                source.content,
+                source.message_id,
+            )?;
             output(cli.json, &event, || {
                 format!("recorded fact: {}", event.content)
             })?;
         }
-        Command::Bug { content } => {
+        Command::Bug {
+            content,
+            from_message,
+        } => {
             let store = open_store(&env)?;
-            let event = append_typed_memory(&store, &env, EventType::Bug, content)?;
+            let source = resolve_content(&store, content, from_message)?;
+            let event = append_typed_memory(
+                &store,
+                &env,
+                EventType::Bug,
+                source.content,
+                source.message_id,
+            )?;
             output(cli.json, &event, || {
                 format!("recorded bug: {}", event.content)
             })?;
@@ -287,13 +430,20 @@ fn main() -> Result<()> {
                     ))?;
                     output_tasks(cli.json, &tasks)?;
                 }
-                TaskCommand::Create { content } => {
+                TaskCommand::Create {
+                    content,
+                    from_message,
+                } => {
+                    let source = resolve_content(&store, content, from_message)?;
                     let event = with_repo_metadata(
-                        shuttle_rs::task::new_task(
-                            env.workspace_id.clone(),
-                            env.agent.clone(),
-                            env.session_id.clone(),
-                            content,
+                        with_source_message_metadata(
+                            shuttle_rs::task::new_task(
+                                env.workspace_id.clone(),
+                                env.agent.clone(),
+                                env.session_id.clone(),
+                                source.content,
+                            ),
+                            source.message_id,
                         ),
                         &env,
                     );
@@ -360,14 +510,22 @@ fn main() -> Result<()> {
         Command::Handoff { command } => {
             let store = open_store(&env)?;
             match command {
-                HandoffCommand::Request { agent, content } => {
+                HandoffCommand::Request {
+                    agent,
+                    content,
+                    from_message,
+                } => {
+                    let source = resolve_content(&store, content, from_message)?;
                     let event = with_repo_metadata(
-                        shuttle_rs::task::new_handoff(
-                            env.workspace_id.clone(),
-                            env.agent.clone(),
-                            env.session_id.clone(),
-                            agent.clone(),
-                            content,
+                        with_source_message_metadata(
+                            shuttle_rs::task::new_handoff(
+                                env.workspace_id.clone(),
+                                env.agent.clone(),
+                                env.session_id.clone(),
+                                agent.clone(),
+                                source.content,
+                            ),
+                            source.message_id,
                         ),
                         &env,
                     );
@@ -588,6 +746,7 @@ struct RuntimeEnv {
     database_path: PathBuf,
     workspace_id: String,
     agent: String,
+    agent_source: String,
     session_id: String,
 }
 
@@ -598,7 +757,7 @@ impl RuntimeEnv {
         let shuttle_dir = root.join(".shuttle");
         let database_path = shuttle_dir.join("shuttle.db");
         let workspace_id = load_or_create_workspace_id(&shuttle_dir, &root)?;
-        let agent = env::var("SHUTTLE_AGENT").unwrap_or_else(|_| "unknown".to_owned());
+        let (agent, agent_source) = load_agent(&shuttle_dir);
         let session_id = load_or_create_session_id(&shuttle_dir)?;
 
         Ok(Self {
@@ -607,6 +766,7 @@ impl RuntimeEnv {
             database_path,
             workspace_id,
             agent,
+            agent_source,
             session_id,
         })
     }
@@ -641,6 +801,17 @@ struct SkillInstallOutput {
 struct SkillPrintOutput {
     target: String,
     content: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct IdentityOutput {
+    agent: String,
+    source: String,
+}
+
+struct ResolvedContent {
+    content: String,
+    message_id: Option<Uuid>,
 }
 
 fn repo_root(cwd: &Path) -> Option<PathBuf> {
@@ -680,6 +851,43 @@ fn load_or_create_workspace_id(shuttle_dir: &Path, root: &Path) -> Result<String
     Ok(workspace.workspace_id)
 }
 
+fn load_agent(shuttle_dir: &Path) -> (String, String) {
+    if let Ok(agent) = env::var("SHUTTLE_AGENT") {
+        let agent = agent.trim();
+        if !agent.is_empty() {
+            return (agent.to_owned(), "SHUTTLE_AGENT".to_owned());
+        }
+    }
+
+    let path = shuttle_dir.join("agent");
+    if let Ok(contents) = fs::read_to_string(path) {
+        let agent = contents.trim();
+        if !agent.is_empty() {
+            return (agent.to_owned(), "repo".to_owned());
+        }
+    }
+
+    ("unknown".to_owned(), "default".to_owned())
+}
+
+fn set_persisted_agent(shuttle_dir: &Path, agent: &str) -> Result<()> {
+    let agent = agent.trim();
+    if agent.is_empty() {
+        anyhow::bail!("agent identity cannot be empty");
+    }
+    fs::create_dir_all(shuttle_dir)
+        .with_context(|| format!("failed to create {}", shuttle_dir.display()))?;
+    fs::write(shuttle_dir.join("agent"), format!("{agent}\n"))
+        .with_context(|| format!("failed to write {}", shuttle_dir.join("agent").display()))
+}
+
+fn current_identity(env: &RuntimeEnv) -> Result<IdentityOutput> {
+    Ok(IdentityOutput {
+        agent: env.agent.clone(),
+        source: env.agent_source.clone(),
+    })
+}
+
 fn load_or_create_session_id(shuttle_dir: &Path) -> Result<String> {
     if let Ok(session_id) = env::var("SHUTTLE_SESSION_ID") {
         return Ok(session_id);
@@ -706,6 +914,63 @@ fn open_store(env: &RuntimeEnv) -> Result<SqliteEventStore> {
         .with_context(|| format!("failed to create {}", env.shuttle_dir.display()))?;
     SqliteEventStore::open(&env.database_path)
         .with_context(|| format!("failed to open {}", env.database_path.display()))
+}
+
+fn resolve_content(
+    store: &SqliteEventStore,
+    content: Option<String>,
+    from_message: Option<Uuid>,
+) -> Result<ResolvedContent> {
+    match (content, from_message) {
+        (Some(_), Some(_)) => anyhow::bail!("provide content or --from-message, not both"),
+        (Some(content), None) => Ok(ResolvedContent {
+            content,
+            message_id: None,
+        }),
+        (None, Some(message_id)) => {
+            let message = load_message(store, message_id)?;
+            Ok(ResolvedContent {
+                content: message.content,
+                message_id: Some(message_id),
+            })
+        }
+        (None, None) => anyhow::bail!("missing content or --from-message"),
+    }
+}
+
+fn load_message(store: &SqliteEventStore, id: Uuid) -> Result<Event> {
+    let mut events = block_on(store.list(EventFilter {
+        id: Some(id),
+        event_type: Some(EventType::Message),
+        ..EventFilter::default()
+    }))?;
+    events
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("unknown message id: {id}"))
+}
+
+fn with_source_message_metadata(mut event: Event, message_id: Option<Uuid>) -> Event {
+    if let Some(message_id) = message_id {
+        if let Some(metadata) = event.metadata_json.as_object_mut() {
+            metadata.insert("source_message_id".to_owned(), json!(message_id));
+        }
+    }
+    event
+}
+
+fn watch_inbox(json: bool, store: &SqliteEventStore, agent: &str, interval: u64) -> Result<()> {
+    let interval = Duration::from_secs(interval.max(1));
+    let mut seen = HashSet::new();
+
+    loop {
+        let events = block_on(shuttle_rs::message::inbox(store, agent))?;
+        for event in events.iter().rev() {
+            if seen.insert(event.id) {
+                output_event_line(json, event)?;
+            }
+        }
+        thread::sleep(interval);
+    }
 }
 
 fn app_oauth(
@@ -828,8 +1093,15 @@ In a Shuttle repo, run:
 
 ```bash
 stl context
+stl inbox
 stl recall "current task"
 stl task list
+```
+
+If the current shell does not set `SHUTTLE_AGENT`, set the repo-local identity:
+
+```bash
+stl identity set codex
 ```
 
 ## Local memory and coordination
@@ -838,6 +1110,19 @@ stl task list
 - Use `stl recall "<query>"` and `stl recall "<query>" --type decision` to retrieve context.
 - Use `stl task create/list/claim/update/done` for task coordination.
 - Use `stl handoff request/list/accept/done` and `stl send/inbox/history` for agent handoffs and messages.
+- Use `stl send` for transient agent-to-agent communication.
+- Use `stl handoff` when ownership of work should move to another agent.
+- Use `stl task` for trackable work.
+- Use typed memory commands for durable project knowledge.
+- Do not leave important decisions only in message history.
+
+## Message loop
+
+- At session start, run `stl context`, `stl inbox`, and `stl task list`.
+- During work, use `stl send <agent> "<message>"` for transient coordination.
+- At session end, run `stl inbox` again and update tasks or handoffs.
+- For polling delivery, run `stl inbox --watch` in a separate terminal.
+- Promote important message outcomes with `stl decide --from-message <message-id>`, `stl task create --from-message <message-id>`, or `stl handoff request <agent> --from-message <message-id>`.
 
 ## MCP
 
@@ -864,14 +1149,18 @@ fn append_typed_memory(
     env: &RuntimeEnv,
     event_type: EventType,
     content: String,
+    source_message_id: Option<Uuid>,
 ) -> Result<Event> {
     let event = with_repo_metadata(
-        shuttle_rs::memory::new_typed_memory(
-            event_type,
-            env.workspace_id.clone(),
-            env.agent.clone(),
-            env.session_id.clone(),
-            content,
+        with_source_message_metadata(
+            shuttle_rs::memory::new_typed_memory(
+                event_type,
+                env.workspace_id.clone(),
+                env.agent.clone(),
+                env.session_id.clone(),
+                content,
+            ),
+            source_message_id,
         ),
         env,
     );
@@ -1054,6 +1343,19 @@ fn output_tasks(json: bool, tasks: &[shuttle_rs::task::TaskSummary]) -> Result<(
     Ok(())
 }
 
+fn output_event_line(json: bool, event: &Event) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(event)?);
+    } else {
+        let title = event.title.as_deref().unwrap_or(event.event_type.as_str());
+        println!(
+            "- [{}] {} from {}: {}",
+            event.id, title, event.agent, event.content
+        );
+    }
+    Ok(())
+}
+
 fn output_handoffs(json: bool, handoffs: &[shuttle_rs::task::HandoffSummary]) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(handoffs)?);
@@ -1160,6 +1462,65 @@ mod tests {
         env::remove_var("SHUTTLE_SESSION_ID");
 
         assert_eq!(session_id, "override");
+    }
+
+    #[test]
+    fn agent_identity_prefers_env_then_repo_then_default() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let shuttle_dir = dir.path().join(".shuttle");
+        env::remove_var("SHUTTLE_AGENT");
+
+        assert_eq!(
+            load_agent(&shuttle_dir),
+            ("unknown".to_owned(), "default".to_owned())
+        );
+
+        set_persisted_agent(&shuttle_dir, "codex").unwrap();
+        assert_eq!(
+            load_agent(&shuttle_dir),
+            ("codex".to_owned(), "repo".to_owned())
+        );
+
+        env::set_var("SHUTTLE_AGENT", "claude");
+        assert_eq!(
+            load_agent(&shuttle_dir),
+            ("claude".to_owned(), "SHUTTLE_AGENT".to_owned())
+        );
+        env::remove_var("SHUTTLE_AGENT");
+    }
+
+    #[test]
+    fn resolves_content_from_message_and_tracks_source_metadata() {
+        let repo = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        init_git_repo(repo.path());
+        let env = test_env(repo.path(), data.path());
+        let store = open_store(&env).unwrap();
+        let message = block_on(store.append(shuttle_rs::message::new_message(
+            env.workspace_id.clone(),
+            "claude".into(),
+            env.session_id.clone(),
+            "codex".into(),
+            "promote this".into(),
+        )))
+        .unwrap();
+
+        let source = resolve_content(&store, None, Some(message.id)).unwrap();
+        let decision = append_typed_memory(
+            &store,
+            &env,
+            EventType::Decision,
+            source.content,
+            source.message_id,
+        )
+        .unwrap();
+
+        assert_eq!(decision.content, "promote this");
+        assert_eq!(
+            decision.metadata_json["source_message_id"],
+            json!(message.id)
+        );
     }
 
     #[test]
@@ -1298,8 +1659,14 @@ mod tests {
             ),
             &env,
         );
-        let decision =
-            append_typed_memory(&store, &env, EventType::Decision, "repo decision".into()).unwrap();
+        let decision = append_typed_memory(
+            &store,
+            &env,
+            EventType::Decision,
+            "repo decision".into(),
+            None,
+        )
+        .unwrap();
         let repo_path = repo.path().canonicalize().unwrap();
 
         for event in [memory, message, decision] {
@@ -1339,6 +1706,7 @@ mod tests {
             &env,
             EventType::Decision,
             "SQLite storage decision".into(),
+            None,
         )
         .unwrap();
         block_on(store.append(memory)).unwrap();
@@ -1390,6 +1758,7 @@ mod tests {
             &env,
             EventType::Decision,
             "SQLite storage decision".into(),
+            None,
         )
         .unwrap();
         block_on(store.append(generic)).unwrap();
@@ -1417,6 +1786,7 @@ mod tests {
             database_path: data.join(".shuttle/shuttle.db"),
             workspace_id: "workspace".into(),
             agent: "codex".into(),
+            agent_source: "test".into(),
             session_id: "session".into(),
         }
     }

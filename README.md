@@ -40,6 +40,16 @@ Initialize local storage:
 stl init
 ```
 
+Set or inspect the local agent identity:
+
+```bash
+stl identity current
+stl identity set codex
+```
+
+`SHUTTLE_AGENT` overrides the repo-local identity in `.shuttle/agent`. When
+neither is set, Shuttle uses `unknown`.
+
 Capture generic and typed memories:
 
 ```bash
@@ -68,6 +78,22 @@ stl context --branch
 stl --json context
 ```
 
+Send and receive agent messages:
+
+```bash
+stl send claude "Please review the latest diff"
+stl send --from claude codex "LGTM after the last fix"
+stl inbox
+stl inbox --agent claude
+stl inbox --watch
+stl history
+```
+
+Messages are stored in the same append-only event log as memories, tasks,
+handoffs, and repository context. Use messages for transient agent-to-agent
+communication, tasks for trackable work, handoffs for ownership transfer, and
+typed memories for durable outcomes.
+
 Coordinate tasks and handoffs:
 
 ```bash
@@ -81,6 +107,14 @@ stl handoff request claude "Please continue this branch"
 stl handoff list
 stl handoff accept <handoff-id>
 stl handoff done <handoff-id>
+```
+
+Promote an important message into durable project state:
+
+```bash
+stl decide --from-message <message-id>
+stl task create --from-message <message-id>
+stl handoff request claude --from-message <message-id>
 ```
 
 Expose Shuttle over HTTP MCP:
@@ -148,6 +182,10 @@ The gateway requires an explicit `project` argument for writes such as
 `shuttle_remember` and `shuttle_task_create`. Reads may use the configured
 default project. Set `SHUTTLE_GATEWAY_TOKEN` to require
 `Authorization: Bearer <token>` at the gateway boundary.
+
+Gateway tools run `stl --json ...` inside the resolved project repository, so
+identity, inbox ownership, and `.shuttle/shuttle.db` remain project-local. Pass
+an explicit `project` argument for writes when using web chat clients.
 
 To expose the gateway to remote MCP clients such as ChatGPT or Claude web
 connectors, configure OAuth with the public URL that forwards to the gateway:
