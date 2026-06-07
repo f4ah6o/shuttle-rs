@@ -98,6 +98,37 @@ token is read only from the environment, so use a secret manager or runtime
 injection instead of putting it in shell history. The public URL must match the
 Cloudflare Tunnel hostname that forwards to `http://127.0.0.1:8787`.
 
+## Multi-project Gateway
+
+For web chat clients that should use one MCP server across several local
+repositories, run the Go gateway from `gateway/`. The gateway keeps Shuttle
+storage project-local by routing each request to a configured repository and
+running `stl --json ...` as a subprocess in that repository.
+
+Create a project config from `gateway/configs/projects.example.toml`, then run:
+
+```bash
+cd gateway
+go run ./cmd/shuttle-gateway serve --config configs/projects.toml --addr 127.0.0.1:8787
+```
+
+Register one MCP endpoint:
+
+```json
+{
+  "mcpServers": {
+    "shuttle-gateway": {
+      "url": "http://127.0.0.1:8787/mcp"
+    }
+  }
+}
+```
+
+The gateway requires an explicit `project` argument for writes such as
+`shuttle_remember` and `shuttle_task_create`. Reads may use the configured
+default project. Set `SHUTTLE_GATEWAY_TOKEN` to require
+`Authorization: Bearer <token>` at the gateway boundary.
+
 Synchronize event logs between Shuttle instances:
 
 ```bash
