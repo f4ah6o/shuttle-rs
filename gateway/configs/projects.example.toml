@@ -1,0 +1,18 @@
+[server]
+addr = "127.0.0.1:8787"
+
+[auth]
+bearer_token_env = "SHUTTLE_GATEWAY_TOKEN"
+
+[defaults]
+project = "shuttle-rs"
+
+# Adjust these example paths for your local machine.
+[projects.shuttle-rs]
+repo = "/path/to/shuttle-rs"
+db = "/path/to/shuttle-rs/.shuttle/shuttle.db"
+description = "Shuttle Rust implementation"
+
+[projects.blog]
+repo = "/path/to/blog"
+description = "Blog and publishing project"
