@@ -16,6 +16,18 @@ Tool-specific setup paths are available for [opencode](./docs/opencode.md),
 [Claude Code](./docs/claude-code.md), and [Codex](./docs/codex.md). Claude Code
 can also use [CLAUDE.md](./CLAUDE.md) as its conventional entrypoint.
 
+Install the bundled Codex skill for Shuttle:
+
+```bash
+stl skill install codex
+```
+
+Preview the generated skill without writing it:
+
+```bash
+stl skill print codex
+```
+
 ## Phase 1 Commands
 
 Initialize local storage:
