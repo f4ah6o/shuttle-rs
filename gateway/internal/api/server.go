@@ -235,10 +235,12 @@ func (s *Server) oauthRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	body := map[string]any{
 		"client_id":                  client.ClientID,
-		"client_secret":              client.ClientSecret,
 		"redirect_uris":              client.RedirectURIs,
 		"client_name":                client.ClientName,
 		"token_endpoint_auth_method": "none",
+	}
+	if client.ClientSecret != nil {
+		body["client_secret"] = *client.ClientSecret
 	}
 	_ = writeJSON(w, http.StatusCreated, body)
 }

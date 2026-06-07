@@ -95,7 +95,7 @@ type RegisterRequest struct {
 
 type RegisteredClient struct {
 	ClientID     string   `json:"client_id"`
-	ClientSecret *string  `json:"client_secret"`
+	ClientSecret *string  `json:"client_secret,omitempty"`
 	RedirectURIs []string `json:"redirect_uris"`
 	ClientName   *string  `json:"client_name,omitempty"`
 }
