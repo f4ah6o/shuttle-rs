@@ -123,6 +123,7 @@ pub struct NewEvent {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct EventFilter {
+    pub id: Option<Uuid>,
     pub event_type: Option<EventType>,
     pub workspace_id: Option<String>,
     pub agent: Option<String>,

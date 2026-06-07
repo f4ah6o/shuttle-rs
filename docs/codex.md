@@ -9,6 +9,7 @@ Start each session by reading Shuttle context and coordination state:
 
 ```bash
 stl context
+stl inbox
 stl recall "current task"
 stl task list
 ```
@@ -17,8 +18,15 @@ Prefer JSON output when passing data between tools:
 
 ```bash
 stl --json context
+stl --json inbox
 stl --json recall "current task"
 stl --json task list
+```
+
+If `SHUTTLE_AGENT` is not set, configure a repo-local identity once:
+
+```bash
+stl identity set codex
 ```
 
 ## During Work
@@ -32,11 +40,28 @@ stl decide "important implementation decision"
 stl task update <task-id> "Progress update"
 ```
 
+Use messages for transient agent-to-agent communication:
+
+```bash
+stl send claude "Please review the latest diff"
+stl inbox --watch
+stl history
+```
+
 Use handoffs when another agent should continue:
 
 ```bash
 stl handoff request claude "Please continue this branch"
 stl handoff request opencode "Please review the latest diff"
+```
+
+Promote important message outcomes into durable state instead of leaving them
+only in history:
+
+```bash
+stl decide --from-message <message-id>
+stl task create --from-message <message-id>
+stl handoff request claude --from-message <message-id>
 ```
 
 ## MCP

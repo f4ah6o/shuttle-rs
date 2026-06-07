@@ -9,12 +9,20 @@ Run:
 
 ```bash
 stl context
+stl inbox
 stl recall "current task"
 stl task list
 ```
 
 Use these results to identify active tasks, pending handoffs, recent decisions,
 related memories, and repository status before editing files.
+
+Set a repo-local identity when `SHUTTLE_AGENT` is not managed by the shell or
+hook environment:
+
+```bash
+stl identity set claude
+```
 
 ## During Work
 
@@ -27,6 +35,13 @@ stl bug "known issue or failing behavior"
 stl task update <task-id> "Progress update"
 ```
 
+Check messages at session start and stop. For monitor-style workflows, keep a
+terminal running:
+
+```bash
+stl inbox --watch
+```
+
 Request or accept handoffs:
 
 ```bash
@@ -34,6 +49,15 @@ stl handoff request claude "Please continue this branch"
 stl handoff list
 stl handoff accept <handoff-id>
 stl handoff done <handoff-id>
+```
+
+Promote message outcomes when they become durable decisions, bugs, tasks, or
+handoffs:
+
+```bash
+stl decide --from-message <message-id>
+stl bug --from-message <message-id>
+stl task create --from-message <message-id>
 ```
 
 ## MCP
