@@ -1,6 +1,6 @@
 [package]
 name = "shuttle-rs"
-version = "2026.6.3"
+version = "2026.6.4"
 edition = "2021"
 description = "Local-first event log CLI for agent memory, repository context, task coordination, handoffs, messaging, mesh sync, and MCP access."
 license = "MIT OR Apache-2.0"
