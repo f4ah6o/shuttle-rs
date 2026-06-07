@@ -180,3 +180,6 @@ synced tasks, handoffs, messages, and memories visible to local commands.
 
 Shuttle is inspired by [kioku-mesh](https://github.com/h-wata/kioku-mesh), a
 shared memory system for AI coding agents across tools and machines.
+
+Shuttle also builds on ideas from [rally-rs](https://github.com/f4ah6o/rally-rs),
+which in turn builds on [agmsg](https://github.com/fujibee/agmsg).
