@@ -48,9 +48,9 @@ Register `https://shuttle.example.com/mcp` with the remote client.
 Recommended startup workflow:
 
 ```text
-Call Shuttle context, recall "current task", and list tasks before changing
-files. Record decisions, observations, bugs, and handoffs in Shuttle as work
-progresses.
+Call Shuttle context, inbox, recall "current task", and list tasks before
+changing files. Record decisions, observations, bugs, messages, and handoffs in
+Shuttle as work progresses.
 ```
 
 ## CLI Fallback
@@ -59,11 +59,16 @@ If MCP is unavailable, run the same workflow directly:
 
 ```bash
 stl context
+stl inbox
 stl recall "current task"
 stl task list
 stl remember "important project note"
 stl decide "important implementation decision"
+stl send codex "Please review the latest diff"
 stl handoff request codex "Please continue this branch"
 ```
 
 Use `stl --json ...` for structured output that opencode can parse or summarize.
+Use `stl inbox --watch` for a polling delivery loop, and promote important
+messages with `stl decide --from-message <message-id>` or
+`stl task create --from-message <message-id>`.
