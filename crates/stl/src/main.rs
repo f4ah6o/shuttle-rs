@@ -78,6 +78,10 @@ enum Command {
         #[command(subcommand)]
         command: AppCommand,
     },
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -110,6 +114,21 @@ enum AppCommand {
         #[arg(long, default_value = "127.0.0.1:8787")]
         addr: SocketAddr,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum SkillCommand {
+    Install {
+        target: SkillTarget,
+    },
+    Print {
+        target: SkillTarget,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SkillTarget {
+    Codex,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -489,6 +508,28 @@ fn main() -> Result<()> {
                 ))?;
             }
         },
+        Command::Skill { command } => match command {
+            SkillCommand::Install { target } => {
+                let install = install_skill(target)?;
+                output(cli.json, &install, || {
+                    format!("installed {} skill at {}", install.target, install.path)
+                })?;
+            }
+            SkillCommand::Print { target } => {
+                let skill = skill_content(target);
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&SkillPrintOutput {
+                            target: target.as_str().to_owned(),
+                            content: skill,
+                        })?
+                    );
+                } else {
+                    print!("{skill}");
+                }
+            }
+        },
     }
 
     Ok(())
@@ -542,6 +583,18 @@ struct MeshExportOutput {
     path: String,
     event_count: usize,
     exported_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize)]
+struct SkillInstallOutput {
+    target: String,
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SkillPrintOutput {
+    target: String,
+    content: &'static str,
 }
 
 fn repo_root(cwd: &Path) -> Option<PathBuf> {
@@ -627,6 +680,95 @@ fn load_peer_workspace_id(database_path: &Path) -> Option<String> {
         .ok()
         .map(|workspace| workspace.workspace_id)
 }
+
+impl SkillTarget {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+        }
+    }
+}
+
+fn install_skill(target: SkillTarget) -> Result<SkillInstallOutput> {
+    let path = skill_install_path(target)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(&path, skill_content(target))
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(SkillInstallOutput {
+        target: target.as_str().to_owned(),
+        path: path.display().to_string(),
+    })
+}
+
+fn skill_install_path(target: SkillTarget) -> Result<PathBuf> {
+    match target {
+        SkillTarget::Codex => Ok(home_dir()?
+            .join(".codex")
+            .join("skills")
+            .join("shuttle")
+            .join("SKILL.md")),
+    }
+}
+
+fn home_dir() -> Result<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .context("HOME is not set")
+}
+
+fn skill_content(target: SkillTarget) -> &'static str {
+    match target {
+        SkillTarget::Codex => CODEX_SKILL,
+    }
+}
+
+const CODEX_SKILL: &str = r#"---
+name: shuttle
+description: Use when working with Shuttle/stl local-first agent memory, tasks, handoffs, messages, mesh sync, MCP app server, or shuttle-gateway multi-project web chat setup.
+---
+
+# Shuttle
+
+## Before work
+
+In a Shuttle repo, run:
+
+```bash
+stl context
+stl recall "current task"
+stl task list
+```
+
+## Local memory and coordination
+
+- Use `stl remember`, `stl observe`, `stl decide`, `stl pattern`, `stl fact`, and `stl bug` for useful durable context.
+- Use `stl recall "<query>"` and `stl recall "<query>" --type decision` to retrieve context.
+- Use `stl task create/list/claim/update/done` for task coordination.
+- Use `stl handoff request/list/accept/done` and `stl send/inbox/history` for agent handoffs and messages.
+
+## MCP
+
+- Single-repo local MCP: `stl app serve --addr 127.0.0.1:8787`.
+- Multi-project gateway: `shuttle-gateway serve --config <projects.toml> --addr 127.0.0.1:8788`.
+- With OAuth, set `SHUTTLE_OAUTH_ADMIN_TOKEN` via a secret manager or runtime injection; never print it.
+- Verify remote MCP with:
+  - `curl -i <public-url>/.well-known/oauth-protected-resource/mcp`
+  - `curl -i <public-url>/mcp -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'`
+- Unauthenticated remote MCP should return 401 with `WWW-Authenticate`.
+
+## Cloudflare named tunnel
+
+- Keep gateway project config and admin token in local user config or a secret manager.
+- Run the gateway locally, then expose it with a Cloudflare named tunnel.
+- Register MCP clients with `<public-url>/mcp`.
+- Check local services with `launchctl list | rg 'shuttle-gateway'` when using LaunchAgents.
+- Check tunnel status with `cloudflared tunnel info <tunnel-name>`.
+- Do not print local admin token files or token environment values.
+"#;
 
 fn append_typed_memory(
     store: &SqliteEventStore,
@@ -929,6 +1071,48 @@ mod tests {
         env::remove_var("SHUTTLE_SESSION_ID");
 
         assert_eq!(session_id, "override");
+    }
+
+    #[test]
+    fn codex_skill_path_uses_home_directory() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        env::set_var("HOME", dir.path());
+
+        let path = skill_install_path(SkillTarget::Codex).unwrap();
+
+        env::remove_var("HOME");
+        assert_eq!(
+            path,
+            dir.path()
+                .join(".codex")
+                .join("skills")
+                .join("shuttle")
+                .join("SKILL.md")
+        );
+    }
+
+    #[test]
+    fn codex_skill_install_writes_skill_file() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        env::set_var("HOME", dir.path());
+
+        let install = install_skill(SkillTarget::Codex).unwrap();
+
+        env::remove_var("HOME");
+        let path = dir
+            .path()
+            .join(".codex")
+            .join("skills")
+            .join("shuttle")
+            .join("SKILL.md");
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(install.target, "codex");
+        assert_eq!(install.path, path.display().to_string());
+        assert!(content.contains("name: shuttle"));
+        assert!(content.contains("stl context"));
+        assert!(content.contains("SHUTTLE_OAUTH_ADMIN_TOKEN"));
     }
 
     #[test]
