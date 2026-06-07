@@ -2,19 +2,27 @@ package api
 
 import (
 	"encoding/json"
+	"html"
 	"net/http"
 	"strings"
 
+	"github.com/f4ah6o/shuttle-rs/gateway/internal/auth"
 	"github.com/f4ah6o/shuttle-rs/gateway/internal/mcp"
+	"github.com/f4ah6o/shuttle-rs/gateway/internal/oauth"
 	"github.com/f4ah6o/shuttle-rs/gateway/internal/router"
 )
 
 type Server struct {
 	service *router.Service
+	oauth   *auth.OAuthRuntime
 }
 
 func NewServer(service *router.Service) *Server {
 	return &Server{service: service}
+}
+
+func NewServerWithOAuth(service *router.Service, oauthRuntime auth.OAuthRuntime) *Server {
+	return &Server{service: service, oauth: &oauthRuntime}
 }
 
 func (s *Server) Routes() http.Handler {
@@ -33,6 +41,13 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /mcp", func(w http.ResponseWriter, _ *http.Request) {
 		_ = writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	mux.HandleFunc("GET /.well-known/oauth-protected-resource", s.oauthProtectedResource)
+	mux.HandleFunc("GET /.well-known/oauth-protected-resource/mcp", s.oauthProtectedResource)
+	mux.HandleFunc("GET /.well-known/oauth-authorization-server", s.oauthAuthorizationServer)
+	mux.HandleFunc("POST /oauth/register", s.oauthRegister)
+	mux.HandleFunc("GET /oauth/authorize", s.oauthAuthorizePage)
+	mux.HandleFunc("POST /oauth/authorize", s.oauthAuthorizeSubmit)
+	mux.HandleFunc("POST /oauth/token", s.oauthToken)
 	return mux
 }
 
@@ -186,4 +201,169 @@ func writeJSON(w http.ResponseWriter, status int, v any) error {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	return json.NewEncoder(w).Encode(v)
+}
+
+func (s *Server) oauthProtectedResource(w http.ResponseWriter, _ *http.Request) {
+	if s.oauth == nil {
+		_ = writeJSON(w, http.StatusNotFound, map[string]string{"error": "oauth is not configured"})
+		return
+	}
+	_ = writeJSON(w, http.StatusOK, oauth.ProtectedResourceMetadata(s.oauth.Config))
+}
+
+func (s *Server) oauthAuthorizationServer(w http.ResponseWriter, _ *http.Request) {
+	if s.oauth == nil {
+		_ = writeJSON(w, http.StatusNotFound, map[string]string{"error": "oauth is not configured"})
+		return
+	}
+	_ = writeJSON(w, http.StatusOK, oauth.AuthorizationServerMetadata(s.oauth.Config))
+}
+
+func (s *Server) oauthRegister(w http.ResponseWriter, r *http.Request) {
+	if s.oauth == nil {
+		_ = writeJSON(w, http.StatusNotFound, map[string]string{"error": "oauth is not configured"})
+		return
+	}
+	var req oauth.RegisterRequest
+	if !decode(w, r, &req) {
+		return
+	}
+	client, err := s.oauth.Store.RegisterClient(r.Context(), req)
+	if err != nil {
+		oauthError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	body := map[string]any{
+		"client_id":                  client.ClientID,
+		"client_secret":              client.ClientSecret,
+		"redirect_uris":              client.RedirectURIs,
+		"client_name":                client.ClientName,
+		"token_endpoint_auth_method": "none",
+	}
+	_ = writeJSON(w, http.StatusCreated, body)
+}
+
+func (s *Server) oauthAuthorizePage(w http.ResponseWriter, r *http.Request) {
+	if s.oauth == nil {
+		_ = writeJSON(w, http.StatusNotFound, map[string]string{"error": "oauth is not configured"})
+		return
+	}
+	req := authorizeRequestFromValues(r.URL.Query())
+	ok, err := s.oauth.Store.ClientAllowsRedirect(r.Context(), req.ClientID, req.RedirectURI)
+	if err != nil {
+		oauthError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	if !ok {
+		oauthError(w, http.StatusBadRequest, "invalid_request", "unknown client_id or redirect_uri")
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(authorizeHTML(req)))
+}
+
+func (s *Server) oauthAuthorizeSubmit(w http.ResponseWriter, r *http.Request) {
+	if s.oauth == nil {
+		_ = writeJSON(w, http.StatusNotFound, map[string]string{"error": "oauth is not configured"})
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		oauthError(w, http.StatusBadRequest, "invalid_request", "invalid form")
+		return
+	}
+	if !auth.CheckAdminToken(r.PostForm.Get("admin_token"), s.oauth.Config.AdminToken) {
+		oauthError(w, http.StatusUnauthorized, "access_denied", "invalid admin token")
+		return
+	}
+	req := authorizeRequestFromValues(r.PostForm)
+	code, err := s.oauth.Store.CreateCode(r.Context(), req)
+	if err != nil {
+		oauthError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return
+	}
+	http.Redirect(w, r, oauth.AuthorizeRedirect(req.RedirectURI, code, req.State), http.StatusSeeOther)
+}
+
+func (s *Server) oauthToken(w http.ResponseWriter, r *http.Request) {
+	if s.oauth == nil {
+		_ = writeJSON(w, http.StatusNotFound, map[string]string{"error": "oauth is not configured"})
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		oauthError(w, http.StatusBadRequest, "invalid_request", "invalid form")
+		return
+	}
+	token, err := s.oauth.Store.ExchangeCode(r.Context(), oauth.TokenRequest{
+		GrantType:    r.PostForm.Get("grant_type"),
+		ClientID:     r.PostForm.Get("client_id"),
+		RedirectURI:  r.PostForm.Get("redirect_uri"),
+		Code:         r.PostForm.Get("code"),
+		CodeVerifier: r.PostForm.Get("code_verifier"),
+	})
+	if err != nil {
+		oauthError(w, http.StatusBadRequest, "invalid_grant", err.Error())
+		return
+	}
+	_ = writeJSON(w, http.StatusOK, token)
+}
+
+func authorizeRequestFromValues(values map[string][]string) oauth.AuthorizeRequest {
+	get := func(key string) string {
+		if values == nil || len(values[key]) == 0 {
+			return ""
+		}
+		return values[key][0]
+	}
+	return oauth.AuthorizeRequest{
+		ResponseType:        get("response_type"),
+		ClientID:            get("client_id"),
+		RedirectURI:         get("redirect_uri"),
+		State:               get("state"),
+		Scope:               get("scope"),
+		CodeChallenge:       get("code_challenge"),
+		CodeChallengeMethod: get("code_challenge_method"),
+	}
+}
+
+func authorizeHTML(req oauth.AuthorizeRequest) string {
+	return `<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Authorize Shuttle Gateway</title></head>
+<body>
+<main>
+<h1>Authorize Shuttle Gateway</h1>
+<p>Client ` + html.EscapeString(req.ClientID) + ` is requesting ` + html.EscapeString(scopeOrDefault(req.Scope)) + ` access.</p>
+<form method="post" action="/oauth/authorize">
+<label>Admin token <input name="admin_token" type="password" autocomplete="current-password" required></label>
+` + hidden("response_type", req.ResponseType) +
+		hidden("client_id", req.ClientID) +
+		hidden("redirect_uri", req.RedirectURI) +
+		hidden("state", req.State) +
+		hidden("scope", req.Scope) +
+		hidden("code_challenge", req.CodeChallenge) +
+		hidden("code_challenge_method", req.CodeChallengeMethod) + `
+<button type="submit">Authorize</button>
+</form>
+</main>
+</body>
+</html>`
+}
+
+func hidden(name, value string) string {
+	return `<input type="hidden" name="` + html.EscapeString(name) + `" value="` + html.EscapeString(value) + `">`
+}
+
+func scopeOrDefault(scope string) string {
+	if scope == "" {
+		return oauth.ScopeMCP
+	}
+	return scope
+}
+
+func oauthError(w http.ResponseWriter, status int, code, description string) {
+	_ = writeJSON(w, status, map[string]string{
+		"error":             code,
+		"error_description": description,
+	})
 }

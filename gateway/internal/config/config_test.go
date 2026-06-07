@@ -46,6 +46,44 @@ repo = "/tmp/demo"
 	if cfg.Auth.BearerTokenEnv != "SHUTTLE_GATEWAY_TOKEN" {
 		t.Fatalf("unexpected token env: %q", cfg.Auth.BearerTokenEnv)
 	}
+	if cfg.OAuth.AdminTokenEnv != "SHUTTLE_OAUTH_ADMIN_TOKEN" {
+		t.Fatalf("unexpected admin token env: %q", cfg.OAuth.AdminTokenEnv)
+	}
+}
+
+func TestLoadNormalizesOAuthDefaults(t *testing.T) {
+	path := writeConfig(t, `
+[oauth]
+public_url = "https://shuttle.example.test/"
+
+[projects.demo]
+repo = "/tmp/demo"
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if cfg.OAuth.PublicURL != "https://shuttle.example.test" {
+		t.Fatalf("unexpected public url: %q", cfg.OAuth.PublicURL)
+	}
+	if cfg.OAuth.DBPath != filepath.Join(filepath.Dir(path), "gateway-oauth.db") {
+		t.Fatalf("unexpected oauth db path: %q", cfg.OAuth.DBPath)
+	}
+}
+
+func TestLoadRejectsRelativeOAuthDBPath(t *testing.T) {
+	path := writeConfig(t, `
+[oauth]
+public_url = "https://shuttle.example.test"
+db_path = "relative.db"
+
+[projects.demo]
+repo = "/tmp/demo"
+`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatal("expected relative oauth db_path to be rejected")
+	}
 }
 
 func writeConfig(t *testing.T, contents string) string {
