@@ -12,6 +12,8 @@ include = [
     "Cargo.toml",
     "Cargo.lock",
     "README.md",
+    "docs/**/*.md",
+    "examples/**/*.toml",
     "LICENSE-MIT",
     "LICENSE-APACHE",
     "src/**/*.rs",
@@ -24,6 +26,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "stl"
 path = "src/bin/stl.rs"
+
+[[bin]]
+name = "shuttle-gateway"
+path = "src/bin/shuttle-gateway.rs"
 
 [dependencies]
 anyhow = "1"
@@ -39,7 +45,8 @@ serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
 thiserror = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "process", "signal", "time"] }
+toml = "0.8"
 uuid = { version = "1", features = ["serde", "v4"] }
 
 [dev-dependencies]
