@@ -1,6 +1,7 @@
 pub mod app;
 pub mod context;
 pub mod core;
+pub mod gateway;
 pub mod mcp;
 pub mod memory;
 pub mod mesh;

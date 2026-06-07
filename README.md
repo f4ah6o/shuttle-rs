@@ -101,15 +101,14 @@ Cloudflare Tunnel hostname that forwards to `http://127.0.0.1:8787`.
 ## Multi-project Gateway
 
 For web chat clients that should use one MCP server across several local
-repositories, run the Go gateway from `gateway/`. The gateway keeps Shuttle
-storage project-local by routing each request to a configured repository and
-running `stl --json ...` as a subprocess in that repository.
+repositories, run `shuttle-gateway`. The gateway keeps Shuttle storage
+project-local by routing each request to a configured repository and running the
+shared `stl --json ...` executable as a subprocess in that repository.
 
-Create a project config from `gateway/configs/projects.example.toml`, then run:
+Create a project config from `examples/projects.example.toml`, then run:
 
 ```bash
-cd gateway
-go run ./cmd/shuttle-gateway serve --config configs/projects.toml --addr 127.0.0.1:8787
+shuttle-gateway serve --config projects.toml --addr 127.0.0.1:8787
 ```
 
 Register one MCP endpoint:
@@ -142,7 +141,7 @@ Then run the gateway with the owner-approval token injected at runtime:
 
 ```bash
 SHUTTLE_OAUTH_ADMIN_TOKEN=<admin-token> \
-go run ./cmd/shuttle-gateway serve --config configs/projects.toml --addr 127.0.0.1:8787
+shuttle-gateway serve --config projects.toml --addr 127.0.0.1:8787
 ```
 
 Register `https://shuttle.example.com/mcp` with the remote MCP client. OAuth

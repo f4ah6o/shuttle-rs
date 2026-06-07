@@ -145,6 +145,9 @@ impl OAuthStore {
     }
 
     pub fn create_code(&self, request: AuthorizeRequest) -> Result<String> {
+        if request.response_type != "code" {
+            return Err(ShuttleError::Store("response_type must be code".to_owned()));
+        }
         if !self.client_allows_redirect(&request.client_id, &request.redirect_uri)? {
             return Err(ShuttleError::Store(
                 "unknown client_id or redirect_uri".to_owned(),
@@ -185,20 +188,26 @@ impl OAuthStore {
     }
 
     pub fn exchange_code(&self, request: TokenRequest) -> Result<TokenResponse> {
+        if request.grant_type != "authorization_code" {
+            return Err(ShuttleError::Store(
+                "grant_type must be authorization_code".to_owned(),
+            ));
+        }
         let code = request
             .code
             .ok_or_else(|| ShuttleError::Store("missing code".to_owned()))?;
         let verifier = request
             .code_verifier
             .ok_or_else(|| ShuttleError::Store("missing code_verifier".to_owned()))?;
-        let conn = self
+        let mut conn = self
             .conn
             .lock()
             .map_err(|err| ShuttleError::Store(err.to_string()))?;
-        let stored = conn
+        let tx = conn.transaction().map_err(to_store_error)?;
+        let stored = tx
             .query_row(
-                "SELECT client_id, redirect_uri, code_challenge, scope, expires_at, used_at
-                 FROM oauth_codes WHERE code = ?1",
+                "SELECT client_id, redirect_uri, code_challenge, scope, expires_at
+                 FROM oauth_codes WHERE code = ?1 AND used_at IS NULL",
                 params![code],
                 |row| {
                     Ok(StoredCode {
@@ -207,22 +216,33 @@ impl OAuthStore {
                         code_challenge: row.get(2)?,
                         scope: row.get(3)?,
                         expires_at: row.get(4)?,
-                        used_at: row.get(5)?,
                     })
                 },
             )
             .optional()
-            .map_err(to_store_error)?
-            .ok_or_else(|| ShuttleError::Store("invalid code".to_owned()))?;
+            .map_err(to_store_error)?;
+        let Some(stored) = stored else {
+            let exists = tx
+                .query_row(
+                    "SELECT 1 FROM oauth_codes WHERE code = ?1",
+                    params![code],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(to_store_error)?
+                .is_some();
+            return Err(ShuttleError::Store(if exists {
+                "code already used".to_owned()
+            } else {
+                "invalid code".to_owned()
+            }));
+        };
 
         if stored.client_id != request.client_id {
             return Err(ShuttleError::Store("invalid client_id".to_owned()));
         }
         if stored.redirect_uri != request.redirect_uri {
             return Err(ShuttleError::Store("invalid redirect_uri".to_owned()));
-        }
-        if stored.used_at.is_some() {
-            return Err(ShuttleError::Store("code already used".to_owned()));
         }
         if parse_time(&stored.expires_at)? < Utc::now() {
             return Err(ShuttleError::Store("code expired".to_owned()));
@@ -231,12 +251,14 @@ impl OAuthStore {
             return Err(ShuttleError::Store("invalid code_verifier".to_owned()));
         }
 
-        conn.execute(
+        tx.execute(
             "UPDATE oauth_codes SET used_at = ?1 WHERE code = ?2",
             params![Utc::now().to_rfc3339(), code],
         )
         .map_err(to_store_error)?;
-        create_token(&conn, &stored.client_id, &stored.scope)
+        let token = create_token(&tx, &stored.client_id, &stored.scope)?;
+        tx.commit().map_err(to_store_error)?;
+        Ok(token)
     }
 
     pub fn validate_access_token(&self, bearer_token: &str) -> Result<bool> {
@@ -312,7 +334,7 @@ impl From<AuthorizeForm> for AuthorizeRequest {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TokenRequest {
     pub grant_type: String,
     pub client_id: String,
@@ -457,7 +479,6 @@ struct StoredCode {
     code_challenge: String,
     scope: String,
     expires_at: String,
-    used_at: Option<String>,
 }
 
 #[cfg(test)]
@@ -542,5 +563,82 @@ mod tests {
             .unwrap();
 
         assert!(store.validate_access_token(&token.access_token).unwrap());
+    }
+
+    #[test]
+    fn code_exchange_rejects_reused_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = OAuthStore::open(dir.path().join("shuttle.db")).unwrap();
+        let client = store
+            .register_client(RegisterRequest {
+                redirect_uris: vec!["https://client.example.test/callback".to_owned()],
+                client_name: Some("client".to_owned()),
+            })
+            .unwrap();
+        let verifier = "abc123abc123abc123abc123abc123abc123abc123abc123";
+        let code = store
+            .create_code(AuthorizeRequest {
+                response_type: "code".to_owned(),
+                client_id: client.client_id.clone(),
+                redirect_uri: "https://client.example.test/callback".to_owned(),
+                state: None,
+                scope: Some("mcp".to_owned()),
+                code_challenge: Some(pkce_s256(verifier)),
+                code_challenge_method: Some("S256".to_owned()),
+            })
+            .unwrap();
+        let request = TokenRequest {
+            grant_type: "authorization_code".to_owned(),
+            client_id: client.client_id,
+            redirect_uri: "https://client.example.test/callback".to_owned(),
+            code: Some(code),
+            code_verifier: Some(verifier.to_owned()),
+        };
+
+        store
+            .exchange_code(TokenRequest { ..request.clone() })
+            .unwrap();
+        let err = store.exchange_code(request).unwrap_err();
+
+        assert!(err.to_string().contains("code already used"));
+    }
+
+    #[test]
+    fn store_validates_oauth_grant_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = OAuthStore::open(dir.path().join("shuttle.db")).unwrap();
+        let client = store
+            .register_client(RegisterRequest {
+                redirect_uris: vec!["https://client.example.test/callback".to_owned()],
+                client_name: Some("client".to_owned()),
+            })
+            .unwrap();
+        let verifier = "abc123abc123abc123abc123abc123abc123abc123abc123";
+
+        assert!(store
+            .create_code(AuthorizeRequest {
+                response_type: "token".to_owned(),
+                client_id: client.client_id.clone(),
+                redirect_uri: "https://client.example.test/callback".to_owned(),
+                state: None,
+                scope: Some("mcp".to_owned()),
+                code_challenge: Some(pkce_s256(verifier)),
+                code_challenge_method: Some("S256".to_owned()),
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("response_type must be code"));
+
+        assert!(store
+            .exchange_code(TokenRequest {
+                grant_type: "refresh_token".to_owned(),
+                client_id: client.client_id,
+                redirect_uri: "https://client.example.test/callback".to_owned(),
+                code: Some("stl_missing".to_owned()),
+                code_verifier: Some(verifier.to_owned()),
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("grant_type must be authorization_code"));
     }
 }
