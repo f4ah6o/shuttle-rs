@@ -9,6 +9,8 @@
 [![CI](https://github.com/shuttle-rs/shuttle-rs/actions/workflows/publish.yaml/badge.svg)](https://github.com/shuttle-rs/shuttle-rs/actions/workflows/publish.yaml)
 <!-- bdg:end -->
 
+[日本語版](./README.ja.md)
+
 `shuttle-rs` is a local-first event log for agent memory, messaging, repository
 context, and coordination. The `stl` CLI stores data in `.shuttle/shuttle.db`
 under the current Git repository.
@@ -123,6 +125,10 @@ Expose Shuttle over HTTP MCP:
 stl app serve --addr 127.0.0.1:8787
 ```
 
+The app serves a small JSON dashboard at `/` and API endpoints for dashboard
+state, inbox, tasks, memories, and repository context. It also exposes the MCP
+endpoint at `/mcp`.
+
 Configure MCP clients to use the `/mcp` endpoint:
 
 ```json
@@ -139,6 +145,14 @@ Set `SHUTTLE_MCP_BEARER_TOKEN` before starting `stl app serve` to require
 `Authorization: Bearer <token>` on MCP requests. When the variable is unset,
 local MCP remains unauthenticated.
 
+Pass `--public-url` to `stl app serve` when the app is already behind a public
+HTTPS endpoint and should publish OAuth metadata:
+
+```bash
+SHUTTLE_OAUTH_ADMIN_TOKEN=<admin-token> \
+stl app serve --addr 127.0.0.1:8787 --public-url https://shuttle.example.com
+```
+
 Expose Shuttle as a remote MCP server for web chat clients with a Cloudflare
 Named Tunnel:
 
@@ -153,6 +167,11 @@ token is read only from the environment, so use a secret manager or runtime
 injection instead of putting it in shell history. The public URL must match the
 Cloudflare Tunnel hostname that forwards to `http://127.0.0.1:8787`.
 
+The MCP server provides memory, message, task, handoff, repository context,
+repository status, changed-file, and diff tools. Tool aliases such as `remember`
+and namespaced tools such as `shuttle_memory_store` call the same local event
+log.
+
 ## Multi-project Gateway
 
 For web chat clients that should use one MCP server across several local
@@ -160,11 +179,19 @@ repositories, run `shuttle-gateway`. The gateway keeps Shuttle storage
 project-local by routing each request to a configured repository and running the
 shared `stl --json ...` executable as a subprocess in that repository.
 
-Create a project config from `examples/projects.example.toml`, then run:
+Create a project config from `examples/projects.example.toml`. Project `repo`
+paths must be absolute, and an optional project `db` path must also be absolute.
+If `db` is omitted, the project uses `.shuttle/shuttle.db` under its repository.
+
+Run the gateway with the config:
 
 ```bash
 shuttle-gateway serve --config projects.toml --addr 127.0.0.1:8787
 ```
+
+When `--addr` is omitted, the gateway uses `[server].addr` from the config.
+Use `--stl /path/to/stl` to choose the CLI binary that gateway tools execute,
+and `--timeout <seconds>` to set the subprocess timeout.
 
 Register one MCP endpoint:
 
