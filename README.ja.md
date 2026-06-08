@@ -173,66 +173,98 @@ changed-file、diff の tool を提供します。`remember` のような alias 
 ## Multi-project Gateway
 
 複数の local repository を 1 つの MCP server から使う web chat client には、
-`shuttle-gateway` を使います。gateway は request を設定済み repository に route し、
-その repository 内で共通の `stl --json ...` executable を subprocess として実行します。
-これにより、Shuttle storage は project-local のままになります。
+`shuttle-gateway` を使います。gateway は MCP、auth、project routing の境界です。
+各 project は local backend として `stl --json ...` を実行するか、repo-local な
+`stl app serve` に HTTP で接続できます。
 
-`examples/projects.example.toml` から project config を作ります。project の `repo` path は
-absolute path が必要です。任意の `db` path を指定する場合、それも absolute path にします。
-`db` を省略すると、その repository の `.shuttle/shuttle.db` を使います。
+remote deployment model は次の形です。
+
+```text
+gateway host / LXC
+└─ shuttle-gateway
+
+project environment
+└─ stl app serve
+   └─ repo + .shuttle/shuttle.db
+```
+
+`examples/projects.example.toml` から project config を作ります。remote project
+environment には `backend = "http"` と `url` を使います。compatibility mode では
+`backend = "local"` と absolute な `repo` path を指定します。`backend` を省略して
+`repo` がある場合、その project は local として扱われます。
 
 config を指定して gateway を起動します。
 
 ```bash
-shuttle-gateway serve --config projects.toml --addr 127.0.0.1:8787
+shuttle-gateway serve --config projects.toml
 ```
 
-`--addr` を省略すると、gateway は config の `[server].addr` を使います。gateway tool が
-実行する CLI binary は `--stl /path/to/stl` で指定できます。subprocess timeout は
-`--timeout <seconds>` で設定します。
+local backend が実行する CLI binary は `--stl /path/to/stl` で指定できます。
+local subprocess と HTTP backend の timeout は `--timeout <seconds>` で設定します。
+single-listener config では `--addr` で address を上書きできます。複数の
+`[[listeners]]` を持つ config では、listener address は config 側が管理します。
 
-MCP endpoint は 1 つだけ登録します。
+listener は ingress/auth policy を project backend type から分離します。public Web Chat
+listener には OAuth を使い、private LAN/Tailscale/local listener には bearer auth または
+loopback-only の認証なし access を使えます。
+
+```toml
+[[listeners]]
+name = "public"
+addr = "127.0.0.1:8787"
+auth = "oauth"
+public_url = "https://shuttle.example.com"
+oauth_admin_token_env = "SHUTTLE_OAUTH_ADMIN_TOKEN"
+
+[[listeners]]
+name = "private"
+addr = "127.0.0.1:8788"
+auth = "bearer"
+bearer_token_env = "SHUTTLE_GATEWAY_TOKEN"
+```
+
+gateway では、`shuttle_remember` や `shuttle_task_create` のような write に明示的な
+`project` argument が必要です。read は設定済み default project を使えます。
+
+HTTP backend では、project environment で repo-local app server を起動します。
+
+```bash
+SHUTTLE_MCP_BEARER_TOKEN=<backend-token> \
+stl app serve --addr 127.0.0.1:8787
+```
+
+gateway project には URL と backend token の environment variable 名を設定します。
+
+```toml
+[projects.main]
+backend = "http"
+url = "http://10.10.10.21:8787"
+token_env = "SHUTTLE_MAIN_BACKEND_TOKEN"
+```
+
+ChatGPT や Claude web connector のような remote MCP client には public listener URL を
+登録します。
 
 ```json
 {
   "mcpServers": {
     "shuttle-gateway": {
-      "url": "http://127.0.0.1:8787/mcp"
+      "url": "https://shuttle.example.com/mcp"
     }
   }
 }
 ```
 
-gateway では、`shuttle_remember` や `shuttle_task_create` のような write に明示的な
-`project` argument が必要です。read は設定済み default project を使えます。
-`SHUTTLE_GATEWAY_TOKEN` を設定すると、gateway boundary で
-`Authorization: Bearer <token>` が必要になります。
-
-gateway tool は解決した project repository 内で `stl --json ...` を実行します。そのため
-identity、inbox ownership、`.shuttle/shuttle.db` は project-local のままです。web chat
-client から write する場合は、明示的な `project` argument を渡してください。
-
-ChatGPT や Claude web connector のような remote MCP client に gateway を公開する場合は、
-gateway へ forward する public URL を OAuth config に書きます。
-
-```toml
-[oauth]
-public_url = "https://shuttle.example.com"
-admin_token_env = "SHUTTLE_OAUTH_ADMIN_TOKEN"
-```
-
-owner-approval token を runtime injection で渡して gateway を起動します。
+OAuth listener は owner-approval token を runtime injection で渡して起動します。
 
 ```bash
 SHUTTLE_OAUTH_ADMIN_TOKEN=<admin-token> \
-shuttle-gateway serve --config projects.toml --addr 127.0.0.1:8787
+shuttle-gateway serve --config projects.toml
 ```
 
-remote MCP client には `https://shuttle.example.com/mcp` を登録します。OAuth client
-registration、authorization code、access token は gateway-local SQLite database に保存されます。
-`[oauth].db_path` に absolute path を指定しない場合、database は config file の隣の
-`gateway-oauth.db` です。admin token は secret manager または runtime-injected
-environment variable で渡してください。
+OAuth client registration、authorization code、access token は gateway-local SQLite database
+に保存されます。backend token と OAuth admin token は secret manager または
+runtime-injected environment variable で渡してください。
 
 Shuttle instance 間で event log を同期します。
 
