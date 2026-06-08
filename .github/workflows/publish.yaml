@@ -8,9 +8,28 @@ on:
 env:
   CARGO_TERM_COLOR: always
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  GH_REPO: ${{ github.repository }}
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/shuttle-gateway
 
 jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes "Shuttle release artifacts for ${GITHUB_REF_NAME}." || \
+              gh release view "${GITHUB_REF_NAME}" >/dev/null
+          fi
+
   publish:
+    needs: create-release
     runs-on: ubuntu-latest
     environment: publish
     permissions:
@@ -54,3 +73,129 @@ jobs:
         run: cargo publish --package shuttle-rs
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  gateway-image:
+    needs: create-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Docker buildx
+        shell: bash
+        run: |
+          docker run --privileged --rm tonistiigi/binfmt --install amd64,arm64
+          docker buildx create --use --name shuttle-gateway-builder
+
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "${GH_TOKEN}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build and push multi-arch image
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --file packaging/oci/Containerfile \
+            --tag "${IMAGE_NAME}:${version}" \
+            --tag "${IMAGE_NAME}:${GITHUB_REF_NAME}" \
+            --push \
+            .
+
+  gateway-oci-archives:
+    needs: create-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            artifact: linux-amd64
+          - platform: linux/arm64
+            artifact: linux-arm64
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Docker buildx
+        shell: bash
+        run: |
+          docker run --privileged --rm tonistiigi/binfmt --install amd64,arm64
+          docker buildx create --use --name shuttle-gateway-archive-builder
+
+      - name: Build OCI archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          version="${GITHUB_REF_NAME#v}"
+          docker buildx build \
+            --platform "${{ matrix.platform }}" \
+            --file packaging/oci/Containerfile \
+            --tag "${IMAGE_NAME}:${version}-${{ matrix.artifact }}" \
+            --output "type=oci,dest=dist/shuttle-gateway-oci-${{ matrix.artifact }}.tar" \
+            .
+
+      - name: Upload OCI archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${GITHUB_REF_NAME}" "dist/shuttle-gateway-oci-${{ matrix.artifact }}.tar" --clobber
+
+  gateway-lxc-archives:
+    needs: create-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: gateway-lxc-${{ matrix.target }}
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build gateway binaries
+        run: cross build --release --target "${{ matrix.target }}" --bin shuttle-gateway --bin stl
+
+      - name: Package archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="shuttle-gateway-lxc-${{ matrix.target }}"
+          root="dist/${archive}/shuttle-gateway-lxc"
+
+          install -d "${root}/bin" "${root}/etc" "${root}/systemd"
+          install -m 0755 "target/${{ matrix.target }}/release/shuttle-gateway" "${root}/bin/shuttle-gateway"
+          install -m 0755 "target/${{ matrix.target }}/release/stl" "${root}/bin/stl"
+          install -m 0644 packaging/lxc/projects.toml.example "${root}/etc/projects.toml.example"
+          install -m 0644 packaging/lxc/shuttle-gateway.env.example "${root}/etc/shuttle-gateway.env.example"
+          install -m 0644 packaging/lxc/shuttle-gateway.service "${root}/systemd/shuttle-gateway.service"
+          install -m 0755 packaging/lxc/install.sh "${root}/install.sh"
+
+          tar -C "dist/${archive}" -czf "dist/${archive}.tar.gz" shuttle-gateway-lxc
+
+      - name: Upload LXC archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${GITHUB_REF_NAME}" "dist/shuttle-gateway-lxc-${{ matrix.target }}.tar.gz" --clobber

@@ -274,14 +274,14 @@ OAuth client registration、authorization code、access token は gateway-local 
 に保存されます。backend token と OAuth admin token は secret manager または
 runtime-injected environment variable で渡してください。
 
-LXC-oriented な gateway host 向けには、`gateway-v*` release tag で
+LXC-oriented な gateway host 向けには、`v*` release tag で
 `shuttle-gateway-lxc-<target>.tar.gz` archive を公開します。archive には
 `bin/shuttle-gateway`、`bin/stl`、LXC config example、systemd unit、`install.sh`
 が含まれます。installer は default で `/usr/local/bin`、`/etc/shuttle-gateway`、
 `/var/lib/shuttle-gateway` を使います。install 後に `projects.toml` と
 `shuttle-gateway.env` を編集してください。example file に実 token value を保存しないでください。
 
-同じ `gateway-v*` tag で OCI image と architecture 別の OCI layout archive も公開します。
+同じ `v*` release で OCI image と architecture 別の OCI layout archive も公開します。
 registry image は GHCR から pull できます。
 
 ```bash
