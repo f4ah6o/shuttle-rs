@@ -2,16 +2,17 @@ use std::env;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use crate::core::{Event, Result, ShuttleError};
+use crate::core::{Event, EventStore, EventType, Result, ShuttleError};
 use crate::oauth::{self, OAuthConfig, OAuthStore};
 use crate::store::SqliteEventStore;
-use axum::extract::{Form, Query, State};
+use axum::extract::{Form, Path as AxumPath, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct AppRuntime {
@@ -53,8 +54,13 @@ pub fn router(runtime: AppRuntime) -> Router {
         .route("/api/dashboard", get(dashboard))
         .route("/api/inbox", get(inbox))
         .route("/api/tasks", get(tasks))
+        .route("/api/tasks", post(create_task))
+        .route("/api/tasks/{id}", patch(update_task))
+        .route("/api/tasks/{id}/done", post(done_task))
         .route("/api/memories", get(memories))
         .route("/api/context", get(context))
+        .route("/api/recall", post(recall))
+        .route("/api/remember", post(remember))
         .route(
             "/mcp",
             get(mcp_health)
@@ -217,6 +223,221 @@ async fn context(headers: HeaderMap, State(runtime): State<AppRuntime>) -> Respo
         .ok(),
     )
     .into_response()
+}
+
+#[derive(Deserialize)]
+struct RecallRequest {
+    #[serde(default)]
+    query: String,
+}
+
+async fn recall(
+    headers: HeaderMap,
+    State(runtime): State<AppRuntime>,
+    Json(request): Json<RecallRequest>,
+) -> Response {
+    if let Some(response) = mcp_unauthorized_response(runtime.oauth.as_ref(), &headers) {
+        return response;
+    }
+    if request.query.trim().is_empty() {
+        return api_error("query is required");
+    }
+    let status = crate::context::repo_status(&runtime.cwd).ok();
+    let repo_id = status.as_ref().map(crate::context::repo_id);
+    let branch = status.as_ref().map(|status| status.branch.as_str());
+    Json(
+        crate::memory::ranked_recall(
+            &runtime.store,
+            &request.query,
+            None,
+            Some(&runtime.workspace_id),
+            repo_id.as_deref(),
+            branch,
+        )
+        .await
+        .unwrap_or_default(),
+    )
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct RememberRequest {
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    text: String,
+}
+
+async fn remember(
+    headers: HeaderMap,
+    State(runtime): State<AppRuntime>,
+    Json(request): Json<RememberRequest>,
+) -> Response {
+    if let Some(response) = mcp_unauthorized_response(runtime.oauth.as_ref(), &headers) {
+        return response;
+    }
+    if request.text.trim().is_empty() {
+        return api_error("text is required");
+    }
+    let event_type = match request.kind.as_str() {
+        "" | "memory" => EventType::Memory,
+        "decision" => EventType::Decision,
+        "observation" => EventType::Observation,
+        "pattern" => EventType::Pattern,
+        "fact" => EventType::Fact,
+        "bug" => EventType::Bug,
+        other => return api_error(&format!("unknown memory kind {other:?}")),
+    };
+    let event = crate::memory::new_typed_memory(
+        event_type,
+        runtime.workspace_id.clone(),
+        runtime.agent.clone(),
+        runtime.session_id.clone(),
+        request.text,
+    );
+    match runtime
+        .store
+        .append(with_repo_metadata(event, &runtime))
+        .await
+    {
+        Ok(event) => Json(event).into_response(),
+        Err(err) => api_error(&err.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct CreateTaskRequest {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    body: String,
+}
+
+async fn create_task(
+    headers: HeaderMap,
+    State(runtime): State<AppRuntime>,
+    Json(request): Json<CreateTaskRequest>,
+) -> Response {
+    if let Some(response) = mcp_unauthorized_response(runtime.oauth.as_ref(), &headers) {
+        return response;
+    }
+    if request.title.trim().is_empty() {
+        return api_error("title is required");
+    }
+    let content = if request.body.is_empty() {
+        request.title
+    } else {
+        format!("{}\n\n{}", request.title, request.body)
+    };
+    let event = crate::task::new_task(
+        runtime.workspace_id.clone(),
+        runtime.agent.clone(),
+        runtime.session_id.clone(),
+        content,
+    );
+    match runtime
+        .store
+        .append(with_repo_metadata(event, &runtime))
+        .await
+    {
+        Ok(event) => Json(event).into_response(),
+        Err(err) => api_error(&err.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdateTaskRequest {
+    #[serde(default)]
+    text: String,
+}
+
+async fn update_task(
+    headers: HeaderMap,
+    State(runtime): State<AppRuntime>,
+    AxumPath(id): AxumPath<Uuid>,
+    Json(request): Json<UpdateTaskRequest>,
+) -> Response {
+    if let Some(response) = mcp_unauthorized_response(runtime.oauth.as_ref(), &headers) {
+        return response;
+    }
+    if request.text.trim().is_empty() {
+        return api_error("text is required");
+    }
+    if let Err(err) =
+        crate::task::ensure_task_exists(&runtime.store, &runtime.workspace_id, id).await
+    {
+        return api_error(&err.to_string());
+    }
+    let event = crate::task::new_task_update(
+        runtime.workspace_id.clone(),
+        runtime.agent.clone(),
+        runtime.session_id.clone(),
+        id,
+        request.text,
+    );
+    match runtime
+        .store
+        .append(with_repo_metadata(event, &runtime))
+        .await
+    {
+        Ok(event) => Json(event).into_response(),
+        Err(err) => api_error(&err.to_string()),
+    }
+}
+
+async fn done_task(
+    headers: HeaderMap,
+    State(runtime): State<AppRuntime>,
+    AxumPath(id): AxumPath<Uuid>,
+) -> Response {
+    if let Some(response) = mcp_unauthorized_response(runtime.oauth.as_ref(), &headers) {
+        return response;
+    }
+    if let Err(err) =
+        crate::task::ensure_task_exists(&runtime.store, &runtime.workspace_id, id).await
+    {
+        return api_error(&err.to_string());
+    }
+    let event = crate::task::new_task_done(
+        runtime.workspace_id.clone(),
+        runtime.agent.clone(),
+        runtime.session_id.clone(),
+        id,
+    );
+    match runtime
+        .store
+        .append(with_repo_metadata(event, &runtime))
+        .await
+    {
+        Ok(event) => Json(event).into_response(),
+        Err(err) => api_error(&err.to_string()),
+    }
+}
+
+fn api_error(message: &str) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response()
+}
+
+fn with_repo_metadata(mut event: Event, runtime: &AppRuntime) -> Event {
+    if let Ok(status) = crate::context::repo_status(&runtime.cwd) {
+        let repo_id = crate::context::repo_id(&status);
+        event.repo_id = Some(repo_id.clone());
+        event.repo_path = Some(status.repo_path.clone());
+        event.git_remote = status.git_remote.clone();
+        event.branch = Some(status.branch.clone());
+        event.commit = Some(status.commit.clone());
+        event.repo_dirty = Some(status.dirty);
+        if let Some(metadata) = event.metadata_json.as_object_mut() {
+            metadata.insert("repo_id".to_owned(), json!(repo_id));
+            metadata.insert("repo_path".to_owned(), json!(status.repo_path));
+            metadata.insert("git_remote".to_owned(), json!(status.git_remote));
+            metadata.insert("branch".to_owned(), json!(status.branch));
+            metadata.insert("commit".to_owned(), json!(status.commit));
+            metadata.insert("repo_dirty".to_owned(), json!(status.dirty));
+            metadata.insert("dirty_files".to_owned(), json!(status.dirty_files));
+        }
+    }
+    event
 }
 
 async fn mcp_health(headers: HeaderMap, State(runtime): State<AppRuntime>) -> Response {
@@ -748,5 +969,46 @@ mod tests {
         assert!(html.contains("heading.textContent = name"));
         assert!(html.contains("pre.textContent = JSON.stringify(value, null, 2)"));
         assert!(!html.contains("section.innerHTML"));
+    }
+
+    #[tokio::test]
+    async fn backend_api_can_remember_and_recall() {
+        let runtime = runtime(None);
+        let app = router(runtime);
+        let remember = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/remember")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"kind":"fact","text":"SQLite backs Shuttle"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(remember.status(), StatusCode::OK);
+
+        let recall = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/recall")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"query":"SQLite"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recall.status(), StatusCode::OK);
+        let body = recall.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(value
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["event"]["content"] == "SQLite backs Shuttle"));
     }
 }
