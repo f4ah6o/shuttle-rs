@@ -270,6 +270,14 @@ OAuth client registrations, authorization codes, and access tokens are stored in
 gateway-local SQLite databases. Backend tokens and OAuth admin tokens should be
 provided by a secret manager or runtime-injected environment variables.
 
+For LXC-oriented gateway hosts, `gateway-v*` release tags publish archives named
+`shuttle-gateway-lxc-<target>.tar.gz`. Each archive contains
+`bin/shuttle-gateway`, `bin/stl`, LXC config examples, a systemd unit, and
+`install.sh`. The installer uses `/usr/local/bin`, `/etc/shuttle-gateway`, and
+`/var/lib/shuttle-gateway` by default. Edit `projects.toml` and
+`shuttle-gateway.env` after installation; do not store real token values in the
+example files.
+
 Synchronize event logs between Shuttle instances:
 
 ```bash
