@@ -1,0 +1,28 @@
+[Unit]
+Description=Shuttle Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=shuttle-gateway
+Group=shuttle-gateway
+EnvironmentFile=/etc/shuttle-gateway/shuttle-gateway.env
+ExecStart=/usr/local/bin/shuttle-gateway serve \
+  --config /etc/shuttle-gateway/projects.toml \
+  --stl /usr/local/bin/stl \
+  --timeout 10
+Restart=on-failure
+RestartSec=3
+
+StateDirectory=shuttle-gateway
+WorkingDirectory=/var/lib/shuttle-gateway
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/shuttle-gateway /etc/shuttle-gateway
+
+[Install]
+WantedBy=multi-user.target
