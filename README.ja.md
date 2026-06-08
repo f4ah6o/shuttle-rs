@@ -199,6 +199,14 @@ config を指定して gateway を起動します。
 shuttle-gateway serve --config projects.toml
 ```
 
+installed binary の version を確認します。
+
+```bash
+stl version
+shuttle-gateway version
+stl --json version
+```
+
 local backend が実行する CLI binary は `--stl /path/to/stl` で指定できます。
 local subprocess と HTTP backend の timeout は `--timeout <seconds>` で設定します。
 single-listener config では `--addr` で address を上書きできます。複数の
@@ -272,6 +280,38 @@ LXC-oriented な gateway host 向けには、`gateway-v*` release tag で
 が含まれます。installer は default で `/usr/local/bin`、`/etc/shuttle-gateway`、
 `/var/lib/shuttle-gateway` を使います。install 後に `projects.toml` と
 `shuttle-gateway.env` を編集してください。example file に実 token value を保存しないでください。
+
+同じ `gateway-v*` tag で OCI image と architecture 別の OCI layout archive も公開します。
+registry image は GHCR から pull できます。
+
+```bash
+docker pull ghcr.io/f4ah6o/shuttle-gateway:<version>
+```
+
+config directory と state directory を mount して起動します。
+
+```bash
+docker run --rm \
+  -p 8787:8787 \
+  -v /path/to/shuttle-gateway:/etc/shuttle-gateway \
+  -v /path/to/shuttle-gateway-state:/var/lib/shuttle-gateway \
+  -e SHUTTLE_OAUTH_ADMIN_TOKEN=<admin-token> \
+  -e SHUTTLE_MAIN_BACKEND_TOKEN=<backend-token> \
+  ghcr.io/f4ah6o/shuttle-gateway:<version>
+```
+
+Apple の `container` tool でも同じ OCI image を pull するか、release archive を
+load できます。
+
+```bash
+container image pull ghcr.io/f4ah6o/shuttle-gateway:<version>
+container image load --input shuttle-gateway-oci-linux-arm64.tar
+container run \
+  -p 8787:8787 \
+  -v /path/to/shuttle-gateway:/etc/shuttle-gateway \
+  -v /path/to/shuttle-gateway-state:/var/lib/shuttle-gateway \
+  ghcr.io/f4ah6o/shuttle-gateway:<version>
+```
 
 Shuttle instance 間で event log を同期します。
 

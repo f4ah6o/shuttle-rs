@@ -19,10 +19,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 || \
+          if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
             gh release create "${GITHUB_REF_NAME}" \
               --title "${GITHUB_REF_NAME}" \
-              --notes "Shuttle Gateway LXC artifacts for ${GITHUB_REF_NAME}."
+              --notes "Shuttle Gateway release artifacts for ${GITHUB_REF_NAME}." || \
+              gh release view "${GITHUB_REF_NAME}" >/dev/null
+          fi
 
   release:
     needs: create-release

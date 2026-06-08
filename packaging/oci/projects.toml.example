@@ -1,0 +1,22 @@
+[defaults]
+project = "main"
+
+[[listeners]]
+name = "public"
+addr = "0.0.0.0:8787"
+auth = "oauth"
+public_url = "https://shuttle.example.com"
+oauth_admin_token_env = "SHUTTLE_OAUTH_ADMIN_TOKEN"
+oauth_db_path = "/var/lib/shuttle-gateway/gateway-public-oauth.db"
+
+[[listeners]]
+name = "private"
+addr = "127.0.0.1:8788"
+auth = "bearer"
+bearer_token_env = "SHUTTLE_GATEWAY_TOKEN"
+
+[projects.main]
+description = "Remote repo-local Shuttle app"
+backend = "http"
+url = "http://10.10.10.21:8787"
+token_env = "SHUTTLE_MAIN_BACKEND_TOKEN"
