@@ -28,6 +28,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(name = "version")]
+    ShowVersion,
     Init,
     Send {
         #[arg(long = "from")]
@@ -220,9 +222,22 @@ impl MemoryKindArg {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if matches!(cli.command, Command::ShowVersion) {
+        output(
+            cli.json,
+            &VersionOutput {
+                binary: "stl",
+                version: env!("CARGO_PKG_VERSION"),
+            },
+            || env!("CARGO_PKG_VERSION").to_owned(),
+        )?;
+        return Ok(());
+    }
+
     let env = RuntimeEnv::load()?;
 
     match cli.command {
+        Command::ShowVersion => unreachable!("version exits before runtime environment loading"),
         Command::Init => {
             fs::create_dir_all(&env.shuttle_dir)
                 .with_context(|| format!("failed to create {}", env.shuttle_dir.display()))?;
@@ -748,6 +763,12 @@ struct RuntimeEnv {
     agent: String,
     agent_source: String,
     session_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct VersionOutput {
+    binary: &'static str,
+    version: &'static str,
 }
 
 impl RuntimeEnv {
