@@ -13,8 +13,6 @@ include = [
     "Cargo.lock",
     "README.md",
     "README.ja.md",
-    ".github/workflows/release-gateway-lxc.yaml",
-    ".github/workflows/release-gateway-oci.yaml",
     "docs/**/*.md",
     "examples/**/*.toml",
     "packaging/lxc/**",
