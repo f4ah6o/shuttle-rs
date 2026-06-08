@@ -51,7 +51,7 @@ jobs:
           key: gateway-lxc-${{ matrix.target }}
 
       - name: Install cross
-        uses: taiki-e/install-action@5ab30948a748a1040bc5b8f22f704796307f12d9 # v2
+        uses: taiki-e/install-action@v2
         with:
           tool: cross
 
