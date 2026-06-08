@@ -1,24 +1,28 @@
-[server]
-addr = "127.0.0.1:8787"
+[defaults]
+project = "main"
 
-[auth]
+[[listeners]]
+name = "public"
+addr = "127.0.0.1:8787"
+auth = "oauth"
+public_url = "https://shuttle.example.com"
+oauth_admin_token_env = "SHUTTLE_OAUTH_ADMIN_TOKEN"
+# oauth_db_path = "/var/lib/shuttle/public-oauth.db"
+
+[[listeners]]
+name = "private"
+addr = "127.0.0.1:8788"
+auth = "bearer"
 bearer_token_env = "SHUTTLE_GATEWAY_TOKEN"
 
-# Uncomment to expose the gateway as a remote MCP server with OAuth.
-# [oauth]
-# public_url = "https://shuttle.example.com"
-# admin_token_env = "SHUTTLE_OAUTH_ADMIN_TOKEN"
-# db_path = "/path/to/gateway-oauth.db"
+[projects.main]
+description = "Remote repo-local Shuttle app"
+backend = "http"
+url = "http://10.10.10.21:8787"
+token_env = "SHUTTLE_MAIN_BACKEND_TOKEN"
 
-[defaults]
-project = "shuttle-rs"
-
-# Adjust these example paths for your local machine.
-[projects.shuttle-rs]
-repo = "/path/to/shuttle-rs"
-db = "/path/to/shuttle-rs/.shuttle/shuttle.db"
-description = "Shuttle Rust implementation"
-
-[projects.blog]
-repo = "/path/to/blog"
-description = "Blog and publishing project"
+[projects.local-test]
+description = "Compatibility mode using local stl subprocess execution"
+backend = "local"
+repo = "/path/to/local-test"
+db = "/path/to/local-test/.shuttle/shuttle.db"

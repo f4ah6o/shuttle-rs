@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::env;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -28,6 +28,8 @@ pub struct GatewayConfig {
     pub oauth: OAuthGatewayConfig,
     #[serde(default)]
     pub defaults: DefaultsConfig,
+    #[serde(default)]
+    pub listeners: Vec<ListenerConfig>,
     pub projects: BTreeMap<String, ProjectConfig>,
 }
 
@@ -87,11 +89,49 @@ pub struct DefaultsConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProjectConfig {
-    pub repo: PathBuf,
+    #[serde(default)]
+    pub backend: ProjectBackendKind,
+    #[serde(default)]
+    pub repo: Option<PathBuf>,
     #[serde(default)]
     pub db: Option<PathBuf>,
     #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub token_env: Option<String>,
+    #[serde(default)]
     pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProjectBackendKind {
+    #[default]
+    Local,
+    Http,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListenerConfig {
+    pub name: String,
+    pub addr: SocketAddr,
+    pub auth: ListenerAuthKind,
+    #[serde(default)]
+    pub public_url: String,
+    #[serde(default)]
+    pub oauth_db_path: Option<PathBuf>,
+    #[serde(default = "default_oauth_admin_token_env")]
+    pub oauth_admin_token_env: String,
+    #[serde(default = "default_gateway_token_env")]
+    pub bearer_token_env: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ListenerAuthKind {
+    OAuth,
+    Bearer,
+    None,
 }
 
 impl GatewayConfig {
@@ -123,16 +163,32 @@ impl GatewayConfig {
                     "project name cannot be empty".to_owned(),
                 ));
             }
-            if !project.repo.is_absolute() {
-                return Err(ShuttleError::Store(format!(
-                    "project {name:?} repo must be an absolute path"
-                )));
-            }
-            if let Some(db) = &project.db {
-                if !db.is_absolute() {
-                    return Err(ShuttleError::Store(format!(
-                        "project {name:?} db must be an absolute path when set"
-                    )));
+            match project.backend {
+                ProjectBackendKind::Local => {
+                    let Some(repo) = &project.repo else {
+                        return Err(ShuttleError::Store(format!(
+                            "project {name:?} repo is required for local backend"
+                        )));
+                    };
+                    if !repo.is_absolute() {
+                        return Err(ShuttleError::Store(format!(
+                            "project {name:?} repo must be an absolute path"
+                        )));
+                    }
+                    if let Some(db) = &project.db {
+                        if !db.is_absolute() {
+                            return Err(ShuttleError::Store(format!(
+                                "project {name:?} db must be an absolute path when set"
+                            )));
+                        }
+                    }
+                }
+                ProjectBackendKind::Http => {
+                    if project.url.trim().is_empty() {
+                        return Err(ShuttleError::Store(format!(
+                            "project {name:?} url is required for http backend"
+                        )));
+                    }
                 }
             }
         }
@@ -160,6 +216,48 @@ impl GatewayConfig {
                 }
             }
         }
+        let config_dir = abs_path.parent().unwrap_or_else(|| Path::new("."));
+        for listener in &mut cfg.listeners {
+            listener.public_url = normalize_public_url(&listener.public_url);
+            if listener.name.trim().is_empty() {
+                return Err(ShuttleError::Store(
+                    "listener name cannot be empty".to_owned(),
+                ));
+            }
+            match listener.auth {
+                ListenerAuthKind::OAuth => {
+                    if listener.public_url.is_empty() {
+                        return Err(ShuttleError::Store(format!(
+                            "listener {:?} public_url is required for oauth auth",
+                            listener.name
+                        )));
+                    }
+                    match &listener.oauth_db_path {
+                        Some(path) if !path.is_absolute() => {
+                            return Err(ShuttleError::Store(format!(
+                                "listener {:?} oauth_db_path must be an absolute path when set",
+                                listener.name
+                            )));
+                        }
+                        Some(_) => {}
+                        None => {
+                            listener.oauth_db_path = Some(
+                                config_dir.join(format!("gateway-{}-oauth.db", listener.name)),
+                            );
+                        }
+                    }
+                }
+                ListenerAuthKind::Bearer => {}
+                ListenerAuthKind::None => {
+                    if !is_loopback_addr(listener.addr) {
+                        return Err(ShuttleError::Store(format!(
+                            "listener {:?} auth none is only allowed on loopback addresses",
+                            listener.name
+                        )));
+                    }
+                }
+            }
+        }
         Ok(cfg)
     }
 }
@@ -170,8 +268,34 @@ pub struct GatewayRuntime {
     auth: GatewayAuth,
 }
 
+#[derive(Clone)]
+pub struct GatewayListener {
+    pub name: String,
+    pub addr: SocketAddr,
+    pub runtime: GatewayRuntime,
+}
+
 impl GatewayRuntime {
     pub fn from_config(config: GatewayConfig, stl: PathBuf, timeout: Duration) -> Result<Self> {
+        let listeners = Self::listeners_from_config(config, stl, timeout)?;
+        if listeners.len() != 1 {
+            return Err(ShuttleError::Store(
+                "GatewayRuntime::from_config requires exactly one listener".to_owned(),
+            ));
+        }
+        Ok(listeners.into_iter().next().unwrap().runtime)
+    }
+
+    pub fn listeners_from_config(
+        mut config: GatewayConfig,
+        stl: PathBuf,
+        timeout: Duration,
+    ) -> Result<Vec<GatewayListener>> {
+        let listener_configs = if config.listeners.is_empty() {
+            vec![legacy_listener_config(&config)]
+        } else {
+            std::mem::take(&mut config.listeners)
+        };
         let registry = ProjectRegistry::new(config.defaults.project, config.projects)?;
         let service = Arc::new(GatewayService::new(
             registry,
@@ -180,36 +304,20 @@ impl GatewayRuntime {
                 timeout,
             }),
         ));
-        let auth = if config.oauth.public_url.is_empty() {
-            GatewayAuth::Bearer {
-                token_env: config.auth.bearer_token_env,
-            }
-        } else {
-            let admin_token = env::var(&config.oauth.admin_token_env).map_err(|_| {
-                ShuttleError::Store(format!(
-                    "{} is required when oauth public_url is configured",
-                    config.oauth.admin_token_env
-                ))
-            })?;
-            if admin_token.is_empty() {
-                return Err(ShuttleError::Store(format!(
-                    "{} is required when oauth public_url is configured",
-                    config.oauth.admin_token_env
-                )));
-            }
-            let db_path = config
-                .oauth
-                .db_path
-                .ok_or_else(|| ShuttleError::Store("oauth db_path is required".to_owned()))?;
-            GatewayAuth::OAuth(Arc::new(OAuthRuntime {
-                config: OAuthConfig {
-                    public_url: config.oauth.public_url,
-                    admin_token: Some(admin_token),
-                },
-                store: OAuthStore::open(db_path)?,
-            }))
-        };
-        Ok(Self { service, auth })
+        listener_configs
+            .into_iter()
+            .map(|listener| {
+                let auth = auth_from_listener(&listener)?;
+                Ok(GatewayListener {
+                    name: listener.name,
+                    addr: listener.addr,
+                    runtime: GatewayRuntime {
+                        service: service.clone(),
+                        auth,
+                    },
+                })
+            })
+            .collect()
     }
 }
 
@@ -217,6 +325,7 @@ impl GatewayRuntime {
 enum GatewayAuth {
     Bearer { token_env: String },
     OAuth(Arc<OAuthRuntime>),
+    None,
 }
 
 #[derive(Clone)]
@@ -232,6 +341,33 @@ pub async fn serve(runtime: GatewayRuntime, addr: SocketAddr) -> Result<()> {
     axum::serve(listener, router(runtime))
         .await
         .map_err(|err| ShuttleError::Store(err.to_string()))
+}
+
+pub async fn serve_listeners(listeners: Vec<GatewayListener>) -> Result<()> {
+    if listeners.is_empty() {
+        return Err(ShuttleError::Store(
+            "at least one listener is required".to_owned(),
+        ));
+    }
+    let mut tasks = Vec::new();
+    for listener in listeners {
+        let addr = listener.addr;
+        let runtime = listener.runtime;
+        let name = listener.name;
+        tasks.push(tokio::spawn(async move {
+            let tcp = tokio::net::TcpListener::bind(addr)
+                .await
+                .map_err(|err| ShuttleError::Store(format!("listener {name}: {err}")))?;
+            axum::serve(tcp, router(runtime))
+                .await
+                .map_err(|err| ShuttleError::Store(format!("listener {name}: {err}")))
+        }));
+    }
+    for task in tasks {
+        task.await
+            .map_err(|err| ShuttleError::Store(err.to_string()))??;
+    }
+    Ok(())
 }
 
 pub fn router(runtime: GatewayRuntime) -> Router {
@@ -276,9 +412,15 @@ pub fn router(runtime: GatewayRuntime) -> Router {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Project {
     pub name: String,
-    pub repo: PathBuf,
+    pub backend: ProjectBackendKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub db: Option<PathBuf>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    #[serde(skip)]
+    pub token_env: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 }
@@ -296,8 +438,11 @@ impl ProjectRegistry {
             .map(|(name, cfg)| {
                 let project = Project {
                     name: name.clone(),
+                    backend: cfg.backend,
                     repo: cfg.repo,
                     db: cfg.db,
+                    url: normalize_public_url(&cfg.url),
+                    token_env: cfg.token_env,
                     description: cfg.description,
                 };
                 (name, project)
@@ -494,8 +639,15 @@ pub struct SubprocessRunner {
 #[async_trait]
 impl Runner for SubprocessRunner {
     async fn run(&self, project: &Project, args: &[&str]) -> std::result::Result<Value, String> {
+        if project.backend == ProjectBackendKind::Http {
+            return self.run_http(project, args).await;
+        }
+        let repo = project
+            .repo
+            .as_ref()
+            .ok_or_else(|| "repo is required for local backend".to_owned())?;
         let mut command = Command::new(&self.binary);
-        command.arg("--json").args(args).current_dir(&project.repo);
+        command.arg("--json").args(args).current_dir(repo);
         let output = tokio::time::timeout(self.timeout, command.output())
             .await
             .map_err(|_| format!("timed out after {}s", self.timeout.as_secs()))?
@@ -509,6 +661,99 @@ impl Runner for SubprocessRunner {
             });
         }
         serde_json::from_slice(&output.stdout).map_err(|err| err.to_string())
+    }
+}
+
+impl SubprocessRunner {
+    async fn run_http(
+        &self,
+        project: &Project,
+        args: &[&str],
+    ) -> std::result::Result<Value, String> {
+        let project = project.clone();
+        let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        let timeout = self.timeout;
+        tokio::task::spawn_blocking(move || http_backend_call(&project, &args, timeout))
+            .await
+            .map_err(|err| err.to_string())?
+    }
+}
+
+fn http_backend_call(
+    project: &Project,
+    args: &[String],
+    timeout: Duration,
+) -> std::result::Result<Value, String> {
+    let base = project.url.trim_end_matches('/');
+    let agent = ureq::AgentBuilder::new().timeout(timeout).build();
+    let request = |method: &str, path: &str| {
+        let req = match method {
+            "GET" => agent.get(&format!("{base}{path}")),
+            "PATCH" => agent.request("PATCH", &format!("{base}{path}")),
+            _ => agent.post(&format!("{base}{path}")),
+        };
+        if let Some(token_env) = &project.token_env {
+            if let Ok(token) = env::var(token_env) {
+                if !token.is_empty() {
+                    return req.set(header::AUTHORIZATION.as_str(), &format!("Bearer {token}"));
+                }
+            }
+        }
+        req
+    };
+    let response = match args {
+        [cmd] if cmd == "context" => request("GET", "/api/context").call(),
+        [cmd, query] if cmd == "recall" => {
+            request("POST", "/api/recall").send_json(json!({ "query": query }))
+        }
+        [cmd, text] if is_memory_command(cmd) => request("POST", "/api/remember")
+            .send_json(json!({ "kind": memory_kind_for_command(cmd), "text": text })),
+        [task, cmd] if task == "task" && cmd == "list" => request("GET", "/api/tasks").call(),
+        [task, cmd, content] if task == "task" && cmd == "create" => {
+            request("POST", "/api/tasks").send_json(json!({ "title": content, "body": "" }))
+        }
+        [task, cmd, id, text] if task == "task" && cmd == "update" => {
+            request("PATCH", &format!("/api/tasks/{id}")).send_json(json!({ "text": text }))
+        }
+        [task, cmd, id] if task == "task" && cmd == "done" => {
+            request("POST", &format!("/api/tasks/{id}/done")).send_json(json!({}))
+        }
+        _ => {
+            return Err(format!(
+                "unsupported http backend command: {}",
+                args.join(" ")
+            ))
+        }
+    };
+    let response = response.map_err(|err| match err {
+        ureq::Error::Status(status, response) => {
+            let body = response.into_string().unwrap_or_default();
+            if body.trim().is_empty() {
+                format!("http backend returned status {status}")
+            } else {
+                format!("http backend returned status {status}: {body}")
+            }
+        }
+        ureq::Error::Transport(err) => err.to_string(),
+    })?;
+    response.into_json::<Value>().map_err(|err| err.to_string())
+}
+
+fn is_memory_command(command: &str) -> bool {
+    matches!(
+        command,
+        "remember" | "decide" | "observe" | "pattern" | "fact" | "bug"
+    )
+}
+
+fn memory_kind_for_command(command: &str) -> &str {
+    match command {
+        "decide" => "decision",
+        "observe" => "observation",
+        "pattern" => "pattern",
+        "fact" => "fact",
+        "bug" => "bug",
+        _ => "memory",
     }
 }
 
@@ -995,6 +1240,7 @@ fn authorize(
                 ))),
             }
         }
+        GatewayAuth::None => Ok(()),
     }
 }
 
@@ -1296,6 +1542,73 @@ fn default_oauth_admin_token_env() -> String {
     "SHUTTLE_OAUTH_ADMIN_TOKEN".to_owned()
 }
 
+fn legacy_listener_config(config: &GatewayConfig) -> ListenerConfig {
+    if config.oauth.public_url.is_empty() {
+        ListenerConfig {
+            name: "default".to_owned(),
+            addr: config.server.addr,
+            auth: ListenerAuthKind::Bearer,
+            public_url: String::new(),
+            oauth_db_path: None,
+            oauth_admin_token_env: config.oauth.admin_token_env.clone(),
+            bearer_token_env: config.auth.bearer_token_env.clone(),
+        }
+    } else {
+        ListenerConfig {
+            name: "default".to_owned(),
+            addr: config.server.addr,
+            auth: ListenerAuthKind::OAuth,
+            public_url: config.oauth.public_url.clone(),
+            oauth_db_path: config.oauth.db_path.clone(),
+            oauth_admin_token_env: config.oauth.admin_token_env.clone(),
+            bearer_token_env: config.auth.bearer_token_env.clone(),
+        }
+    }
+}
+
+fn auth_from_listener(listener: &ListenerConfig) -> Result<GatewayAuth> {
+    match listener.auth {
+        ListenerAuthKind::Bearer => Ok(GatewayAuth::Bearer {
+            token_env: listener.bearer_token_env.clone(),
+        }),
+        ListenerAuthKind::None => Ok(GatewayAuth::None),
+        ListenerAuthKind::OAuth => {
+            let admin_token = env::var(&listener.oauth_admin_token_env).map_err(|_| {
+                ShuttleError::Store(format!(
+                    "{} is required when oauth listener {:?} is configured",
+                    listener.oauth_admin_token_env, listener.name
+                ))
+            })?;
+            if admin_token.is_empty() {
+                return Err(ShuttleError::Store(format!(
+                    "{} is required when oauth listener {:?} is configured",
+                    listener.oauth_admin_token_env, listener.name
+                )));
+            }
+            let db_path = listener.oauth_db_path.clone().ok_or_else(|| {
+                ShuttleError::Store(format!(
+                    "oauth_db_path is required for listener {:?}",
+                    listener.name
+                ))
+            })?;
+            Ok(GatewayAuth::OAuth(Arc::new(OAuthRuntime {
+                config: OAuthConfig {
+                    public_url: listener.public_url.clone(),
+                    admin_token: Some(admin_token),
+                },
+                store: OAuthStore::open(db_path)?,
+            })))
+        }
+    }
+}
+
+fn is_loopback_addr(addr: SocketAddr) -> bool {
+    match addr.ip() {
+        IpAddr::V4(ip) => ip.is_loopback(),
+        IpAddr::V6(ip) => ip.is_loopback(),
+    }
+}
+
 fn normalize_public_url(url: &str) -> String {
     url.trim().trim_end_matches('/').to_owned()
 }
@@ -1335,8 +1648,11 @@ mod tests {
             BTreeMap::from([(
                 "demo".to_owned(),
                 ProjectConfig {
-                    repo: PathBuf::from("/tmp/demo"),
+                    backend: ProjectBackendKind::Local,
+                    repo: Some(PathBuf::from("/tmp/demo")),
                     db: None,
+                    url: String::new(),
+                    token_env: None,
                     description: None,
                 },
             )]),
@@ -1373,6 +1689,51 @@ mod tests {
             cfg.oauth.db_path.unwrap().file_name().unwrap(),
             "gateway-oauth.db"
         );
+    }
+
+    #[test]
+    fn config_accepts_http_projects_without_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projects.toml");
+        std::fs::write(
+            &path,
+            "[projects.demo]\nbackend = \"http\"\nurl = \"http://127.0.0.1:8787\"\ntoken_env = \"DEMO_TOKEN\"\n",
+        )
+        .unwrap();
+        let cfg = GatewayConfig::load(&path).unwrap();
+        let project = cfg.projects.get("demo").unwrap();
+
+        assert_eq!(project.backend, ProjectBackendKind::Http);
+        assert!(project.repo.is_none());
+        assert_eq!(project.token_env.as_deref(), Some("DEMO_TOKEN"));
+    }
+
+    #[test]
+    fn config_rejects_http_projects_without_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projects.toml");
+        std::fs::write(&path, "[projects.demo]\nbackend = \"http\"\n").unwrap();
+
+        assert!(GatewayConfig::load(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("url is required"));
+    }
+
+    #[test]
+    fn config_rejects_none_listener_on_non_loopback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projects.toml");
+        std::fs::write(
+            &path,
+            "[[listeners]]\nname = \"open\"\naddr = \"0.0.0.0:8787\"\nauth = \"none\"\n\n[projects.demo]\nrepo = \"/tmp/demo\"\n",
+        )
+        .unwrap();
+
+        assert!(GatewayConfig::load(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("only allowed on loopback"));
     }
 
     #[tokio::test]
@@ -1633,8 +1994,11 @@ mod tests {
             BTreeMap::from([(
                 "demo".to_owned(),
                 ProjectConfig {
-                    repo: PathBuf::from("/tmp/demo"),
+                    backend: ProjectBackendKind::Local,
+                    repo: Some(PathBuf::from("/tmp/demo")),
                     db: None,
+                    url: String::new(),
+                    token_env: None,
                     description: None,
                 },
             )]),

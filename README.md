@@ -175,66 +175,100 @@ log.
 ## Multi-project Gateway
 
 For web chat clients that should use one MCP server across several local
-repositories, run `shuttle-gateway`. The gateway keeps Shuttle storage
-project-local by routing each request to a configured repository and running the
-shared `stl --json ...` executable as a subprocess in that repository.
+repositories, run `shuttle-gateway`. The gateway is the MCP, auth, and project
+routing boundary. Each project can execute locally with `stl --json ...`, or it
+can point at a repo-local `stl app serve` process over HTTP.
 
-Create a project config from `examples/projects.example.toml`. Project `repo`
-paths must be absolute, and an optional project `db` path must also be absolute.
-If `db` is omitted, the project uses `.shuttle/shuttle.db` under its repository.
+The remote deployment model is:
+
+```text
+gateway host / LXC
+└─ shuttle-gateway
+
+project environment
+└─ stl app serve
+   └─ repo + .shuttle/shuttle.db
+```
+
+Create a project config from `examples/projects.example.toml`. Use
+`backend = "http"` with `url` for remote project environments, or
+`backend = "local"` with an absolute `repo` path for compatibility mode. If
+`backend` is omitted and `repo` is present, the project is treated as local.
 
 Run the gateway with the config:
 
 ```bash
-shuttle-gateway serve --config projects.toml --addr 127.0.0.1:8787
+shuttle-gateway serve --config projects.toml
 ```
 
-When `--addr` is omitted, the gateway uses `[server].addr` from the config.
-Use `--stl /path/to/stl` to choose the CLI binary that gateway tools execute,
-and `--timeout <seconds>` to set the subprocess timeout.
+Use `--stl /path/to/stl` to choose the CLI binary for local backends, and
+`--timeout <seconds>` to set local subprocess and HTTP backend timeouts.
+`--addr` can override a single-listener config, but a config with multiple
+`[[listeners]]` owns its listener addresses.
 
-Register one MCP endpoint:
+Listeners separate ingress/auth policy from project backend type. A public Web
+Chat listener should use OAuth, while private LAN/Tailscale/local listeners can
+use bearer auth or loopback-only unauthenticated access:
+
+```toml
+[[listeners]]
+name = "public"
+addr = "127.0.0.1:8787"
+auth = "oauth"
+public_url = "https://shuttle.example.com"
+oauth_admin_token_env = "SHUTTLE_OAUTH_ADMIN_TOKEN"
+
+[[listeners]]
+name = "private"
+addr = "127.0.0.1:8788"
+auth = "bearer"
+bearer_token_env = "SHUTTLE_GATEWAY_TOKEN"
+```
+
+The gateway requires an explicit `project` argument for writes such as
+`shuttle_remember` and `shuttle_task_create`. Reads may use the configured
+default project.
+
+For HTTP backends, start a repo-local app server in the project environment:
+
+```bash
+SHUTTLE_MCP_BEARER_TOKEN=<backend-token> \
+stl app serve --addr 127.0.0.1:8787
+```
+
+Then configure the gateway project with the URL and backend token environment
+variable:
+
+```toml
+[projects.main]
+backend = "http"
+url = "http://10.10.10.21:8787"
+token_env = "SHUTTLE_MAIN_BACKEND_TOKEN"
+```
+
+Register the public listener URL with remote MCP clients such as ChatGPT or
+Claude web connectors:
 
 ```json
 {
   "mcpServers": {
     "shuttle-gateway": {
-      "url": "http://127.0.0.1:8787/mcp"
+      "url": "https://shuttle.example.com/mcp"
     }
   }
 }
 ```
 
-The gateway requires an explicit `project` argument for writes such as
-`shuttle_remember` and `shuttle_task_create`. Reads may use the configured
-default project. Set `SHUTTLE_GATEWAY_TOKEN` to require
-`Authorization: Bearer <token>` at the gateway boundary.
-
-Gateway tools run `stl --json ...` inside the resolved project repository, so
-identity, inbox ownership, and `.shuttle/shuttle.db` remain project-local. Pass
-an explicit `project` argument for writes when using web chat clients.
-
-To expose the gateway to remote MCP clients such as ChatGPT or Claude web
-connectors, configure OAuth with the public URL that forwards to the gateway:
-
-```toml
-[oauth]
-public_url = "https://shuttle.example.com"
-admin_token_env = "SHUTTLE_OAUTH_ADMIN_TOKEN"
-```
-
-Then run the gateway with the owner-approval token injected at runtime:
+Run OAuth listeners with the owner-approval token injected at runtime:
 
 ```bash
 SHUTTLE_OAUTH_ADMIN_TOKEN=<admin-token> \
-shuttle-gateway serve --config projects.toml --addr 127.0.0.1:8787
+shuttle-gateway serve --config projects.toml
 ```
 
-Register `https://shuttle.example.com/mcp` with the remote MCP client. OAuth
-client registrations, authorization codes, and access tokens are stored in a
-gateway-local SQLite database, defaulting to `gateway-oauth.db` next to the
-config file unless `[oauth].db_path` is set to an absolute path. Keep the admin
-token in a secret manager or runtime-injected environment variable.
+OAuth client registrations, authorization codes, and access tokens are stored in
+gateway-local SQLite databases. Backend tokens and OAuth admin tokens should be
+provided by a secret manager or runtime-injected environment variables.
 
 Synchronize event logs between Shuttle instances:
 
