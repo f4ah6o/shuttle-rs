@@ -274,6 +274,9 @@ OAuth client registration、authorization code、access token は gateway-local 
 に保存されます。backend token と OAuth admin token は secret manager または
 runtime-injected environment variable で渡してください。
 
+standard な `v*` release workflow は、同じ tag から Rust crate と gateway artifact
+を公開します。gateway 専用の release tag は不要です。
+
 LXC-oriented な gateway host 向けには、`v*` release tag で
 `shuttle-gateway-lxc-<target>.tar.gz` archive を公開します。archive には
 `bin/shuttle-gateway`、`bin/stl`、LXC config example、systemd unit、`install.sh`

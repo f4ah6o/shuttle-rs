@@ -278,6 +278,10 @@ OAuth client registrations, authorization codes, and access tokens are stored in
 gateway-local SQLite databases. Backend tokens and OAuth admin tokens should be
 provided by a secret manager or runtime-injected environment variables.
 
+The standard `v*` release workflow publishes the Rust crate and gateway
+artifacts from the same tag; a separate gateway-specific release tag is not
+required.
+
 For LXC-oriented gateway hosts, `v*` release tags publish archives named
 `shuttle-gateway-lxc-<target>.tar.gz`. Each archive contains
 `bin/shuttle-gateway`, `bin/stl`, LXC config examples, a systemd unit, and
