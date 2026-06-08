@@ -31,6 +31,8 @@ struct Tool {
     description: &'static str,
     #[serde(rename = "inputSchema")]
     input_schema: Value,
+    #[serde(rename = "outputSchema")]
+    output_schema: Value,
 }
 
 pub async fn handle_request(runtime: &McpRuntime, request: Request) -> Value {
@@ -50,13 +52,23 @@ pub async fn handle_request(runtime: &McpRuntime, request: Request) -> Value {
         ),
         "notifications/initialized" => json!({"jsonrpc": "2.0"}),
         "tools/list" => ok(id, json!({ "tools": tools() })),
-        "tools/call" => match call_tool(runtime, request.params).await {
-            Ok(value) => ok(
-                id,
-                json!({ "content": [{ "type": "text", "text": value.to_string() }] }),
-            ),
-            Err(err) => error(id, -32603, &err.to_string()),
-        },
+        "tools/call" => {
+            let tool_name = request
+                .params
+                .get("name")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            match call_tool(runtime, request.params).await {
+                Ok(value) => ok(
+                    id,
+                    json!({
+                        "content": [{ "type": "text", "text": value.to_string() }],
+                        "structuredContent": structured_content(tool_name.as_deref(), &value),
+                    }),
+                ),
+                Err(err) => error(id, -32603, &err.to_string()),
+            }
+        }
         _ => error(id, -32601, "method not found"),
     }
 }
@@ -318,46 +330,354 @@ fn string_arg(args: &Value, name: &str) -> Result<String> {
 
 fn tools() -> Vec<Tool> {
     vec![
-        tool("remember", "Store a local Shuttle memory"),
-        tool("recall", "Search local Shuttle memories"),
-        tool("inbox", "Read an agent inbox"),
-        tool("send", "Send a message to an agent"),
-        tool("history", "Read message history"),
-        tool("context", "Read assembled repo context"),
-        tool("tasks", "List Shuttle task state"),
-        tool("shuttle_memory_search", "Search local Shuttle memories"),
-        tool("shuttle_memory_store", "Store a local Shuttle memory"),
-        tool("shuttle_message_inbox", "Read an agent inbox"),
-        tool("shuttle_message_history", "Read message history"),
-        tool("shuttle_message_send", "Send a message to an agent"),
-        tool("shuttle_task_list", "List Shuttle task state"),
-        tool("shuttle_task_create", "Create a Shuttle task"),
-        tool("shuttle_task_claim", "Claim a Shuttle task"),
-        tool("shuttle_task_update", "Update a Shuttle task"),
-        tool("shuttle_task_done", "Complete a Shuttle task"),
-        tool("shuttle_handoff_request", "Request a Shuttle handoff"),
-        tool("shuttle_handoff_list", "List Shuttle handoff state"),
-        tool("shuttle_handoff_accept", "Accept a Shuttle handoff"),
-        tool("shuttle_handoff_done", "Complete a Shuttle handoff"),
-        tool("shuttle_repo_context", "Read assembled repo context"),
-        tool("shuttle_repo_status", "Read Git repo status"),
+        tool(
+            "remember",
+            "Store a local Shuttle memory",
+            event_output_schema(),
+        ),
+        tool(
+            "recall",
+            "Search local Shuttle memories",
+            events_output_schema(),
+        ),
+        tool("inbox", "Read an agent inbox", events_output_schema()),
+        tool("send", "Send a message to an agent", event_output_schema()),
+        tool("history", "Read message history", events_output_schema()),
+        tool(
+            "context",
+            "Read assembled repo context",
+            context_output_schema(),
+        ),
+        tool("tasks", "List Shuttle task state", tasks_output_schema()),
+        tool(
+            "shuttle_memory_search",
+            "Search local Shuttle memories",
+            events_output_schema(),
+        ),
+        tool(
+            "shuttle_memory_store",
+            "Store a local Shuttle memory",
+            event_output_schema(),
+        ),
+        tool(
+            "shuttle_message_inbox",
+            "Read an agent inbox",
+            events_output_schema(),
+        ),
+        tool(
+            "shuttle_message_history",
+            "Read message history",
+            events_output_schema(),
+        ),
+        tool(
+            "shuttle_message_send",
+            "Send a message to an agent",
+            event_output_schema(),
+        ),
+        tool(
+            "shuttle_task_list",
+            "List Shuttle task state",
+            tasks_output_schema(),
+        ),
+        tool(
+            "shuttle_task_create",
+            "Create a Shuttle task",
+            event_output_schema(),
+        ),
+        tool(
+            "shuttle_task_claim",
+            "Claim a Shuttle task",
+            event_output_schema(),
+        ),
+        tool(
+            "shuttle_task_update",
+            "Update a Shuttle task",
+            event_output_schema(),
+        ),
+        tool(
+            "shuttle_task_done",
+            "Complete a Shuttle task",
+            event_output_schema(),
+        ),
+        tool(
+            "shuttle_handoff_request",
+            "Request a Shuttle handoff",
+            event_output_schema(),
+        ),
+        tool(
+            "shuttle_handoff_list",
+            "List Shuttle handoff state",
+            handoffs_output_schema(),
+        ),
+        tool(
+            "shuttle_handoff_accept",
+            "Accept a Shuttle handoff",
+            event_output_schema(),
+        ),
+        tool(
+            "shuttle_handoff_done",
+            "Complete a Shuttle handoff",
+            event_output_schema(),
+        ),
+        tool(
+            "shuttle_repo_context",
+            "Read assembled repo context",
+            context_output_schema(),
+        ),
+        tool(
+            "shuttle_repo_status",
+            "Read Git repo status",
+            repo_status_output_schema(),
+        ),
         tool(
             "shuttle_repo_changed_files",
             "List changed files in the current Git repo",
+            changed_files_output_schema(),
         ),
         tool(
             "shuttle_repo_diff",
             "Read the current Git diff, optionally for one path",
+            diff_output_schema(),
         ),
     ]
 }
 
-fn tool(name: &'static str, description: &'static str) -> Tool {
+fn tool(name: &'static str, description: &'static str, output_schema: Value) -> Tool {
     Tool {
         name,
         description,
         input_schema: json!({ "type": "object", "additionalProperties": true }),
+        output_schema,
     }
+}
+
+fn structured_content(tool_name: Option<&str>, value: &Value) -> Value {
+    match tool_name {
+        Some(
+            "remember"
+            | "send"
+            | "shuttle_memory_store"
+            | "shuttle_message_send"
+            | "shuttle_task_create"
+            | "shuttle_task_claim"
+            | "shuttle_task_update"
+            | "shuttle_task_done"
+            | "shuttle_handoff_request"
+            | "shuttle_handoff_accept"
+            | "shuttle_handoff_done",
+        ) => json!({ "event": value }),
+        Some(
+            "recall"
+            | "inbox"
+            | "history"
+            | "shuttle_memory_search"
+            | "shuttle_message_inbox"
+            | "shuttle_message_history",
+        ) => {
+            json!({ "events": value })
+        }
+        Some("tasks" | "shuttle_task_list") => json!({ "tasks": value }),
+        Some("shuttle_handoff_list") => json!({ "handoffs": value }),
+        _ => value.clone(),
+    }
+}
+
+fn event_output_schema() -> Value {
+    object_schema(json!({ "event": event_schema() }), vec!["event"])
+}
+
+fn events_output_schema() -> Value {
+    object_schema(
+        json!({ "events": array_schema(event_schema()) }),
+        vec!["events"],
+    )
+}
+
+fn tasks_output_schema() -> Value {
+    object_schema(
+        json!({ "tasks": array_schema(task_schema()) }),
+        vec!["tasks"],
+    )
+}
+
+fn handoffs_output_schema() -> Value {
+    object_schema(
+        json!({ "handoffs": array_schema(handoff_schema()) }),
+        vec!["handoffs"],
+    )
+}
+
+fn context_output_schema() -> Value {
+    object_schema(
+        json!({
+            "repo": string_schema("Repository path"),
+            "branch": string_schema("Git branch"),
+            "commit": string_schema("Git commit"),
+            "git_remote": nullable_string_schema("Git remote URL"),
+            "dirty": boolean_schema("Whether the repository has changes"),
+            "dirty_files": array_schema(string_schema("Changed file path")),
+            "open_tasks": array_schema(task_schema()),
+            "claimed_tasks": array_schema(task_schema()),
+            "recent_decisions": array_schema(event_schema()),
+            "related_memories": array_schema(event_schema()),
+            "recent_messages": array_schema(event_schema()),
+            "pending_handoffs": array_schema(handoff_schema()),
+            "recent_completed_handoffs": array_schema(handoff_schema()),
+            "inbox": array_schema(event_schema()),
+        }),
+        vec![
+            "repo",
+            "branch",
+            "commit",
+            "dirty",
+            "dirty_files",
+            "open_tasks",
+            "claimed_tasks",
+            "recent_decisions",
+            "related_memories",
+            "recent_messages",
+            "pending_handoffs",
+            "recent_completed_handoffs",
+            "inbox",
+        ],
+    )
+}
+
+fn repo_status_output_schema() -> Value {
+    object_schema(
+        json!({
+            "repo_path": string_schema("Repository path"),
+            "git_remote": nullable_string_schema("Git remote URL"),
+            "branch": string_schema("Git branch"),
+            "commit": string_schema("Git commit"),
+            "dirty": boolean_schema("Whether the repository has changes"),
+            "dirty_files": array_schema(string_schema("Changed file path")),
+        }),
+        vec!["repo_path", "branch", "commit", "dirty", "dirty_files"],
+    )
+}
+
+fn changed_files_output_schema() -> Value {
+    object_schema(
+        json!({ "files": array_schema(string_schema("Changed file path")) }),
+        vec!["files"],
+    )
+}
+
+fn diff_output_schema() -> Value {
+    object_schema(
+        json!({
+            "diff": string_schema("Git diff text"),
+            "truncated": boolean_schema("Whether the diff was truncated"),
+        }),
+        vec!["diff", "truncated"],
+    )
+}
+
+fn event_schema() -> Value {
+    object_schema(
+        json!({
+            "id": string_schema("Event UUID"),
+            "event_type": string_schema("Event type"),
+            "workspace_id": string_schema("Workspace identifier"),
+            "agent": string_schema("Agent identifier"),
+            "session_id": string_schema("Session identifier"),
+            "content": string_schema("Event content"),
+            "tags": array_schema(string_schema("Event tag")),
+            "metadata_json": json!({ "type": "object", "additionalProperties": true }),
+            "created_at": string_schema("RFC3339 creation timestamp"),
+        }),
+        vec![
+            "id",
+            "event_type",
+            "workspace_id",
+            "agent",
+            "session_id",
+            "content",
+            "tags",
+            "metadata_json",
+            "created_at",
+        ],
+    )
+}
+
+fn task_schema() -> Value {
+    object_schema(
+        json!({
+            "id": string_schema("Task UUID"),
+            "status": enum_schema("Task status", &["open", "claimed", "completed"]),
+            "content": string_schema("Task content"),
+            "created_by": string_schema("Creating agent"),
+            "claimed_by": nullable_string_schema("Claiming agent"),
+            "created_at": string_schema("RFC3339 creation timestamp"),
+            "updated_at": string_schema("RFC3339 update timestamp"),
+            "source_event_ids": array_schema(string_schema("Source event UUID")),
+        }),
+        vec![
+            "id",
+            "status",
+            "content",
+            "created_by",
+            "created_at",
+            "updated_at",
+            "source_event_ids",
+        ],
+    )
+}
+
+fn handoff_schema() -> Value {
+    object_schema(
+        json!({
+            "id": string_schema("Handoff UUID"),
+            "status": enum_schema("Handoff status", &["pending", "accepted", "completed"]),
+            "content": string_schema("Handoff content"),
+            "from_agent": string_schema("Requesting agent"),
+            "to_agent": string_schema("Receiving agent"),
+            "accepted_by": nullable_string_schema("Accepting agent"),
+            "created_at": string_schema("RFC3339 creation timestamp"),
+            "updated_at": string_schema("RFC3339 update timestamp"),
+            "source_event_ids": array_schema(string_schema("Source event UUID")),
+        }),
+        vec![
+            "id",
+            "status",
+            "content",
+            "from_agent",
+            "to_agent",
+            "created_at",
+            "updated_at",
+            "source_event_ids",
+        ],
+    )
+}
+
+fn object_schema(properties: Value, required: Vec<&str>) -> Value {
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": true,
+    })
+}
+
+fn array_schema(items: Value) -> Value {
+    json!({ "type": "array", "items": items })
+}
+
+fn string_schema(description: &str) -> Value {
+    json!({ "type": "string", "description": description })
+}
+
+fn nullable_string_schema(description: &str) -> Value {
+    json!({ "type": ["string", "null"], "description": description })
+}
+
+fn boolean_schema(description: &str) -> Value {
+    json!({ "type": "boolean", "description": description })
+}
+
+fn enum_schema(description: &str, values: &[&str]) -> Value {
+    json!({ "type": "string", "description": description, "enum": values })
 }
 
 fn ok(id: Value, result: Value) -> Value {
@@ -439,10 +759,8 @@ mod tests {
 
     #[test]
     fn tools_list_includes_phase_two_tools() {
-        let names = tools()
-            .into_iter()
-            .map(|tool| tool.name)
-            .collect::<Vec<_>>();
+        let tools = tools();
+        let names = tools.iter().map(|tool| tool.name).collect::<Vec<_>>();
 
         assert!(names.contains(&"shuttle_message_history"));
         assert!(names.contains(&"shuttle_task_update"));
@@ -451,6 +769,9 @@ mod tests {
         assert!(names.contains(&"shuttle_handoff_list"));
         assert!(names.contains(&"shuttle_handoff_accept"));
         assert!(names.contains(&"shuttle_handoff_done"));
+        assert!(tools
+            .iter()
+            .all(|tool| tool.output_schema["type"] == "object"));
     }
 
     #[test]
@@ -478,6 +799,10 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
+        assert_eq!(
+            task_response["result"]["structuredContent"]["event"]["id"],
+            task_id
+        );
         futures_executor::block_on(handle_request(
             &runtime,
             tool_request("shuttle_task_claim", json!({ "id": task_id })),
@@ -500,6 +825,10 @@ mod tests {
         let task_json = response_text_json(&task_list);
         assert_eq!(task_json[0]["status"], "completed");
         assert_eq!(task_json[0]["content"], "updated task tools");
+        assert_eq!(
+            task_list["result"]["structuredContent"]["tasks"][0]["status"],
+            "completed"
+        );
 
         futures_executor::block_on(handle_request(
             &runtime,

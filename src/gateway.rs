@@ -1015,7 +1015,10 @@ async fn handle_mcp(service: &GatewayService, request: RpcRequest) -> Value {
         "tools/call" => match mcp_call_tool(service, request.params).await {
             Ok(value) => rpc_ok(
                 id,
-                json!({ "content": [{ "type": "text", "text": value.to_string() }] }),
+                json!({
+                    "content": [{ "type": "text", "text": value.to_string() }],
+                    "structuredContent": value,
+                }),
             ),
             Err(err) => rpc_error(id, -32603, &err.to_string()),
         },
@@ -1114,65 +1117,81 @@ fn gateway_tools() -> Vec<Value> {
             "List configured Shuttle projects",
             json!({}),
             vec![],
+            projects_output_schema(),
         ),
         tool(
             "shuttle_current_project",
             "Read the current or default project",
             json!({}),
             vec![],
+            project_output_schema(),
         ),
         tool(
             "shuttle_use_project",
             "Set the current project",
             json!({"project": string_schema("Configured project name")}),
             vec!["project"],
+            project_output_schema(),
         ),
         tool(
             "shuttle_context",
             "Read Shuttle context for a project",
             json!({"project": string_schema("Configured project name; optional with default project")}),
             vec![],
+            service_response_output_schema(),
         ),
         tool(
             "shuttle_recall",
             "Search Shuttle memories in a project",
             json!({"project": string_schema("Configured project name; optional with default project"), "query": string_schema("Recall query")}),
             vec!["query"],
+            service_response_output_schema(),
         ),
         tool(
             "shuttle_remember",
             "Store a Shuttle memory in a project",
             json!({"project": string_schema("Configured project name"), "kind": enum_schema("Memory kind", &["memory", "decision", "observation", "pattern", "fact", "bug"]), "text": string_schema("Memory text")}),
             vec!["project", "text"],
+            service_response_output_schema(),
         ),
         tool(
             "shuttle_task_list",
             "List Shuttle tasks in a project",
             json!({"project": string_schema("Configured project name; optional with default project")}),
             vec![],
+            service_response_output_schema(),
         ),
         tool(
             "shuttle_task_create",
             "Create a Shuttle task in a project",
             json!({"project": string_schema("Configured project name"), "title": string_schema("Task title"), "body": string_schema("Optional task body")}),
             vec!["project", "title"],
+            service_response_output_schema(),
         ),
         tool(
             "shuttle_task_update",
             "Update a Shuttle task in a project",
             json!({"project": string_schema("Configured project name"), "task_id": string_schema("Task UUID"), "text": string_schema("Update text")}),
             vec!["project", "task_id", "text"],
+            service_response_output_schema(),
         ),
         tool(
             "shuttle_task_done",
             "Complete a Shuttle task in a project",
             json!({"project": string_schema("Configured project name"), "task_id": string_schema("Task UUID")}),
             vec!["project", "task_id"],
+            service_response_output_schema(),
         ),
     ]
 }
 
-fn tool(name: &str, description: &str, properties: Value, required: Vec<&str>) -> Value {
+fn tool(
+    name: &str,
+    description: &str,
+    properties: Value,
+    required: Vec<&str>,
+    output_schema: Value,
+) -> Value {
     json!({
         "name": name,
         "description": description,
@@ -1181,12 +1200,72 @@ fn tool(name: &str, description: &str, properties: Value, required: Vec<&str>) -
             "properties": properties,
             "required": required,
             "additionalProperties": false,
-        }
+        },
+        "outputSchema": output_schema,
+    })
+}
+
+fn projects_output_schema() -> Value {
+    object_schema(
+        json!({ "projects": { "type": "array", "items": project_schema() } }),
+        vec!["projects"],
+    )
+}
+
+fn project_output_schema() -> Value {
+    project_schema()
+}
+
+fn service_response_output_schema() -> Value {
+    object_schema(
+        json!({
+            "project": string_schema("Configured project name"),
+            "result": json_schema("Tool result from the selected project"),
+            "stored": {
+                "type": "boolean",
+                "description": "Whether the operation stored data",
+            },
+        }),
+        vec!["project", "result"],
+    )
+}
+
+fn project_schema() -> Value {
+    object_schema(
+        json!({
+            "name": string_schema("Configured project name"),
+            "backend": enum_schema("Project backend", &["local", "http"]),
+            "repo": nullable_string_schema("Local repository path"),
+            "db": nullable_string_schema("Local Shuttle database path"),
+            "url": string_schema("HTTP project base URL"),
+            "description": nullable_string_schema("Project description"),
+        }),
+        vec!["name", "backend", "url"],
+    )
+}
+
+fn object_schema(properties: Value, required: Vec<&str>) -> Value {
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": true,
     })
 }
 
 fn string_schema(description: &str) -> Value {
     json!({ "type": "string", "description": description })
+}
+
+fn nullable_string_schema(description: &str) -> Value {
+    json!({ "type": ["string", "null"], "description": description })
+}
+
+fn json_schema(description: &str) -> Value {
+    json!({
+        "type": ["object", "array", "string", "number", "integer", "boolean", "null"],
+        "description": description,
+    })
 }
 
 fn enum_schema(description: &str, values: &[&str]) -> Value {
@@ -1786,6 +1865,40 @@ mod tests {
         assert!(tools
             .iter()
             .all(|tool| tool["inputSchema"]["additionalProperties"] == false));
+        assert!(tools
+            .iter()
+            .all(|tool| tool["outputSchema"]["type"] == "object"));
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_call_returns_structured_content() {
+        let runtime = test_runtime(registry(), Arc::new(FakeRunner::default()));
+        env::remove_var("TEST_EMPTY_GATEWAY_TOKEN");
+        let response = router(runtime)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/mcp")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"shuttle_task_create","arguments":{"project":"demo","title":"ship it"}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            value["result"]["structuredContent"],
+            json!({"project": "demo", "result": {"ok": true}, "stored": true})
+        );
+        assert_eq!(
+            value["result"]["content"][0]["text"],
+            r#"{"project":"demo","result":{"ok":true},"stored":true}"#
+        );
     }
 
     #[tokio::test]
