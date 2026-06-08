@@ -201,6 +201,14 @@ Run the gateway with the config:
 shuttle-gateway serve --config projects.toml
 ```
 
+Check installed binary versions:
+
+```bash
+stl version
+shuttle-gateway version
+stl --json version
+```
+
 Use `--stl /path/to/stl` to choose the CLI binary for local backends, and
 `--timeout <seconds>` to set local subprocess and HTTP backend timeouts.
 `--addr` can override a single-listener config, but a config with multiple
@@ -277,6 +285,37 @@ For LXC-oriented gateway hosts, `gateway-v*` release tags publish archives named
 `/var/lib/shuttle-gateway` by default. Edit `projects.toml` and
 `shuttle-gateway.env` after installation; do not store real token values in the
 example files.
+
+The same `gateway-v*` tags also publish OCI images and per-architecture OCI
+layout archives. Pull the registry image from GHCR:
+
+```bash
+docker pull ghcr.io/f4ah6o/shuttle-gateway:<version>
+```
+
+Run it with mounted config and state directories:
+
+```bash
+docker run --rm \
+  -p 8787:8787 \
+  -v /path/to/shuttle-gateway:/etc/shuttle-gateway \
+  -v /path/to/shuttle-gateway-state:/var/lib/shuttle-gateway \
+  -e SHUTTLE_OAUTH_ADMIN_TOKEN=<admin-token> \
+  -e SHUTTLE_MAIN_BACKEND_TOKEN=<backend-token> \
+  ghcr.io/f4ah6o/shuttle-gateway:<version>
+```
+
+Apple's `container` tool can pull the same OCI image or load a release archive:
+
+```bash
+container image pull ghcr.io/f4ah6o/shuttle-gateway:<version>
+container image load --input shuttle-gateway-oci-linux-arm64.tar
+container run \
+  -p 8787:8787 \
+  -v /path/to/shuttle-gateway:/etc/shuttle-gateway \
+  -v /path/to/shuttle-gateway-state:/var/lib/shuttle-gateway \
+  ghcr.io/f4ah6o/shuttle-gateway:<version>
+```
 
 Synchronize event logs between Shuttle instances:
 

@@ -14,6 +14,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(name = "version")]
+    ShowVersion,
     Serve {
         #[arg(long)]
         config: PathBuf,
@@ -29,6 +31,9 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Command::ShowVersion => {
+            println!("{}", env!("CARGO_PKG_VERSION"));
+        }
         Command::Serve {
             config,
             addr,
