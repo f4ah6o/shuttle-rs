@@ -1,8 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -14,12 +15,15 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::process::Command;
+use toml_edit::{value, DocumentMut, Item, Table};
 
 use crate::core::{Result, ShuttleError};
 use crate::oauth::{self, OAuthConfig, OAuthStore};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayConfig {
+    #[serde(skip)]
+    config_path: Option<PathBuf>,
     #[serde(default)]
     pub server: ServerConfig,
     #[serde(default)]
@@ -150,6 +154,7 @@ impl GatewayConfig {
             std::fs::read_to_string(path).map_err(|err| ShuttleError::Store(err.to_string()))?;
         let mut cfg: GatewayConfig =
             toml::from_str(&raw).map_err(|err| ShuttleError::Serialization(err.to_string()))?;
+        cfg.config_path = Some(abs_path.clone());
 
         cfg.oauth.public_url = normalize_public_url(&cfg.oauth.public_url);
         if cfg.projects.is_empty() {
@@ -158,39 +163,7 @@ impl GatewayConfig {
             ));
         }
         for (name, project) in &cfg.projects {
-            if name.is_empty() {
-                return Err(ShuttleError::Store(
-                    "project name cannot be empty".to_owned(),
-                ));
-            }
-            match project.backend {
-                ProjectBackendKind::Local => {
-                    let Some(repo) = &project.repo else {
-                        return Err(ShuttleError::Store(format!(
-                            "project {name:?} repo is required for local backend"
-                        )));
-                    };
-                    if !repo.is_absolute() {
-                        return Err(ShuttleError::Store(format!(
-                            "project {name:?} repo must be an absolute path"
-                        )));
-                    }
-                    if let Some(db) = &project.db {
-                        if !db.is_absolute() {
-                            return Err(ShuttleError::Store(format!(
-                                "project {name:?} db must be an absolute path when set"
-                            )));
-                        }
-                    }
-                }
-                ProjectBackendKind::Http => {
-                    if project.url.trim().is_empty() {
-                        return Err(ShuttleError::Store(format!(
-                            "project {name:?} url is required for http backend"
-                        )));
-                    }
-                }
-            }
+            validate_project_config(name, project)?;
         }
         if !cfg.defaults.project.is_empty() && !cfg.projects.contains_key(&cfg.defaults.project) {
             return Err(ShuttleError::Store(format!(
@@ -296,13 +269,15 @@ impl GatewayRuntime {
         } else {
             std::mem::take(&mut config.listeners)
         };
+        let config_path = config.config_path.clone();
         let registry = ProjectRegistry::new(config.defaults.project, config.projects)?;
-        let service = Arc::new(GatewayService::new(
+        let service = Arc::new(GatewayService::new_with_config_path(
             registry,
             Arc::new(SubprocessRunner {
                 binary: stl,
                 timeout,
             }),
+            config_path,
         ));
         listener_configs
             .into_iter()
@@ -372,7 +347,7 @@ pub async fn serve_listeners(listeners: Vec<GatewayListener>) -> Result<()> {
 
 pub fn router(runtime: GatewayRuntime) -> Router {
     Router::new()
-        .route("/api/projects", get(api_projects))
+        .route("/api/projects", get(api_projects).post(api_add_project))
         .route("/api/projects/current", get(api_current_project))
         .route("/api/projects/use", post(api_use_project))
         .route("/api/recall", post(api_recall))
@@ -433,18 +408,13 @@ pub struct ProjectRegistry {
 
 impl ProjectRegistry {
     pub fn new(default_project: String, configs: BTreeMap<String, ProjectConfig>) -> Result<Self> {
+        for (name, cfg) in &configs {
+            validate_project_config(name, cfg)?;
+        }
         let projects = configs
             .into_iter()
             .map(|(name, cfg)| {
-                let project = Project {
-                    name: name.clone(),
-                    backend: cfg.backend,
-                    repo: cfg.repo,
-                    db: cfg.db,
-                    url: normalize_public_url(&cfg.url),
-                    token_env: cfg.token_env,
-                    description: cfg.description,
-                };
+                let project = project_from_config(name.clone(), cfg);
                 (name, project)
             })
             .collect::<BTreeMap<_, _>>();
@@ -461,6 +431,22 @@ impl ProjectRegistry {
 
     pub fn list(&self) -> Vec<Project> {
         self.projects.values().cloned().collect()
+    }
+
+    pub fn names(&self) -> BTreeSet<String> {
+        self.projects.keys().cloned().collect()
+    }
+
+    pub fn insert_named(&mut self, name: String, config: ProjectConfig) -> Result<Project> {
+        validate_project_config(&name, &config)?;
+        if self.projects.contains_key(&name) {
+            return Err(ShuttleError::Store(format!(
+                "project {name:?} is already configured"
+            )));
+        }
+        let project = project_from_config(name.clone(), config);
+        self.projects.insert(name, project.clone());
+        Ok(project)
     }
 
     pub fn get(&self, name: &str) -> Option<Project> {
@@ -489,6 +475,146 @@ impl ProjectRegistry {
     }
 }
 
+fn project_from_config(name: String, cfg: ProjectConfig) -> Project {
+    Project {
+        name,
+        backend: cfg.backend,
+        repo: cfg.repo,
+        db: cfg.db,
+        url: normalize_public_url(&cfg.url),
+        token_env: cfg.token_env,
+        description: cfg.description,
+    }
+}
+
+fn validate_project_config(name: &str, project: &ProjectConfig) -> Result<()> {
+    validate_project_name(name)?;
+    match project.backend {
+        ProjectBackendKind::Local => {
+            let Some(repo) = &project.repo else {
+                return Err(ShuttleError::Store(format!(
+                    "project {name:?} repo is required for local backend"
+                )));
+            };
+            if !repo.is_absolute() {
+                return Err(ShuttleError::Store(format!(
+                    "project {name:?} repo must be an absolute path"
+                )));
+            }
+            if let Some(db) = &project.db {
+                if !db.is_absolute() {
+                    return Err(ShuttleError::Store(format!(
+                        "project {name:?} db must be an absolute path when set"
+                    )));
+                }
+            }
+        }
+        ProjectBackendKind::Http => {
+            if project.url.trim().is_empty() {
+                return Err(ShuttleError::Store(format!(
+                    "project {name:?} url is required for http backend"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_project_name(name: &str) -> Result<()> {
+    if name.trim().is_empty() {
+        return Err(ShuttleError::Store(
+            "project name cannot be empty".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_project_name(name: &str) -> Result<String> {
+    validate_project_name(name)?;
+    Ok(name.trim().to_owned())
+}
+
+fn unique_project_name(base_name: &str, existing_names: &BTreeSet<String>) -> String {
+    if !existing_names.contains(base_name) {
+        return base_name.to_owned();
+    }
+    for index in 2.. {
+        let candidate = format!("{base_name}-{index}");
+        if !existing_names.contains(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded suffix search always returns")
+}
+
+fn persist_project_config(
+    config_path: &Path,
+    base_name: &str,
+    config: &ProjectConfig,
+    registry_names: &BTreeSet<String>,
+) -> Result<String> {
+    let raw =
+        std::fs::read_to_string(config_path).map_err(|err| ShuttleError::Store(err.to_string()))?;
+    let mut document = raw
+        .parse::<DocumentMut>()
+        .map_err(|err| ShuttleError::Serialization(err.to_string()))?;
+    let mut existing_names = registry_names.clone();
+    if let Some(projects) = document.get("projects").and_then(Item::as_table) {
+        existing_names.extend(projects.iter().map(|(name, _)| name.to_owned()));
+    }
+    let name = unique_project_name(base_name, &existing_names);
+
+    let projects = document
+        .entry("projects")
+        .or_insert_with(|| Item::Table(Table::new()))
+        .as_table_mut()
+        .ok_or_else(|| ShuttleError::Store("projects must be a TOML table".to_owned()))?;
+    projects[&name] = project_config_item(config);
+    write_config_atomically(config_path, document.to_string().as_bytes())?;
+    Ok(name)
+}
+
+fn project_config_item(config: &ProjectConfig) -> Item {
+    let mut table = Table::new();
+    table["backend"] = value(match config.backend {
+        ProjectBackendKind::Local => "local",
+        ProjectBackendKind::Http => "http",
+    });
+    if let Some(repo) = &config.repo {
+        table["repo"] = value(repo.display().to_string());
+    }
+    if let Some(db) = &config.db {
+        table["db"] = value(db.display().to_string());
+    }
+    if !config.url.trim().is_empty() {
+        table["url"] = value(normalize_public_url(&config.url));
+    }
+    if let Some(token_env) = &config.token_env {
+        if !token_env.trim().is_empty() {
+            table["token_env"] = value(token_env.trim());
+        }
+    }
+    if let Some(description) = &config.description {
+        if !description.trim().is_empty() {
+            table["description"] = value(description.trim());
+        }
+    }
+    Item::Table(table)
+}
+
+fn write_config_atomically(path: &Path, contents: &[u8]) -> Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temp =
+        tempfile::NamedTempFile::new_in(dir).map_err(|err| ShuttleError::Store(err.to_string()))?;
+    temp.write_all(contents)
+        .map_err(|err| ShuttleError::Store(err.to_string()))?;
+    temp.flush()
+        .map_err(|err| ShuttleError::Store(err.to_string()))?;
+    temp.persist(path)
+        .map_err(|err| ShuttleError::Store(err.to_string()))?;
+    Ok(())
+}
+
 #[derive(Debug, Serialize)]
 pub struct ServiceResponse {
     pub project: String,
@@ -498,48 +624,80 @@ pub struct ServiceResponse {
 }
 
 pub struct GatewayService {
-    projects: ProjectRegistry,
+    projects: Mutex<ProjectRegistry>,
     runner: Arc<dyn Runner>,
+    config_path: Option<PathBuf>,
     current: Mutex<String>,
 }
 
 impl GatewayService {
     pub fn new(projects: ProjectRegistry, runner: Arc<dyn Runner>) -> Self {
+        Self::new_with_config_path(projects, runner, None)
+    }
+
+    pub fn new_with_config_path(
+        projects: ProjectRegistry,
+        runner: Arc<dyn Runner>,
+        config_path: Option<PathBuf>,
+    ) -> Self {
         Self {
-            projects,
+            projects: Mutex::new(projects),
             runner,
+            config_path,
             current: Mutex::new(String::new()),
         }
     }
 
-    pub fn list_projects(&self) -> Vec<Project> {
-        self.projects.list()
+    pub fn list_projects(&self) -> Result<Vec<Project>> {
+        Ok(self.projects()?.list())
+    }
+
+    pub fn add_project(
+        &self,
+        name: &str,
+        config: ProjectConfig,
+        make_current: bool,
+    ) -> Result<Project> {
+        // Keep registry and current-project locks separate so gateway commands never hold
+        // mutable registry access while later running backend work.
+        let base_name = normalize_project_name(name)?;
+        validate_project_config(&base_name, &config)?;
+        let project = {
+            let mut projects = self.projects()?;
+            let name = if let Some(config_path) = &self.config_path {
+                persist_project_config(config_path, &base_name, &config, &projects.names())?
+            } else {
+                unique_project_name(&base_name, &projects.names())
+            };
+            projects.insert_named(name, config)?
+        };
+        if make_current {
+            *self.current()? = project.name.clone();
+        }
+        Ok(project)
     }
 
     pub fn use_project(&self, name: &str) -> Result<Project> {
-        let project = self
-            .projects
-            .get(name)
-            .ok_or_else(|| ShuttleError::Store(format!("unknown project {name:?}")))?;
-        *self
-            .current
-            .lock()
-            .map_err(|err| ShuttleError::Store(err.to_string()))? = name.to_owned();
+        // Validate against the registry before updating current; current_project() falls
+        // back to the default if future runtime removal leaves this value stale.
+        let project = {
+            let projects = self.projects()?;
+            projects
+                .get(name)
+                .ok_or_else(|| ShuttleError::Store(format!("unknown project {name:?}")))?
+        };
+        *self.current()? = name.to_owned();
         Ok(project)
     }
 
     pub fn current_project(&self) -> Result<Project> {
-        let current = self
-            .current
-            .lock()
-            .map_err(|err| ShuttleError::Store(err.to_string()))?
-            .clone();
+        let current = self.current()?.clone();
         if !current.is_empty() {
-            if let Some(project) = self.projects.get(&current) {
+            if let Some(project) = self.projects()?.get(&current) {
                 return Ok(project);
             }
         }
-        self.projects
+        self.projects()?
             .default()
             .ok_or_else(|| ShuttleError::Store("no current or default project".to_owned()))
     }
@@ -607,7 +765,10 @@ impl GatewayService {
     }
 
     async fn run(&self, project: &str, write: bool, args: &[&str]) -> Result<ServiceResponse> {
-        let project = self.projects.resolve(project, write)?;
+        let project = {
+            let projects = self.projects()?;
+            projects.resolve(project, write)?
+        };
         let result = self.runner.run(&project, args).await.map_err(|err| {
             ShuttleError::Store(format!("stl failed for project {}: {err}", project.name))
         })?;
@@ -616,6 +777,18 @@ impl GatewayService {
             result,
             stored: write.then_some(true),
         })
+    }
+
+    fn projects(&self) -> Result<MutexGuard<'_, ProjectRegistry>> {
+        self.projects
+            .lock()
+            .map_err(|err| ShuttleError::Store(err.to_string()))
+    }
+
+    fn current(&self) -> Result<MutexGuard<'_, String>> {
+        self.current
+            .lock()
+            .map_err(|err| ShuttleError::Store(err.to_string()))
     }
 }
 
@@ -758,9 +931,65 @@ fn memory_kind_for_command(command: &str) -> &str {
 }
 
 async fn api_projects(State(runtime): State<GatewayRuntime>, headers: HeaderMap) -> Response {
-    authorize(&runtime, &headers, "/api/projects", false)
-        .map(|_| Json(json!({ "projects": runtime.service.list_projects() })).into_response())
-        .unwrap_or_else(|response| *response)
+    if let Err(response) = authorize(&runtime, &headers, "/api/projects", false) {
+        return *response;
+    }
+    match runtime.service.list_projects() {
+        Ok(projects) => Json(json!({ "projects": projects })).into_response(),
+        Err(err) => error_response(err),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AddProjectRequest {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    backend: ProjectBackendKind,
+    #[serde(default)]
+    repo: Option<PathBuf>,
+    #[serde(default)]
+    db: Option<PathBuf>,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    token_env: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    make_current: bool,
+}
+
+impl AddProjectRequest {
+    fn into_parts(self) -> (String, ProjectConfig, bool) {
+        (
+            self.name,
+            ProjectConfig {
+                backend: self.backend,
+                repo: self.repo,
+                db: self.db,
+                url: self.url,
+                token_env: self.token_env,
+                description: self.description,
+            },
+            self.make_current,
+        )
+    }
+}
+
+async fn api_add_project(
+    State(runtime): State<GatewayRuntime>,
+    headers: HeaderMap,
+    Json(request): Json<AddProjectRequest>,
+) -> Response {
+    if let Err(response) = authorize(&runtime, &headers, "/api/projects", false) {
+        return *response;
+    }
+    let (name, config, make_current) = request.into_parts();
+    match runtime.service.add_project(&name, config, make_current) {
+        Ok(project) => (StatusCode::CREATED, Json(project)).into_response(),
+        Err(err) => error_response(err),
+    }
 }
 
 async fn api_current_project(
@@ -1036,7 +1265,12 @@ async fn mcp_call_tool(service: &GatewayService, params: Value) -> Result<Value>
         .cloned()
         .unwrap_or_else(|| json!({}));
     match name {
-        "shuttle_projects" => Ok(json!({ "projects": service.list_projects() })),
+        "shuttle_projects" => Ok(json!({ "projects": service.list_projects()? })),
+        "shuttle_project_add" => {
+            let (name, config, make_current) = project_add_args(&args)?;
+            serde_json::to_value(service.add_project(&name, config, make_current)?)
+                .map_err(|err| ShuttleError::Serialization(err.to_string()))
+        }
         "shuttle_current_project" => serde_json::to_value(service.current_project()?)
             .map_err(|err| ShuttleError::Serialization(err.to_string())),
         "shuttle_use_project" => {
@@ -1102,6 +1336,48 @@ fn optional_str_arg<'a>(args: &'a Value, key: &str) -> &'a str {
     args.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
+fn project_add_args(args: &Value) -> Result<(String, ProjectConfig, bool)> {
+    Ok((
+        str_arg(args, "name")?.to_owned(),
+        ProjectConfig {
+            backend: project_backend_arg(args, "backend")?,
+            repo: optional_path_arg(args, "repo"),
+            db: optional_path_arg(args, "db"),
+            url: optional_string_arg(args, "url").unwrap_or_default(),
+            token_env: optional_string_arg(args, "token_env"),
+            description: optional_string_arg(args, "description"),
+        },
+        optional_bool_arg(args, "make_current"),
+    ))
+}
+
+fn project_backend_arg(args: &Value, key: &str) -> Result<ProjectBackendKind> {
+    match optional_str_arg(args, key) {
+        "" => Ok(ProjectBackendKind::Local),
+        "local" => Ok(ProjectBackendKind::Local),
+        "http" => Ok(ProjectBackendKind::Http),
+        other => Err(ShuttleError::Store(format!(
+            "{key} must be one of: local, http; got {other:?}"
+        ))),
+    }
+}
+
+fn optional_path_arg(args: &Value, key: &str) -> Option<PathBuf> {
+    optional_string_arg(args, key).map(PathBuf::from)
+}
+
+fn optional_string_arg(args: &Value, key: &str) -> Option<String> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn optional_bool_arg(args: &Value, key: &str) -> bool {
+    args.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
 fn rpc_ok(id: Value, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
@@ -1118,6 +1394,22 @@ fn gateway_tools() -> Vec<Value> {
             json!({}),
             vec![],
             projects_output_schema(),
+        ),
+        tool(
+            "shuttle_project_add",
+            "Add a Shuttle project to the running gateway",
+            json!({
+                "name": string_schema("Project name"),
+                "backend": enum_schema("Project backend; defaults to local", &["local", "http"]),
+                "repo": nullable_string_schema("Absolute local repository path for local backends"),
+                "db": nullable_string_schema("Absolute local Shuttle database path"),
+                "url": string_schema("HTTP project base URL for http backends"),
+                "token_env": nullable_string_schema("Environment variable name containing the backend bearer token"),
+                "description": nullable_string_schema("Project description"),
+                "make_current": bool_schema("Set the added project as the current project"),
+            }),
+            vec!["name"],
+            project_output_schema(),
         ),
         tool(
             "shuttle_current_project",
@@ -1255,6 +1547,10 @@ fn object_schema(properties: Value, required: Vec<&str>) -> Value {
 
 fn string_schema(description: &str) -> Value {
     json!({ "type": "string", "description": description })
+}
+
+fn bool_schema(description: &str) -> Value {
+    json!({ "type": "boolean", "description": description })
 }
 
 fn nullable_string_schema(description: &str) -> Value {
@@ -1840,6 +2136,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn service_add_project_routes_to_runtime_project() {
+        let runner = Arc::new(FakeRunner::default());
+        let service = GatewayService::new(registry(), runner.clone());
+        let project = service
+            .add_project(
+                " extra ",
+                ProjectConfig {
+                    backend: ProjectBackendKind::Http,
+                    repo: None,
+                    db: None,
+                    url: "http://127.0.0.1:9999/".to_owned(),
+                    token_env: Some("EXTRA_TOKEN".to_owned()),
+                    description: Some("extra project".to_owned()),
+                },
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(project.name, "extra");
+        assert_eq!(project.url, "http://127.0.0.1:9999");
+        assert_eq!(service.current_project().unwrap().name, "extra");
+        service.task_list("extra").await.unwrap();
+
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls[0].0, "extra");
+        assert_eq!(calls[0].1, vec!["task", "list"]);
+    }
+
+    #[test]
+    fn service_add_project_suffixes_duplicates_and_rejects_invalid_config() {
+        let service = GatewayService::new(registry(), Arc::new(FakeRunner::default()));
+        let duplicate = service
+            .add_project(
+                "demo",
+                ProjectConfig {
+                    backend: ProjectBackendKind::Http,
+                    repo: None,
+                    db: None,
+                    url: "http://127.0.0.1:9999".to_owned(),
+                    token_env: None,
+                    description: None,
+                },
+                false,
+            )
+            .unwrap();
+        assert_eq!(duplicate.name, "demo-2");
+        assert!(service
+            .add_project(
+                "relative",
+                ProjectConfig {
+                    backend: ProjectBackendKind::Local,
+                    repo: Some(PathBuf::from("relative")),
+                    db: None,
+                    url: String::new(),
+                    token_env: None,
+                    description: None,
+                },
+                false,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("absolute path"));
+    }
+
+    #[tokio::test]
     async fn mcp_tools_list_includes_gateway_tools() {
         let runtime = test_runtime(registry(), Arc::new(FakeRunner::default()));
         env::remove_var("TEST_EMPTY_GATEWAY_TOKEN");
@@ -1861,6 +2222,9 @@ mod tests {
         let value: Value = serde_json::from_slice(&body).unwrap();
         let tools = value["result"]["tools"].as_array().unwrap();
         assert!(tools.iter().any(|tool| tool["name"] == "shuttle_projects"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool["name"] == "shuttle_project_add"));
         assert!(tools.iter().any(|tool| tool["name"] == "shuttle_remember"));
         assert!(tools
             .iter()
@@ -1899,6 +2263,59 @@ mod tests {
             value["result"]["content"][0]["text"],
             r#"{"project":"demo","result":{"ok":true},"stored":true}"#
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_project_add_registers_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = write_gateway_config(dir.path(), true);
+        let runtime = file_backed_runtime(&config_path, Arc::new(FakeRunner::default()));
+        env::remove_var("TEST_EMPTY_GATEWAY_TOKEN");
+        let app = router(runtime);
+
+        let add = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/mcp")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"shuttle_project_add","arguments":{"name":"extra","backend":"http","url":"http://127.0.0.1:9999/","make_current":true}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(add.status(), StatusCode::OK);
+        let body = add.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["result"]["structuredContent"]["name"], "extra-2");
+        assert_eq!(
+            value["result"]["structuredContent"]["url"],
+            "http://127.0.0.1:9999"
+        );
+        assert!(GatewayConfig::load(&config_path)
+            .unwrap()
+            .projects
+            .contains_key("extra-2"));
+
+        let current = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/mcp")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"shuttle_current_project","arguments":{}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = current.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["result"]["structuredContent"]["name"], "extra-2");
     }
 
     #[tokio::test]
@@ -1956,6 +2373,72 @@ mod tests {
         assert_eq!(recall.status(), StatusCode::OK);
         let calls = runner.calls.lock().unwrap();
         assert_eq!(calls[0].1, vec!["recall", "sqlite"]);
+    }
+
+    #[tokio::test]
+    async fn http_project_add_updates_project_list_and_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = write_gateway_config(dir.path(), true);
+        let runtime = file_backed_runtime(&config_path, Arc::new(FakeRunner::default()));
+        env::remove_var("TEST_EMPTY_GATEWAY_TOKEN");
+        let app = router(runtime);
+
+        let add = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/projects")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"name":"extra","backend":"http","url":"http://127.0.0.1:9999/","description":"extra project","make_current":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(add.status(), StatusCode::CREATED);
+        let body = add.into_body().collect().await.unwrap().to_bytes();
+        let project: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(project["name"], "extra-2");
+        assert_eq!(project["url"], "http://127.0.0.1:9999");
+        assert!(GatewayConfig::load(&config_path)
+            .unwrap()
+            .projects
+            .contains_key("extra-2"));
+
+        let current = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/projects/current")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = current.into_body().collect().await.unwrap().to_bytes();
+        let project: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(project["name"], "extra-2");
+
+        let list = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/projects")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = list.into_body().collect().await.unwrap().to_bytes();
+        let projects: Value = serde_json::from_slice(&body).unwrap();
+        assert!(projects["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|project| project["name"] == "extra-2"));
     }
 
     #[tokio::test]
@@ -2090,6 +2573,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(authorized.status(), StatusCode::OK);
+    }
+
+    fn write_gateway_config(dir: &Path, include_extra: bool) -> PathBuf {
+        let path = dir.join("projects.toml");
+        let extra = if include_extra {
+            "\n[projects.extra]\nbackend = \"http\"\nurl = \"http://127.0.0.1:8788\"\n"
+        } else {
+            ""
+        };
+        std::fs::write(
+            &path,
+            format!(
+                "[defaults]\nproject = \"demo\"\n\n[projects.demo]\nbackend = \"local\"\nrepo = \"/tmp/demo\"\n{extra}"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    fn file_backed_runtime(path: &Path, runner: Arc<FakeRunner>) -> GatewayRuntime {
+        let cfg = GatewayConfig::load(path).unwrap();
+        let config_path = cfg.config_path.clone();
+        let registry = ProjectRegistry::new(cfg.defaults.project, cfg.projects).unwrap();
+        GatewayRuntime {
+            service: Arc::new(GatewayService::new_with_config_path(
+                registry,
+                runner,
+                config_path,
+            )),
+            auth: GatewayAuth::Bearer {
+                token_env: "TEST_EMPTY_GATEWAY_TOKEN".to_owned(),
+            },
+        }
     }
 
     fn test_runtime(registry: ProjectRegistry, runner: Arc<FakeRunner>) -> GatewayRuntime {

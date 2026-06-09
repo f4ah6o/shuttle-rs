@@ -237,6 +237,23 @@ The gateway requires an explicit `project` argument for writes such as
 `shuttle_remember` and `shuttle_task_create`. Reads may use the configured
 default project.
 
+Add projects to a running gateway with `POST /api/projects` or the MCP tool
+`shuttle_project_add`. Additions are written to `projects.toml` and are
+available immediately to all listeners. If the requested name is already in use,
+the gateway chooses the next available suffix such as `extra-2`.
+
+```bash
+curl -X POST http://127.0.0.1:8788/api/projects \
+  -H 'content-type: application/json' \
+  --data '{
+    "name": "extra",
+    "backend": "http",
+    "url": "http://10.10.10.22:8787",
+    "token_env": "SHUTTLE_EXTRA_BACKEND_TOKEN",
+    "make_current": true
+  }'
+```
+
 For HTTP backends, start a repo-local app server in the project environment:
 
 ```bash
