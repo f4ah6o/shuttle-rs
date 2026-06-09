@@ -234,6 +234,23 @@ bearer_token_env = "SHUTTLE_GATEWAY_TOKEN"
 gateway では、`shuttle_remember` や `shuttle_task_create` のような write に明示的な
 `project` argument が必要です。read は設定済み default project を使えます。
 
+起動中の gateway には `POST /api/projects` または MCP tool の `shuttle_project_add` で
+project を追加できます。追加した project は `projects.toml` に書き戻され、全 listener
+からすぐ使えます。指定した name が既に使われている場合、gateway は `extra-2` のような
+次の空き suffix を選びます。
+
+```bash
+curl -X POST http://127.0.0.1:8788/api/projects \
+  -H 'content-type: application/json' \
+  --data '{
+    "name": "extra",
+    "backend": "http",
+    "url": "http://10.10.10.22:8787",
+    "token_env": "SHUTTLE_EXTRA_BACKEND_TOKEN",
+    "make_current": true
+  }'
+```
+
 HTTP backend では、project environment で repo-local app server を起動します。
 
 ```bash

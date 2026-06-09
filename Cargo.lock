@@ -1125,6 +1125,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+ "toml_edit",
  "tower",
  "ureq",
  "uuid",
