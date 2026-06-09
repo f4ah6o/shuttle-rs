@@ -2200,6 +2200,39 @@ mod tests {
             .contains("absolute path"));
     }
 
+    #[test]
+    fn service_add_project_persists_local_project_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = write_gateway_config(dir.path(), false);
+        let runtime = file_backed_runtime(&config_path, Arc::new(FakeRunner::default()));
+        let repo = dir.path().join("repo");
+        let db = dir.path().join("repo/.shuttle/shuttle.db");
+
+        let project = runtime
+            .service
+            .add_project(
+                "local-extra",
+                ProjectConfig {
+                    backend: ProjectBackendKind::Local,
+                    repo: Some(repo.clone()),
+                    db: Some(db.clone()),
+                    url: String::new(),
+                    token_env: None,
+                    description: Some("local extra".to_owned()),
+                },
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(project.name, "local-extra");
+        let reloaded = GatewayConfig::load(&config_path).unwrap();
+        let persisted = reloaded.projects.get("local-extra").unwrap();
+        assert_eq!(persisted.backend, ProjectBackendKind::Local);
+        assert_eq!(persisted.repo.as_ref(), Some(&repo));
+        assert_eq!(persisted.db.as_ref(), Some(&db));
+        assert_eq!(persisted.description.as_deref(), Some("local extra"));
+    }
+
     #[tokio::test]
     async fn mcp_tools_list_includes_gateway_tools() {
         let runtime = test_runtime(registry(), Arc::new(FakeRunner::default()));
