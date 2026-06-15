@@ -21,8 +21,10 @@ enum Command {
         config: PathBuf,
         #[arg(long)]
         addr: Option<SocketAddr>,
-        #[arg(long, default_value = "stl")]
-        stl: PathBuf,
+        /// Run local projects by executing this external `stl` binary instead of
+        /// the built-in in-process engine. Omit to run the gateway standalone.
+        #[arg(long)]
+        stl: Option<PathBuf>,
         #[arg(long, default_value = "10")]
         timeout: u64,
     },

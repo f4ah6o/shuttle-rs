@@ -174,8 +174,9 @@ changed-file、diff の tool を提供します。`remember` のような alias 
 
 複数の local repository を 1 つの MCP server から使う web chat client には、
 `shuttle-gateway` を使います。gateway は MCP、auth、project routing の境界です。
-各 project は local backend として `stl --json ...` を実行するか、repo-local な
-`stl app serve` に HTTP で接続できます。
+各 local project は `.shuttle/shuttle.db` に対して in-process で実行されるため、
+gateway は単体で動作し、別途 `stl` binary を必要としません。repo-local な
+`stl app serve` に HTTP で接続することもできます。
 
 remote deployment model は次の形です。
 
@@ -207,7 +208,8 @@ shuttle-gateway version
 stl --json version
 ```
 
-local backend が実行する CLI binary は `--stl /path/to/stl` で指定できます。
+local backend は既定で in-process 実行されるため、外部の `stl` binary は不要です。
+`--stl /path/to/stl` を渡すと、local project をその外部 binary 経由で実行します。
 local subprocess と HTTP backend の timeout は `--timeout <seconds>` で設定します。
 single-listener config では `--addr` で address を上書きできます。複数の
 `[[listeners]]` を持つ config では、listener address は config 側が管理します。

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::fs;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -12,13 +13,20 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
+use chrono::{DateTime, Utc};
+use futures_executor::block_on;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::process::Command;
 use toml_edit::{value, DocumentMut, Item, Table};
+use uuid::Uuid;
 
-use crate::core::{Result, ShuttleError};
+use crate::context;
+use crate::core::{Event, EventStore, EventType, Result, ShuttleError};
+use crate::memory;
 use crate::oauth::{self, OAuthConfig, OAuthStore};
+use crate::store::SqliteEventStore;
+use crate::task;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayConfig {
@@ -249,7 +257,11 @@ pub struct GatewayListener {
 }
 
 impl GatewayRuntime {
-    pub fn from_config(config: GatewayConfig, stl: PathBuf, timeout: Duration) -> Result<Self> {
+    pub fn from_config(
+        config: GatewayConfig,
+        stl: Option<PathBuf>,
+        timeout: Duration,
+    ) -> Result<Self> {
         let listeners = Self::listeners_from_config(config, stl, timeout)?;
         if listeners.len() != 1 {
             return Err(ShuttleError::Store(
@@ -261,7 +273,7 @@ impl GatewayRuntime {
 
     pub fn listeners_from_config(
         mut config: GatewayConfig,
-        stl: PathBuf,
+        stl: Option<PathBuf>,
         timeout: Duration,
     ) -> Result<Vec<GatewayListener>> {
         let listener_configs = if config.listeners.is_empty() {
@@ -271,12 +283,16 @@ impl GatewayRuntime {
         };
         let config_path = config.config_path.clone();
         let registry = ProjectRegistry::new(config.defaults.project, config.projects)?;
+        // Default to the built-in in-process engine so the gateway runs local
+        // projects standalone; an explicit `stl` binary opts back into subprocess
+        // execution for compatibility.
+        let runner: Arc<dyn Runner> = match stl {
+            Some(binary) => Arc::new(SubprocessRunner { binary, timeout }),
+            None => Arc::new(LibraryRunner { timeout }),
+        };
         let service = Arc::new(GatewayService::new_with_config_path(
             registry,
-            Arc::new(SubprocessRunner {
-                binary: stl,
-                timeout,
-            }),
+            runner,
             config_path,
         ));
         listener_configs
@@ -813,7 +829,7 @@ pub struct SubprocessRunner {
 impl Runner for SubprocessRunner {
     async fn run(&self, project: &Project, args: &[&str]) -> std::result::Result<Value, String> {
         if project.backend == ProjectBackendKind::Http {
-            return self.run_http(project, args).await;
+            return run_http_backend(project, args, self.timeout).await;
         }
         let repo = project
             .repo
@@ -837,18 +853,274 @@ impl Runner for SubprocessRunner {
     }
 }
 
-impl SubprocessRunner {
-    async fn run_http(
-        &self,
-        project: &Project,
-        args: &[&str],
-    ) -> std::result::Result<Value, String> {
+/// In-process runner that executes local projects against their Shuttle SQLite
+/// database directly, so the gateway works standalone without an external `stl`
+/// binary. HTTP-backed projects reuse the shared HTTP call path.
+pub struct LibraryRunner {
+    timeout: Duration,
+}
+
+#[async_trait]
+impl Runner for LibraryRunner {
+    async fn run(&self, project: &Project, args: &[&str]) -> std::result::Result<Value, String> {
+        if project.backend == ProjectBackendKind::Http {
+            return run_http_backend(project, args, self.timeout).await;
+        }
         let project = project.clone();
         let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
-        let timeout = self.timeout;
-        tokio::task::spawn_blocking(move || http_backend_call(&project, &args, timeout))
+        tokio::task::spawn_blocking(move || local_backend_call(&project, &args))
             .await
             .map_err(|err| err.to_string())?
+    }
+}
+
+async fn run_http_backend(
+    project: &Project,
+    args: &[&str],
+    timeout: Duration,
+) -> std::result::Result<Value, String> {
+    let project = project.clone();
+    let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+    tokio::task::spawn_blocking(move || http_backend_call(&project, &args, timeout))
+        .await
+        .map_err(|err| err.to_string())?
+}
+
+/// Per-repository runtime derived the same way the `stl` CLI derives it, so
+/// in-process execution observes identical workspace, agent, and session state.
+struct LocalEnv {
+    cwd: PathBuf,
+    database_path: PathBuf,
+    workspace_id: String,
+    agent: String,
+    session_id: String,
+}
+
+impl LocalEnv {
+    fn load(repo: &Path, db: Option<&Path>) -> Result<Self> {
+        let shuttle_dir = repo.join(".shuttle");
+        let database_path = db
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| shuttle_dir.join("shuttle.db"));
+        let workspace_id = load_or_create_workspace_id(&shuttle_dir, repo)?;
+        let agent = load_agent(&shuttle_dir);
+        let session_id = load_or_create_session_id(&shuttle_dir)?;
+        Ok(Self {
+            cwd: repo.to_path_buf(),
+            database_path,
+            workspace_id,
+            agent,
+            session_id,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct WorkspaceFile {
+    workspace_id: String,
+    repo_path: String,
+    created_at: DateTime<Utc>,
+}
+
+fn load_or_create_workspace_id(shuttle_dir: &Path, root: &Path) -> Result<String> {
+    let path = shuttle_dir.join("workspace.json");
+    if let Ok(contents) = fs::read_to_string(&path) {
+        let workspace: WorkspaceFile = serde_json::from_str(&contents)
+            .map_err(|err| ShuttleError::Serialization(err.to_string()))?;
+        return Ok(workspace.workspace_id);
+    }
+    fs::create_dir_all(shuttle_dir).map_err(|err| ShuttleError::Store(err.to_string()))?;
+    let workspace = WorkspaceFile {
+        workspace_id: Uuid::new_v4().to_string(),
+        repo_path: root.display().to_string(),
+        created_at: Utc::now(),
+    };
+    let serialized =
+        serde_json::to_string_pretty(&workspace).map_err(|err| ShuttleError::Serialization(err.to_string()))?;
+    fs::write(&path, serialized).map_err(|err| ShuttleError::Store(err.to_string()))?;
+    Ok(workspace.workspace_id)
+}
+
+fn load_agent(shuttle_dir: &Path) -> String {
+    if let Ok(agent) = env::var("SHUTTLE_AGENT") {
+        let agent = agent.trim();
+        if !agent.is_empty() {
+            return agent.to_owned();
+        }
+    }
+    if let Ok(contents) = fs::read_to_string(shuttle_dir.join("agent")) {
+        let agent = contents.trim();
+        if !agent.is_empty() {
+            return agent.to_owned();
+        }
+    }
+    "unknown".to_owned()
+}
+
+fn load_or_create_session_id(shuttle_dir: &Path) -> Result<String> {
+    if let Ok(session_id) = env::var("SHUTTLE_SESSION_ID") {
+        return Ok(session_id);
+    }
+    let path = shuttle_dir.join("session");
+    if let Ok(contents) = fs::read_to_string(&path) {
+        let session_id = contents.trim();
+        if !session_id.is_empty() {
+            return Ok(session_id.to_owned());
+        }
+    }
+    fs::create_dir_all(shuttle_dir).map_err(|err| ShuttleError::Store(err.to_string()))?;
+    let session_id = Uuid::new_v4().to_string();
+    fs::write(&path, format!("{session_id}\n")).map_err(|err| ShuttleError::Store(err.to_string()))?;
+    Ok(session_id)
+}
+
+fn with_local_repo_metadata(mut event: Event, env: &LocalEnv) -> Event {
+    if let Ok(status) = context::repo_status(&env.cwd) {
+        let repo_id = context::repo_id(&status);
+        event.repo_id = Some(repo_id.clone());
+        event.repo_path = Some(status.repo_path.clone());
+        event.git_remote = status.git_remote.clone();
+        event.branch = Some(status.branch.clone());
+        event.commit = Some(status.commit.clone());
+        event.repo_dirty = Some(status.dirty);
+        if let Some(metadata) = event.metadata_json.as_object_mut() {
+            metadata.insert("repo_id".to_owned(), json!(repo_id));
+            metadata.insert("repo_path".to_owned(), json!(status.repo_path));
+            metadata.insert("git_remote".to_owned(), json!(status.git_remote));
+            metadata.insert("branch".to_owned(), json!(status.branch));
+            metadata.insert("commit".to_owned(), json!(status.commit));
+            metadata.insert("repo_dirty".to_owned(), json!(status.dirty));
+            metadata.insert("dirty_files".to_owned(), json!(status.dirty_files));
+        }
+    }
+    event
+}
+
+fn local_backend_call(project: &Project, args: &[String]) -> std::result::Result<Value, String> {
+    let repo = project
+        .repo
+        .as_ref()
+        .ok_or_else(|| "repo is required for local backend".to_owned())?;
+    let env = LocalEnv::load(repo, project.db.as_deref()).map_err(|err| err.to_string())?;
+    let store = SqliteEventStore::open(&env.database_path).map_err(|err| err.to_string())?;
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let value = match args.as_slice() {
+        ["context"] => {
+            let context = block_on(context::assemble_context(
+                &store,
+                &env.cwd,
+                &env.workspace_id,
+                &env.agent,
+            ))
+            .map_err(|err| err.to_string())?;
+            to_json_value(&context)?
+        }
+        ["recall", query] => {
+            let status = context::repo_status(&env.cwd).ok();
+            let repo_id = status.as_ref().map(context::repo_id);
+            let branch = status.as_ref().map(|status| status.branch.as_str());
+            let results = block_on(memory::ranked_recall(
+                &store,
+                query,
+                None,
+                Some(&env.workspace_id),
+                repo_id.as_deref(),
+                branch,
+            ))
+            .map_err(|err| err.to_string())?;
+            to_json_value(&results)?
+        }
+        [command, text] if is_memory_command(command) => {
+            let event = with_local_repo_metadata(
+                memory::new_typed_memory(
+                    memory_event_type_for_command(command),
+                    env.workspace_id.clone(),
+                    env.agent.clone(),
+                    env.session_id.clone(),
+                    (*text).to_owned(),
+                ),
+                &env,
+            );
+            let event = block_on(store.append(event)).map_err(|err| err.to_string())?;
+            to_json_value(&event)?
+        }
+        ["task", "list"] => {
+            let tasks = block_on(task::tasks(&store, Some(&env.workspace_id), None))
+                .map_err(|err| err.to_string())?;
+            to_json_value(&tasks)?
+        }
+        ["task", "create", content] => {
+            let event = with_local_repo_metadata(
+                task::new_task(
+                    env.workspace_id.clone(),
+                    env.agent.clone(),
+                    env.session_id.clone(),
+                    (*content).to_owned(),
+                ),
+                &env,
+            );
+            let event = block_on(store.append(event)).map_err(|err| err.to_string())?;
+            to_json_value(&event)?
+        }
+        ["task", "update", id, text] => {
+            let task_id = parse_task_id(id)?;
+            block_on(task::ensure_task_exists(&store, &env.workspace_id, task_id))
+                .map_err(|err| err.to_string())?;
+            let event = with_local_repo_metadata(
+                task::new_task_update(
+                    env.workspace_id.clone(),
+                    env.agent.clone(),
+                    env.session_id.clone(),
+                    task_id,
+                    (*text).to_owned(),
+                ),
+                &env,
+            );
+            let event = block_on(store.append(event)).map_err(|err| err.to_string())?;
+            to_json_value(&event)?
+        }
+        ["task", "done", id] => {
+            let task_id = parse_task_id(id)?;
+            block_on(task::ensure_task_exists(&store, &env.workspace_id, task_id))
+                .map_err(|err| err.to_string())?;
+            let event = with_local_repo_metadata(
+                task::new_task_done(
+                    env.workspace_id.clone(),
+                    env.agent.clone(),
+                    env.session_id.clone(),
+                    task_id,
+                ),
+                &env,
+            );
+            let event = block_on(store.append(event)).map_err(|err| err.to_string())?;
+            to_json_value(&event)?
+        }
+        _ => {
+            return Err(format!(
+                "unsupported local backend command: {}",
+                args.join(" ")
+            ))
+        }
+    };
+    Ok(value)
+}
+
+fn to_json_value<T: Serialize>(value: &T) -> std::result::Result<Value, String> {
+    serde_json::to_value(value).map_err(|err| err.to_string())
+}
+
+fn parse_task_id(id: &str) -> std::result::Result<Uuid, String> {
+    Uuid::parse_str(id).map_err(|err| format!("invalid task id {id:?}: {err}"))
+}
+
+fn memory_event_type_for_command(command: &str) -> EventType {
+    match command {
+        "decide" => EventType::Decision,
+        "observe" => EventType::Observation,
+        "pattern" => EventType::Pattern,
+        "fact" => EventType::Fact,
+        "bug" => EventType::Bug,
+        _ => EventType::Memory,
     }
 }
 
@@ -2109,6 +2381,55 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("only allowed on loopback"));
+    }
+
+    #[tokio::test]
+    async fn library_runner_executes_local_project_in_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let project = Project {
+            name: "demo".to_owned(),
+            backend: ProjectBackendKind::Local,
+            repo: Some(repo.clone()),
+            db: None,
+            url: String::new(),
+            token_env: None,
+            description: None,
+        };
+        let runner = LibraryRunner {
+            timeout: Duration::from_secs(5),
+        };
+
+        let stored = runner
+            .run(&project, &["remember", "sqlite is the store"])
+            .await
+            .unwrap();
+        assert_eq!(stored["content"], "sqlite is the store");
+
+        let recalled = runner.run(&project, &["recall", "sqlite"]).await.unwrap();
+        assert!(recalled
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|result| result["event"]["content"] == "sqlite is the store"));
+
+        let created = runner
+            .run(&project, &["task", "create", "ship gateway"])
+            .await
+            .unwrap();
+        let task_id = created["id"].as_str().unwrap().to_owned();
+
+        let listed = runner.run(&project, &["task", "list"]).await.unwrap();
+        assert!(listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|task| task["id"] == task_id && task["content"] == "ship gateway"));
+
+        // The database is created in-process under the project repo without an
+        // external `stl` binary on PATH.
+        assert!(repo.join(".shuttle/shuttle.db").exists());
     }
 
     #[tokio::test]
