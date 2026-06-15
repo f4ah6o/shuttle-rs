@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use crate::adapter::{AdapterRecord, ProjectCacheEntry};
 use crate::core::{Event, EventFilter, EventStore, EventType, Result, ShuttleError};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -61,6 +62,25 @@ impl SqliteEventStore {
             CREATE INDEX IF NOT EXISTS idx_events_workspace_created ON events(workspace_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_events_agent_created ON events(agent, created_at);
             CREATE INDEX IF NOT EXISTS idx_event_tags_tag ON event_tags(tag);
+
+            CREATE TABLE IF NOT EXISTS adapter_registry (
+                id TEXT PRIMARY KEY NOT NULL,
+                name TEXT NOT NULL,
+                base_model TEXT NOT NULL,
+                path TEXT NOT NULL,
+                embedding_json TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            );
+
+            CREATE TABLE IF NOT EXISTS project_adapter_cache (
+                repo_hash TEXT NOT NULL,
+                branch TEXT NOT NULL,
+                commit_hash TEXT NOT NULL,
+                project_embedding_json TEXT NOT NULL,
+                selected_adapters_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (repo_hash, branch, commit_hash)
+            );
             "#,
         )
         .map_err(to_store_error)?;
@@ -80,6 +100,139 @@ impl SqliteEventStore {
             .map_err(|err| ShuttleError::Store(err.to_string()))?;
         insert_event(&mut conn, event, InsertMode::IgnoreDuplicates)
     }
+
+    /// Insert or replace an adapter in the local registry.
+    pub fn upsert_adapter(&self, record: &AdapterRecord) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|err| ShuttleError::Store(err.to_string()))?;
+        let embedding_json = serde_json::to_string(&record.embedding)
+            .map_err(|err| ShuttleError::Serialization(err.to_string()))?;
+        let metadata_json = serde_json::to_string(&record.metadata)
+            .map_err(|err| ShuttleError::Serialization(err.to_string()))?;
+        conn.execute(
+            r#"
+            INSERT OR REPLACE INTO adapter_registry (id, name, base_model, path, embedding_json, metadata_json)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            params![
+                record.id,
+                record.name,
+                record.base_model,
+                record.path,
+                embedding_json,
+                metadata_json,
+            ],
+        )
+        .map_err(to_store_error)?;
+        Ok(())
+    }
+
+    /// List every adapter currently registered, ordered by name.
+    pub fn list_adapters(&self) -> Result<Vec<AdapterRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|err| ShuttleError::Store(err.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, name, base_model, path, embedding_json, metadata_json
+                 FROM adapter_registry ORDER BY name",
+            )
+            .map_err(to_store_error)?;
+        let rows = stmt.query_map([], row_to_adapter).map_err(to_store_error)?;
+        let mut adapters = Vec::new();
+        for row in rows {
+            adapters.push(row.map_err(to_store_error)?);
+        }
+        Ok(adapters)
+    }
+
+    /// Persist the project embedding and selection for a repo/branch/commit key.
+    pub fn put_project_cache(&self, entry: &ProjectCacheEntry) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|err| ShuttleError::Store(err.to_string()))?;
+        let embedding_json = serde_json::to_string(&entry.project_embedding)
+            .map_err(|err| ShuttleError::Serialization(err.to_string()))?;
+        let selected_json = serde_json::to_string(&entry.selected_adapters)
+            .map_err(|err| ShuttleError::Serialization(err.to_string()))?;
+        conn.execute(
+            r#"
+            INSERT OR REPLACE INTO project_adapter_cache
+                (repo_hash, branch, commit_hash, project_embedding_json, selected_adapters_json, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            params![
+                entry.repo_hash,
+                entry.branch,
+                entry.commit,
+                embedding_json,
+                selected_json,
+                entry.created_at.to_rfc3339(),
+            ],
+        )
+        .map_err(to_store_error)?;
+        Ok(())
+    }
+
+    /// Look up a cached project embedding for a repo/branch/commit key.
+    pub fn get_project_cache(
+        &self,
+        repo_hash: &str,
+        branch: &str,
+        commit: &str,
+    ) -> Result<Option<ProjectCacheEntry>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|err| ShuttleError::Store(err.to_string()))?;
+        conn.query_row(
+            "SELECT repo_hash, branch, commit_hash, project_embedding_json, selected_adapters_json, created_at
+             FROM project_adapter_cache WHERE repo_hash = ?1 AND branch = ?2 AND commit_hash = ?3",
+            params![repo_hash, branch, commit],
+            row_to_project_cache,
+        )
+        .optional()
+        .map_err(to_store_error)?
+        .transpose()
+    }
+}
+
+fn row_to_adapter(row: &rusqlite::Row<'_>) -> rusqlite::Result<AdapterRecord> {
+    let embedding_json: String = row.get(4)?;
+    let metadata_json: String = row.get(5)?;
+    Ok(AdapterRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        base_model: row.get(2)?,
+        path: row.get(3)?,
+        embedding: serde_json::from_str(&embedding_json).map_err(to_sql_error)?,
+        metadata: serde_json::from_str(&metadata_json).map_err(to_sql_error)?,
+    })
+}
+
+#[allow(clippy::type_complexity)]
+fn row_to_project_cache(row: &rusqlite::Row<'_>) -> rusqlite::Result<Result<ProjectCacheEntry>> {
+    let embedding_json: String = row.get(3)?;
+    let selected_json: String = row.get(4)?;
+    let created_at: String = row.get(5)?;
+    Ok((|| {
+        Ok(ProjectCacheEntry {
+            repo_hash: row.get(0).map_err(to_store_error)?,
+            branch: row.get(1).map_err(to_store_error)?,
+            commit: row.get(2).map_err(to_store_error)?,
+            project_embedding: serde_json::from_str(&embedding_json)
+                .map_err(|err| ShuttleError::Serialization(err.to_string()))?,
+            selected_adapters: serde_json::from_str(&selected_json)
+                .map_err(|err| ShuttleError::Serialization(err.to_string()))?,
+            created_at: DateTime::parse_from_rfc3339(&created_at)
+                .map_err(|err| ShuttleError::Serialization(err.to_string()))?
+                .with_timezone(&Utc),
+        })
+    })())
 }
 
 #[async_trait]
