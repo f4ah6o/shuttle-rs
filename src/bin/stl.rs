@@ -212,6 +212,27 @@ enum AdapterCommand {
         #[arg(long, default_value = "json")]
         format: String,
     },
+    /// Generate an adapter from project context via an external doc-to-lora runner.
+    Doc2lora {
+        /// Name (and default registry id) for the generated adapter.
+        #[arg(long)]
+        name: String,
+        /// Base model the generated adapter targets.
+        #[arg(long = "base-model")]
+        base_model: String,
+        /// Directory the runner writes the adapter (and context document) into.
+        #[arg(long = "out-dir")]
+        out_dir: PathBuf,
+        /// Runner program override (defaults to $SHUTTLE_DOC2LORA_RUNNER, then `doc2lora`).
+        #[arg(long)]
+        runner: Option<String>,
+        /// Repeatable tag recorded on the generated adapter.
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        /// Optional focus query that biases and annotates the context document.
+        #[arg(long)]
+        focus: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -929,6 +950,37 @@ fn main() -> Result<()> {
                         format!(
                             "exported manifest with {} adapter(s)",
                             manifest.adapters.len()
+                        )
+                    })?;
+                }
+                AdapterCommand::Doc2lora {
+                    name,
+                    base_model,
+                    out_dir,
+                    runner,
+                    tags,
+                    focus,
+                } => {
+                    let input = shuttle_rs::adapter::Doc2LoraInput {
+                        name,
+                        base_model,
+                        out_dir,
+                        runner,
+                        tags,
+                        focus,
+                    };
+                    let generator = shuttle_rs::adapter::CommandGenerator::from_input(&input);
+                    let outcome = block_on(shuttle_rs::adapter::run_doc2lora(
+                        &store,
+                        &generator,
+                        &env.cwd,
+                        &env.workspace_id,
+                        &input,
+                    ))?;
+                    output(cli.json, &outcome, || {
+                        format!(
+                            "generated and registered adapter '{}' -> {} (base {})",
+                            outcome.record.name, outcome.record.path, outcome.record.base_model
                         )
                     })?;
                 }

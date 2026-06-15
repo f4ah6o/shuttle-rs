@@ -6,9 +6,13 @@
 //! similarity, produces a deterministic merge plan, and exports a runtime manifest
 //! that external inference engines can consume.
 //!
-//! This is intentionally **not** Code2LoRA: Shuttle never generates adapter weights
-//! and never runs model inference. It only routes to adapters that already exist.
+//! Routing is intentionally inference-free: Shuttle scores and exports adapters
+//! without running a model. The [`doc2lora`] bridge is the one place Shuttle drives
+//! adapter *generation*, and it does so by delegating to an external doc-to-lora
+//! runner — Shuttle assembles the context document and registers the result, but
+//! still never runs model inference itself.
 
+pub mod doc2lora;
 pub mod embedding;
 pub mod export;
 pub mod merge;
@@ -24,6 +28,10 @@ use serde_json::Value;
 use crate::core::Result;
 use crate::store::SqliteEventStore;
 
+pub use doc2lora::{
+    build_context_document, run_doc2lora, CommandGenerator, ContextDocument, Doc2LoraInput,
+    Doc2LoraOutcome, GenerationRequest, GenerationResult, Generator,
+};
 pub use embedding::{build_project_embedding, classify_project_type, ProjectEmbedding};
 pub use export::{export_manifest, ExportEntry, ExportFormat, ExportManifest};
 pub use merge::{merge_plan, MergeEntry, MergePlan};
