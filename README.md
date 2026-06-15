@@ -176,8 +176,10 @@ log.
 
 For web chat clients that should use one MCP server across several local
 repositories, run `shuttle-gateway`. The gateway is the MCP, auth, and project
-routing boundary. Each project can execute locally with `stl --json ...`, or it
-can point at a repo-local `stl app serve` process over HTTP.
+routing boundary. Each local project runs in-process against its
+`.shuttle/shuttle.db` — the gateway is standalone and needs no separate `stl`
+binary — or a project can point at a repo-local `stl app serve` process over
+HTTP.
 
 The remote deployment model is:
 
@@ -209,10 +211,11 @@ shuttle-gateway version
 stl --json version
 ```
 
-Use `--stl /path/to/stl` to choose the CLI binary for local backends, and
-`--timeout <seconds>` to set local subprocess and HTTP backend timeouts.
-`--addr` can override a single-listener config, but a config with multiple
-`[[listeners]]` owns its listener addresses.
+Local backends run in-process by default, so no external `stl` binary is
+required. Pass `--stl /path/to/stl` to opt into executing local projects through
+that external binary instead, and `--timeout <seconds>` to set local subprocess
+and HTTP backend timeouts. `--addr` can override a single-listener config, but a
+config with multiple `[[listeners]]` owns its listener addresses.
 
 Listeners separate ingress/auth policy from project backend type. A public Web
 Chat listener should use OAuth, while private LAN/Tailscale/local listeners can
