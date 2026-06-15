@@ -369,8 +369,8 @@ selects coding adapters (such as LoRA/PEFT adapters) for the current repository.
 It builds a deterministic project embedding from repository structure, git
 metadata, and the local event log, scores adapters from a local registry by
 cosine similarity, and exports a routing manifest for external inference engines.
-Shuttle never generates adapter weights and never runs inference — it only routes
-to adapters that already exist.
+Routing itself never runs a model — Shuttle only scores and exports adapters that
+already exist.
 
 ```bash
 # Register adapters in the local registry (embeddings are computed from the
@@ -390,6 +390,47 @@ stl adapter export --json    # runtime manifest (base model + adapter paths)
 `merge` and `export` accept `--top-k` and `--min-score` to control how many
 adapters are retained and the minimum similarity required. `export --format`
 currently supports `json`; runtime-specific presets (PEFT, vLLM, MLX) are planned.
+
+### doc-to-lora generation
+
+Beyond routing to existing adapters, Shuttle can generate one from the current
+project's accumulated knowledge by driving an external
+[doc-to-lora](https://github.com/SakanaAI/doc-to-lora) runner. Shuttle assembles a
+context document from repository metadata and the local event log (decisions,
+facts, patterns, observations, bugs, tasks, handoffs, and memories), hands it to
+the runner, and registers the produced adapter so it is immediately routable.
+Shuttle still never runs model inference itself — the external runner performs the
+generation.
+
+```bash
+stl adapter doc2lora \
+  --name project-lora \
+  --base-model Qwen/Qwen2.5-Coder-7B-Instruct \
+  --out-dir ./adapters/project-lora \
+  --tag generated \
+  --focus "adapter routing"   # optional: bias and annotate the context document
+```
+
+Shuttle writes the context document to `<out-dir>/context.md` and invokes the
+runner as:
+
+```text
+<runner> generate --base-model <model> --document <out-dir>/context.md \
+  --output <out-dir> --name <name>
+```
+
+The runner must produce the adapter under `--output` and print a JSON manifest to
+stdout. `path` is required; `base_model` and `name` are optional and fall back to
+the requested values:
+
+```json
+{ "path": "./adapters/project-lora", "base_model": "Qwen/Qwen2.5-Coder-7B-Instruct", "name": "project-lora" }
+```
+
+The runner program is resolved from `--runner`, then the
+`SHUTTLE_DOC2LORA_RUNNER` environment variable, then `doc2lora` on `PATH`. The
+registered adapter is embedded from its source document, so it sits in the same
+space as the project embedding and is selected by `stl adapter select` right away.
 
 ## Acknowledgements
 
