@@ -112,6 +112,11 @@ enum Command {
         #[command(subcommand)]
         command: SkillCommand,
     },
+    /// Project-aware coding adapter routing (LoRA/PEFT selection and export).
+    Adapter {
+        #[command(subcommand)]
+        command: AdapterCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -162,6 +167,51 @@ enum MeshCommand {
 enum IdentityCommand {
     Current,
     Set { agent: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum AdapterCommand {
+    /// Register (or replace) an adapter in the local registry.
+    Register {
+        #[arg(long)]
+        name: String,
+        #[arg(long = "base-model")]
+        base_model: String,
+        #[arg(long)]
+        path: String,
+        #[arg(long)]
+        id: Option<String>,
+        /// Repeatable tag describing the adapter (e.g. --tag rust --tag cli).
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        #[arg(long)]
+        description: Option<String>,
+        /// Externally produced embedding as a JSON array of floats.
+        #[arg(long)]
+        embedding: Option<String>,
+    },
+    /// List registered adapters.
+    List,
+    /// Build (and cache) the project embedding from repo context and event log.
+    Index,
+    /// Select adapters for the current project by similarity.
+    Select,
+    /// Produce a deterministic adapter merge plan.
+    Merge {
+        #[arg(long = "top-k", default_value_t = 3)]
+        top_k: usize,
+        #[arg(long = "min-score", default_value_t = 0.0)]
+        min_score: f32,
+    },
+    /// Export a runtime manifest for external inference engines.
+    Export {
+        #[arg(long = "top-k", default_value_t = 3)]
+        top_k: usize,
+        #[arg(long = "min-score", default_value_t = 0.0)]
+        min_score: f32,
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -749,9 +799,193 @@ fn main() -> Result<()> {
                 }
             }
         },
+        Command::Adapter { command } => {
+            let store = open_store(&env)?;
+            match command {
+                AdapterCommand::Register {
+                    name,
+                    base_model,
+                    path,
+                    id,
+                    tags,
+                    description,
+                    embedding,
+                } => {
+                    let embedding = match embedding {
+                        Some(raw) => Some(
+                            serde_json::from_str::<Vec<f32>>(&raw)
+                                .context("--embedding must be a JSON array of numbers")?,
+                        ),
+                        None => None,
+                    };
+                    let record = shuttle_rs::adapter::register_adapter(
+                        &store,
+                        shuttle_rs::adapter::RegisterInput {
+                            id,
+                            name,
+                            base_model,
+                            path,
+                            tags,
+                            description,
+                            embedding,
+                        },
+                    )?;
+                    let summary = AdapterSummary::from(&record);
+                    output(cli.json, &summary, || {
+                        format!("registered adapter '{}' ({})", summary.name, summary.id)
+                    })?;
+                }
+                AdapterCommand::List => {
+                    let adapters = store.list_adapters()?;
+                    let summaries: Vec<AdapterSummary> =
+                        adapters.iter().map(AdapterSummary::from).collect();
+                    output(cli.json, &summaries, || {
+                        if summaries.is_empty() {
+                            "no adapters registered".to_owned()
+                        } else {
+                            summaries
+                                .iter()
+                                .map(|adapter| {
+                                    format!(
+                                        "{} -> {} ({})",
+                                        adapter.name, adapter.path, adapter.base_model
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        }
+                    })?;
+                }
+                AdapterCommand::Index => {
+                    let embedding = block_on(shuttle_rs::adapter::index_project(
+                        &store,
+                        &env.cwd,
+                        &env.workspace_id,
+                    ))?;
+                    let summary = AdapterIndexOutput::from(&embedding);
+                    output(cli.json, &summary, || {
+                        format!(
+                            "indexed {} ({}) on {} as project type '{}'",
+                            summary.repo, &summary.commit, summary.branch, summary.project_type
+                        )
+                    })?;
+                }
+                AdapterCommand::Select => {
+                    let selection = block_on(shuttle_rs::adapter::select_for_project(
+                        &store,
+                        &env.cwd,
+                        &env.workspace_id,
+                    ))?;
+                    output(cli.json, &selection.result, || {
+                        format!(
+                            "project type '{}', {} adapter(s) scored",
+                            selection.result.project_type,
+                            selection.result.adapters.len()
+                        )
+                    })?;
+                }
+                AdapterCommand::Merge { top_k, min_score } => {
+                    let selection = block_on(shuttle_rs::adapter::select_for_project(
+                        &store,
+                        &env.cwd,
+                        &env.workspace_id,
+                    ))?;
+                    let plan = shuttle_rs::adapter::merge_plan(
+                        &selection.result.adapters,
+                        &selection.adapters,
+                        top_k,
+                        min_score,
+                    );
+                    output(cli.json, &plan, || {
+                        format!("merge plan with {} adapter(s)", plan.adapters.len())
+                    })?;
+                }
+                AdapterCommand::Export {
+                    top_k,
+                    min_score,
+                    format,
+                } => {
+                    let format = format
+                        .parse::<shuttle_rs::adapter::ExportFormat>()
+                        .map_err(|err| anyhow::anyhow!(err))?;
+                    if !format.is_supported() {
+                        anyhow::bail!(
+                            "export format '{format}' is not supported yet (Phase 1 supports 'json')"
+                        );
+                    }
+                    let selection = block_on(shuttle_rs::adapter::select_for_project(
+                        &store,
+                        &env.cwd,
+                        &env.workspace_id,
+                    ))?;
+                    let plan = shuttle_rs::adapter::merge_plan(
+                        &selection.result.adapters,
+                        &selection.adapters,
+                        top_k,
+                        min_score,
+                    );
+                    let manifest = shuttle_rs::adapter::export_manifest(&plan, &selection.adapters);
+                    output(cli.json, &manifest, || {
+                        format!(
+                            "exported manifest with {} adapter(s)",
+                            manifest.adapters.len()
+                        )
+                    })?;
+                }
+            }
+        }
     }
 
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct AdapterSummary {
+    id: String,
+    name: String,
+    base_model: String,
+    path: String,
+    tags: Vec<String>,
+}
+
+impl From<&shuttle_rs::adapter::AdapterRecord> for AdapterSummary {
+    fn from(record: &shuttle_rs::adapter::AdapterRecord) -> Self {
+        let tags = record
+            .metadata
+            .get("tags")
+            .and_then(|value| serde_json::from_value::<Vec<String>>(value.clone()).ok())
+            .unwrap_or_default();
+        Self {
+            id: record.id.clone(),
+            name: record.name.clone(),
+            base_model: record.base_model.clone(),
+            path: record.path.clone(),
+            tags,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct AdapterIndexOutput {
+    repo: String,
+    repo_hash: String,
+    branch: String,
+    commit: String,
+    project_type: String,
+    dim: usize,
+}
+
+impl From<&shuttle_rs::adapter::ProjectEmbedding> for AdapterIndexOutput {
+    fn from(embedding: &shuttle_rs::adapter::ProjectEmbedding) -> Self {
+        Self {
+            repo: embedding.repo.clone(),
+            repo_hash: embedding.repo_hash.clone(),
+            branch: embedding.branch.clone(),
+            commit: embedding.commit.clone(),
+            project_type: embedding.project_type.clone(),
+            dim: embedding.vector.len(),
+        }
+    }
 }
 
 #[derive(Debug)]
