@@ -359,6 +359,35 @@ store has not seen yet. The CLI normalizes imported events to the receiving
 workspace id and records the source workspace in event metadata, which keeps
 synced tasks, handoffs, messages, and memories visible to local commands.
 
+## Adapter router
+
+Shuttle can act as a lightweight, local-first project intelligence layer that
+selects coding adapters (such as LoRA/PEFT adapters) for the current repository.
+It builds a deterministic project embedding from repository structure, git
+metadata, and the local event log, scores adapters from a local registry by
+cosine similarity, and exports a routing manifest for external inference engines.
+Shuttle never generates adapter weights and never runs inference — it only routes
+to adapters that already exist.
+
+```bash
+# Register adapters in the local registry (embeddings are computed from the
+# adapter description, or supplied with --embedding '<json array>').
+stl adapter register --name rust-cli \
+  --base-model Qwen/Qwen2.5-Coder-7B-Instruct \
+  --path /path/to/adapters/rust-cli --tag rust --tag cli
+stl adapter list
+
+# Build the project embedding, inspect the selection, and produce a plan.
+stl adapter index            # build and cache the project embedding
+stl adapter select --json    # ranked adapters + detected project type
+stl adapter merge --json     # deterministic weights that sum to 1.0
+stl adapter export --json    # runtime manifest (base model + adapter paths)
+```
+
+`merge` and `export` accept `--top-k` and `--min-score` to control how many
+adapters are retained and the minimum similarity required. `export --format`
+currently supports `json`; runtime-specific presets (PEFT, vLLM, MLX) are planned.
+
 ## Acknowledgements
 
 Shuttle is inspired by [kioku-mesh](https://github.com/h-wata/kioku-mesh), a
