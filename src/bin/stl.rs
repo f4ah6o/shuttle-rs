@@ -292,7 +292,11 @@ impl MemoryKindArg {
 }
 
 fn main() -> Result<()> {
+    let _telemetry = shuttle_rs::telemetry::init("stl");
     let cli = Cli::parse();
+    let command_name = cli.command.name();
+    let _command_span =
+        tracing::info_span!("stl.command", command = command_name, json = cli.json).entered();
     if matches!(cli.command, Command::ShowVersion) {
         output(
             cli.json,
@@ -989,6 +993,34 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+impl Command {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::ShowVersion => "version",
+            Self::Init => "init",
+            Self::Send { .. } => "send",
+            Self::Inbox { .. } => "inbox",
+            Self::History => "history",
+            Self::Identity { .. } => "identity",
+            Self::Remember { .. } => "remember",
+            Self::Recall { .. } => "recall",
+            Self::Memories => "memories",
+            Self::Decide { .. } => "decide",
+            Self::Observe { .. } => "observe",
+            Self::Pattern { .. } => "pattern",
+            Self::Fact { .. } => "fact",
+            Self::Bug { .. } => "bug",
+            Self::Task { .. } => "task",
+            Self::Handoff { .. } => "handoff",
+            Self::Mesh { .. } => "mesh",
+            Self::Context { .. } => "context",
+            Self::App { .. } => "app",
+            Self::Skill { .. } => "skill",
+            Self::Adapter { .. } => "adapter",
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]

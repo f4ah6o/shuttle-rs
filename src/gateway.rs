@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::process::Command;
 use toml_edit::{value, DocumentMut, Item, Table};
+use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::context;
@@ -397,6 +398,7 @@ pub fn router(runtime: GatewayRuntime) -> Router {
             get(oauth_authorize_page).post(oauth_authorize_submit),
         )
         .route("/oauth/token", post(oauth_token))
+        .layer(TraceLayer::new_for_http())
         .with_state(runtime)
 }
 
@@ -935,8 +937,8 @@ fn load_or_create_workspace_id(shuttle_dir: &Path, root: &Path) -> Result<String
         repo_path: root.display().to_string(),
         created_at: Utc::now(),
     };
-    let serialized =
-        serde_json::to_string_pretty(&workspace).map_err(|err| ShuttleError::Serialization(err.to_string()))?;
+    let serialized = serde_json::to_string_pretty(&workspace)
+        .map_err(|err| ShuttleError::Serialization(err.to_string()))?;
     fs::write(&path, serialized).map_err(|err| ShuttleError::Store(err.to_string()))?;
     Ok(workspace.workspace_id)
 }
@@ -970,7 +972,8 @@ fn load_or_create_session_id(shuttle_dir: &Path) -> Result<String> {
     }
     fs::create_dir_all(shuttle_dir).map_err(|err| ShuttleError::Store(err.to_string()))?;
     let session_id = Uuid::new_v4().to_string();
-    fs::write(&path, format!("{session_id}\n")).map_err(|err| ShuttleError::Store(err.to_string()))?;
+    fs::write(&path, format!("{session_id}\n"))
+        .map_err(|err| ShuttleError::Store(err.to_string()))?;
     Ok(session_id)
 }
 

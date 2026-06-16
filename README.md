@@ -172,6 +172,31 @@ repository status, changed-file, and diff tools. Tool aliases such as `remember`
 and namespaced tools such as `shuttle_memory_store` call the same local event
 log.
 
+## Telemetry
+
+Shuttle emits `tracing` diagnostics to stderr, preserving stdout for normal CLI
+and `--json` output. Set `RUST_LOG` to control local log verbosity:
+
+```bash
+RUST_LOG=info,shuttle_rs=debug stl context
+```
+
+OpenTelemetry trace export is disabled by default. Enable OTLP export by setting
+`SHUTTLE_OTEL=1` or an OTLP endpoint before running `stl`, `stl app serve`, or
+`shuttle-gateway`:
+
+```bash
+SHUTTLE_OTEL=1 \
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+OTEL_SERVICE_NAME=stl \
+RUST_LOG=info,shuttle_rs=debug \
+stl app serve --addr 127.0.0.1:8787
+```
+
+HTTP app and gateway requests are traced automatically. Shuttle records command
+and request metadata, but avoids recording memory contents, message bodies,
+OAuth tokens, bearer tokens, or request bodies as span attributes.
+
 ## Multi-project Gateway
 
 For web chat clients that should use one MCP server across several local

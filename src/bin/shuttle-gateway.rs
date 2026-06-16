@@ -31,7 +31,11 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    let _telemetry = shuttle_rs::telemetry::init("shuttle-gateway");
     let cli = Cli::parse();
+    let command_name = cli.command.name();
+    let _command_span =
+        tracing::info_span!("shuttle_gateway.command", command = command_name).entered();
     match cli.command {
         Command::ShowVersion => {
             println!("{}", env!("CARGO_PKG_VERSION"));
@@ -63,4 +67,13 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+impl Command {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::ShowVersion => "version",
+            Self::Serve { .. } => "serve",
+        }
+    }
 }
