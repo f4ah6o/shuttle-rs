@@ -12,6 +12,7 @@ use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -86,6 +87,7 @@ pub fn router(runtime: AppRuntime) -> Router {
             get(oauth_authorize_page).post(oauth_authorize_submit),
         )
         .route("/oauth/token", post(oauth_token))
+        .layer(TraceLayer::new_for_http())
         .with_state(runtime)
 }
 
