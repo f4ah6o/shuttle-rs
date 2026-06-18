@@ -1,8 +1,8 @@
 import type { Database } from "./database.js";
 import type { Env } from "./env.js";
-import { forbidden, unauthorized } from "./errors.js";
+import { forbidden, notFound, unauthorized } from "./errors.js";
 import { mintToken, nowIso, sha256Hex } from "./ids.js";
-import { ensureOwner } from "./repository.js";
+import { ensureOwner, findProject } from "./repository.js";
 import type { Project } from "./types.js";
 
 export type Scope = "read" | "write" | "admin";
@@ -85,26 +85,73 @@ export async function authenticate(
 }
 
 /** Require that the principal holds `scope` over the whole account. */
-export function requireAccountScope(principal: Principal, scope: Scope): void {
-  if (!principal.scopes.has(scope) && !principal.scopes.has("admin")) {
+function hasScope(principal: Principal, scope: Scope): boolean {
+  return principal.scopes.has(scope) || principal.scopes.has("admin");
+}
+
+// Branded capability tokens. The brand symbols are module-private, so an
+// AuthorizedProject/AuthorizedAccount can only be produced by the authorize
+// functions below — never fabricated by a caller. Service entry points accept
+// these instead of a raw project_id, which makes it impossible to reach the
+// repository without having passed authorization first.
+const projectBrand: unique symbol = Symbol("authorized-project");
+const accountBrand: unique symbol = Symbol("authorized-account");
+
+/** Proof that the caller is authorized for `scope` on a specific project. */
+export interface AuthorizedProject<S extends Scope = Scope> {
+  readonly project: Project;
+  readonly principal: Principal;
+  readonly scope: S;
+  readonly [projectBrand]: true;
+}
+
+/** Proof that the caller holds `scope` across the whole account. */
+export interface AuthorizedAccount<S extends Scope = Scope> {
+  readonly principal: Principal;
+  readonly scope: S;
+  readonly [accountBrand]: true;
+}
+
+/** Require that the principal holds `scope` over the whole account. */
+export function authorizeAccount<S extends Scope>(
+  principal: Principal,
+  scope: S,
+): AuthorizedAccount<S> {
+  if (!hasScope(principal, scope)) {
     throw forbidden(`missing ${scope} scope`);
   }
   if (principal.projectId) {
     throw forbidden("token is limited to a single project");
   }
+  return { principal, scope, [accountBrand]: true };
 }
 
-/** Authorize the principal for `scope` on a specific project. */
-export function authorizeProject(principal: Principal, project: Project, scope: Scope): void {
+/**
+ * Resolve a project by id or slug and authorize the principal for `scope` on
+ * it in one step. This is the only way to obtain an AuthorizedProject, so every
+ * transport (HTTP, MCP, future CLI/workers) shares one authorization contract.
+ */
+export async function authorize<S extends Scope>(
+  db: Database,
+  principal: Principal,
+  selector: string,
+  scope: S,
+): Promise<AuthorizedProject<S>> {
+  const trimmed = (selector ?? "").trim();
+  if (!trimmed) throw forbidden("project is required");
+  const project = await findProject(db, principal.ownerId, trimmed);
+  if (!project) throw notFound(`unknown project ${JSON.stringify(trimmed)}`);
+
   if (principal.ownerId !== project.owner_id) {
     throw forbidden("project belongs to a different owner");
   }
   if (principal.projectId && principal.projectId !== project.id) {
     throw forbidden("token is not scoped to this project");
   }
-  if (!principal.scopes.has(scope) && !principal.scopes.has("admin")) {
+  if (!hasScope(principal, scope)) {
     throw forbidden(`missing ${scope} scope`);
   }
+  return { project, principal, scope, [projectBrand]: true };
 }
 
 export interface MintedToken {

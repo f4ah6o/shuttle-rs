@@ -22,6 +22,13 @@ Git.
 - **Per-request project selection.** Every MCP tool and API endpoint resolves an
   explicit project and authorizes it per request. There is no process-global
   "current project", so one client's selection cannot affect another's.
+- **Authorization is a type-level boundary.** Project-scoped services accept an
+  `AuthorizedProject` (and writes an `AuthorizedProject<"write">`), never a raw
+  `project_id`. The only way to obtain one is `authorize(db, principal, selector,
+  scope)`, which resolves and authorizes in one step. A new endpoint therefore
+  cannot reach the repository without passing authorization, and a read-only
+  capability won't type-check against a write service. Repository methods stay
+  free of authorization logic.
 - **Canonical identity `(project_id, event_id)`.** A client-supplied event id is
   project-scoped, not globally unique. Replaying an id within a project is a
   no-op that reports `deduplicated: true`, while the same id in another project

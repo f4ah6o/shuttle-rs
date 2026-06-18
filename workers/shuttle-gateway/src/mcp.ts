@@ -1,4 +1,4 @@
-import { authorizeProject, requireAccountScope, type Principal } from "./auth.js";
+import { authorize, authorizeAccount, type Principal } from "./auth.js";
 import type { Database } from "./database.js";
 import { badRequest } from "./errors.js";
 import {
@@ -11,7 +11,6 @@ import {
   publishSnapshotService,
   recallService,
   rememberService,
-  resolveProject,
   updateTaskService,
 } from "./services.js";
 import type { ContextEnvelope } from "./types.js";
@@ -171,22 +170,17 @@ async function callTool(
   const { db, principal } = ctx;
 
   // Every project operation resolves an explicit project and authorizes it per
-  // request. There is no process-global "current project", so one client's
-  // selection can never affect another's reads or writes.
-  const withProject = async (scope: "read" | "write") => {
-    const project = await resolveProject(db, principal.ownerId, str(args, "project"));
-    authorizeProject(principal, project, scope);
-    return project;
-  };
+  // request via `authorize`. There is no process-global "current project", so
+  // one client's selection can never affect another's reads or writes.
+  const forProject = <S extends "read" | "write">(scope: S) =>
+    authorize(db, principal, str(args, "project"), scope);
 
   switch (name) {
     case "shuttle_projects": {
-      requireAccountScope(principal, "read");
-      return { projects: await listProjectsService(db, principal.ownerId) };
+      return { projects: await listProjectsService(db, authorizeAccount(principal, "read")) };
     }
     case "shuttle_project_create": {
-      requireAccountScope(principal, "admin");
-      return createProjectService(db, principal.ownerId, {
+      return createProjectService(db, authorizeAccount(principal, "admin"), {
         slug: str(args, "slug"),
         display_name: optStr(args, "display_name"),
         description: optStr(args, "description"),
@@ -194,48 +188,46 @@ async function callTool(
       });
     }
     case "shuttle_remember": {
-      const project = await withProject("write");
-      return rememberService(db, project, {
+      return rememberService(db, await forProject("write"), {
         kind: optStr(args, "kind"),
         text: str(args, "text"),
         context: envelope(args),
       });
     }
     case "shuttle_recall": {
-      const project = await withProject("read");
-      return { results: await recallService(db, project, str(args, "query")) };
+      return { results: await recallService(db, await forProject("read"), str(args, "query")) };
     }
     case "shuttle_context": {
-      const project = await withProject("read");
-      return { snapshot: await latestSnapshotService(db, project) };
+      return { snapshot: await latestSnapshotService(db, await forProject("read")) };
     }
     case "shuttle_context_publish": {
-      const project = await withProject("write");
-      return publishSnapshotService(db, project, {
+      return publishSnapshotService(db, await forProject("write"), {
         workspace_id: envelope(args)?.workspace_id ?? null,
         agent: envelope(args)?.agent ?? null,
         content: args.content,
       });
     }
     case "shuttle_task_create": {
-      const project = await withProject("write");
-      return createTaskService(db, project, {
+      return createTaskService(db, await forProject("write"), {
         title: str(args, "title"),
         body: optStr(args, "body"),
         context: envelope(args),
       });
     }
     case "shuttle_task_list": {
-      const project = await withProject("read");
-      return { tasks: await listTasksService(db, project) };
+      return { tasks: await listTasksService(db, await forProject("read")) };
     }
     case "shuttle_task_update": {
-      const project = await withProject("write");
-      return updateTaskService(db, project, str(args, "task_id"), str(args, "text"), envelope(args));
+      return updateTaskService(
+        db,
+        await forProject("write"),
+        str(args, "task_id"),
+        str(args, "text"),
+        envelope(args),
+      );
     }
     case "shuttle_task_done": {
-      const project = await withProject("write");
-      return completeTaskService(db, project, str(args, "task_id"), envelope(args));
+      return completeTaskService(db, await forProject("write"), str(args, "task_id"), envelope(args));
     }
     default:
       throw badRequest(`unknown tool: ${name}`);

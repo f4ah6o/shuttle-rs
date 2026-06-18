@@ -1,3 +1,4 @@
+import type { AuthorizedAccount, AuthorizedProject } from "./auth.js";
 import type { Database } from "./database.js";
 import { badRequest, notFound } from "./errors.js";
 import { newId, normalizeSlug } from "./ids.js";
@@ -41,19 +42,9 @@ function requireNonEmpty(value: string | undefined | null, message: string): str
   return trimmed;
 }
 
-export async function resolveProject(
-  db: Database,
-  ownerId: string,
-  selector: string,
-): Promise<Project> {
-  const project = await findProject(db, ownerId, requireNonEmpty(selector, "project is required"));
-  if (!project) throw notFound(`unknown project ${JSON.stringify(selector)}`);
-  return project;
-}
-
 export async function createProjectService(
   db: Database,
-  ownerId: string,
+  account: AuthorizedAccount<"admin">,
   input: {
     slug: string;
     display_name?: string | null;
@@ -61,6 +52,7 @@ export async function createProjectService(
     canonical_git_remote?: string | null;
   },
 ): Promise<Project> {
+  const ownerId = account.principal.ownerId;
   const slug = normalizeSlug(requireNonEmpty(input.slug, "slug is required"));
   if (await findProject(db, ownerId, slug)) {
     throw badRequest(`project ${JSON.stringify(slug)} already exists`);
@@ -74,17 +66,17 @@ export async function createProjectService(
   });
 }
 
-export function listProjectsService(db: Database, ownerId: string): Promise<Project[]> {
-  return listProjects(db, ownerId);
+export function listProjectsService(db: Database, account: AuthorizedAccount): Promise<Project[]> {
+  return listProjects(db, account.principal.ownerId);
 }
 
 export function createWorkspaceService(
   db: Database,
-  project: Project,
+  authorized: AuthorizedProject<"write">,
   input: { client_instance_id: string; local_path_hint?: string | null },
 ): Promise<Workspace> {
   requireNonEmpty(input.client_instance_id, "client_instance_id is required");
-  return createWorkspace(db, project.id, input);
+  return createWorkspace(db, authorized.project.id, input);
 }
 
 function normalizeEventType(value: string): EventType {
@@ -96,7 +88,7 @@ function normalizeEventType(value: string): EventType {
 
 export function appendEventService(
   db: Database,
-  project: Project,
+  authorized: AuthorizedProject<"write">,
   input: {
     event_id?: string | null;
     event_type: string;
@@ -110,7 +102,7 @@ export function appendEventService(
   },
 ): Promise<AppendResult> {
   requireNonEmpty(input.content, "content is required");
-  return appendEvent(db, project.id, {
+  return appendEvent(db, authorized.project.id, {
     event_id: input.event_id ?? null,
     event_type: normalizeEventType(input.event_type),
     agent: (input.agent ?? "").trim() || "unknown",
@@ -125,13 +117,13 @@ export function appendEventService(
 
 export function rememberService(
   db: Database,
-  project: Project,
+  authorized: AuthorizedProject<"write">,
   input: { kind?: string | null; text: string; context?: ContextEnvelope | null },
 ): Promise<AppendResult> {
   const kind = (input.kind ?? "").trim();
   const eventType = MEMORY_KIND_TO_TYPE[kind];
   if (!eventType) throw badRequest(`unknown memory kind ${JSON.stringify(kind)}`);
-  return appendEventService(db, project, {
+  return appendEventService(db, authorized, {
     event_type: eventType,
     agent: input.context?.agent ?? "unknown",
     session_id: input.context?.session_id ?? "",
@@ -143,10 +135,10 @@ export function rememberService(
 
 export function listEventsService(
   db: Database,
-  project: Project,
+  authorized: AuthorizedProject,
   options: { eventType?: EventType; limit?: number } = {},
 ): Promise<Event[]> {
-  return listEvents(db, project.id, options);
+  return listEvents(db, authorized.project.id, options);
 }
 
 function tokenize(query: string): string[] {
@@ -158,12 +150,12 @@ function tokenize(query: string): string[] {
 
 export async function recallService(
   db: Database,
-  project: Project,
+  authorized: AuthorizedProject,
   query: string,
   limit = 20,
 ): Promise<RecallResult[]> {
   requireNonEmpty(query, "query is required");
-  const events = await listEvents(db, project.id, {
+  const events = await listEvents(db, authorized.project.id, {
     eventTypes: memoryEventTypes(),
     limit: 200,
   });
@@ -185,14 +177,14 @@ export async function recallService(
 
 export async function createTaskService(
   db: Database,
-  project: Project,
+  authorized: AuthorizedProject<"write">,
   input: { title: string; body?: string | null; context?: ContextEnvelope | null },
 ): Promise<{ task_id: string; result: AppendResult }> {
   const title = requireNonEmpty(input.title, "title is required");
   const body = (input.body ?? "").trim();
   const content = body ? `${title}\n\n${body}` : title;
   const taskId = newId();
-  const result = await appendEventService(db, project, {
+  const result = await appendEventService(db, authorized, {
     event_type: "task",
     agent: input.context?.agent ?? "unknown",
     session_id: input.context?.session_id ?? "",
@@ -204,24 +196,28 @@ export async function createTaskService(
   return { task_id: taskId, result };
 }
 
-async function findTaskEvents(db: Database, project: Project, taskId: string): Promise<Event[]> {
-  const events = await listEvents(db, project.id, { eventType: "task", limit: 500 });
+async function findTaskEvents(
+  db: Database,
+  authorized: AuthorizedProject,
+  taskId: string,
+): Promise<Event[]> {
+  const events = await listEvents(db, authorized.project.id, { eventType: "task", limit: 500 });
   return events.filter((event) => (event.metadata_json as { task_id?: string }).task_id === taskId);
 }
 
 export async function updateTaskService(
   db: Database,
-  project: Project,
+  authorized: AuthorizedProject<"write">,
   taskId: string,
   text: string,
   context?: ContextEnvelope | null,
 ): Promise<AppendResult> {
   requireNonEmpty(taskId, "task_id is required");
   const text_ = requireNonEmpty(text, "text is required");
-  if ((await findTaskEvents(db, project, taskId)).length === 0) {
+  if ((await findTaskEvents(db, authorized, taskId)).length === 0) {
     throw notFound(`unknown task ${JSON.stringify(taskId)}`);
   }
-  return appendEventService(db, project, {
+  return appendEventService(db, authorized, {
     event_type: "task",
     agent: context?.agent ?? "unknown",
     session_id: context?.session_id ?? "",
@@ -233,15 +229,15 @@ export async function updateTaskService(
 
 export async function completeTaskService(
   db: Database,
-  project: Project,
+  authorized: AuthorizedProject<"write">,
   taskId: string,
   context?: ContextEnvelope | null,
 ): Promise<AppendResult> {
   requireNonEmpty(taskId, "task_id is required");
-  if ((await findTaskEvents(db, project, taskId)).length === 0) {
+  if ((await findTaskEvents(db, authorized, taskId)).length === 0) {
     throw notFound(`unknown task ${JSON.stringify(taskId)}`);
   }
-  return appendEventService(db, project, {
+  return appendEventService(db, authorized, {
     event_type: "task",
     agent: context?.agent ?? "unknown",
     session_id: context?.session_id ?? "",
@@ -251,8 +247,11 @@ export async function completeTaskService(
   });
 }
 
-export async function listTasksService(db: Database, project: Project): Promise<TaskSummary[]> {
-  const events = await listEvents(db, project.id, { eventType: "task", limit: 500 });
+export async function listTasksService(
+  db: Database,
+  authorized: AuthorizedProject,
+): Promise<TaskSummary[]> {
+  const events = await listEvents(db, authorized.project.id, { eventType: "task", limit: 500 });
   const byTask = new Map<string, Event[]>();
   for (const event of events) {
     const taskId = (event.metadata_json as { task_id?: string }).task_id;
@@ -282,18 +281,18 @@ export async function listTasksService(db: Database, project: Project): Promise<
 
 export function publishSnapshotService(
   db: Database,
-  project: Project,
+  authorized: AuthorizedProject<"write">,
   input: { workspace_id?: string | null; agent?: string | null; content: unknown },
 ): Promise<ContextSnapshot> {
   if (input.content === undefined || input.content === null) {
     throw badRequest("content is required");
   }
-  return publishSnapshot(db, project.id, input);
+  return publishSnapshot(db, authorized.project.id, input);
 }
 
 export function latestSnapshotService(
   db: Database,
-  project: Project,
+  authorized: AuthorizedProject,
 ): Promise<ContextSnapshot | null> {
-  return latestSnapshot(db, project.id);
+  return latestSnapshot(db, authorized.project.id);
 }

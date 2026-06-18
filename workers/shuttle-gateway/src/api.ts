@@ -1,7 +1,7 @@
 import {
-  authorizeProject,
+  authorize,
+  authorizeAccount,
   mintGrant,
-  requireAccountScope,
   type Principal,
   type Scope,
 } from "./auth.js";
@@ -17,7 +17,6 @@ import {
   listProjectsService,
   publishSnapshotService,
   recallService,
-  resolveProject,
 } from "./services.js";
 import type { ContextEnvelope, EventType } from "./types.js";
 
@@ -36,7 +35,9 @@ function scopeList(value: unknown): Scope[] {
 
 /**
  * Resource-oriented API. MCP tools and these endpoints call the same
- * application services, so neither one is a privileged path.
+ * application services, so neither one is a privileged path. Every project
+ * operation goes through `authorize`, which is the only way to obtain the
+ * AuthorizedProject the services require.
  */
 export async function handleApi(
   request: Request,
@@ -48,14 +49,14 @@ export async function handleApi(
 
   // /api/tokens — mint scoped personal access tokens (admin).
   if (segments.length === 1 && segments[0] === "tokens" && method === "POST") {
-    requireAccountScope(principal, "admin");
+    const account = authorizeAccount(principal, "admin");
     const body = await readJson(request);
     let projectId: string | null = null;
     if (typeof body.project === "string" && body.project.trim()) {
-      projectId = (await resolveProject(db, principal.ownerId, body.project)).id;
+      projectId = (await authorize(db, principal, body.project, "admin")).project.id;
     }
     const minted = await mintGrant(db, {
-      owner_id: principal.ownerId,
+      owner_id: account.principal.ownerId,
       project_id: projectId,
       scopes: scopeList(body.scopes),
       label: typeof body.label === "string" ? body.label : null,
@@ -66,12 +67,13 @@ export async function handleApi(
   // /api/projects
   if (segments.length === 1 && segments[0] === "projects") {
     if (method === "GET") {
-      return json({ projects: await listProjectsService(db, principal.ownerId) });
+      const account = authorizeAccount(principal, "read");
+      return json({ projects: await listProjectsService(db, account) });
     }
     if (method === "POST") {
-      requireAccountScope(principal, "admin");
+      const account = authorizeAccount(principal, "admin");
       const body = await readJson(request);
-      const project = await createProjectService(db, principal.ownerId, {
+      const project = await createProjectService(db, account, {
         slug: String(body.slug ?? ""),
         display_name: typeof body.display_name === "string" ? body.display_name : null,
         description: typeof body.description === "string" ? body.description : null,
@@ -85,15 +87,12 @@ export async function handleApi(
   // /api/projects/:project/...
   if (segments.length >= 3 && segments[0] === "projects") {
     const selector = decodeURIComponent(segments[1]);
-    const project = await resolveProject(db, principal.ownerId, selector);
     const tail = segments.slice(2);
-    const writeScope: Scope = "write";
-    const readScope: Scope = "read";
 
     if (tail.length === 1 && tail[0] === "workspaces" && method === "POST") {
-      authorizeProject(principal, project, writeScope);
+      const authorized = await authorize(db, principal, selector, "write");
       const body = await readJson(request);
-      const workspace = await createWorkspaceService(db, project, {
+      const workspace = await createWorkspaceService(db, authorized, {
         client_instance_id: String(body.client_instance_id ?? ""),
         local_path_hint: typeof body.local_path_hint === "string" ? body.local_path_hint : null,
       });
@@ -102,9 +101,9 @@ export async function handleApi(
 
     if (tail.length === 1 && tail[0] === "events") {
       if (method === "POST") {
-        authorizeProject(principal, project, writeScope);
+        const authorized = await authorize(db, principal, selector, "write");
         const body = await readJson(request);
-        const result = await appendEventService(db, project, {
+        const result = await appendEventService(db, authorized, {
           event_id: typeof body.event_id === "string" ? body.event_id : null,
           event_type: String(body.event_type ?? ""),
           agent: String(body.agent ?? ""),
@@ -118,11 +117,11 @@ export async function handleApi(
         return json(result, result.deduplicated ? 200 : 201);
       }
       if (method === "GET") {
-        authorizeProject(principal, project, readScope);
+        const authorized = await authorize(db, principal, selector, "read");
         const url = new URL(request.url);
         const typeParam = url.searchParams.get("event_type");
         const limit = Number(url.searchParams.get("limit") ?? "50");
-        const events = await listEventsService(db, project, {
+        const events = await listEventsService(db, authorized, {
           eventType: (typeParam as EventType) ?? undefined,
           limit: Number.isFinite(limit) ? limit : 50,
         });
@@ -131,17 +130,17 @@ export async function handleApi(
     }
 
     if (tail.length === 1 && tail[0] === "recall" && method === "POST") {
-      authorizeProject(principal, project, readScope);
+      const authorized = await authorize(db, principal, selector, "read");
       const body = await readJson(request);
-      const results = await recallService(db, project, String(body.query ?? ""));
+      const results = await recallService(db, authorized, String(body.query ?? ""));
       return json({ results });
     }
 
     if (tail[0] === "context-snapshots") {
       if (tail.length === 1 && method === "POST") {
-        authorizeProject(principal, project, writeScope);
+        const authorized = await authorize(db, principal, selector, "write");
         const body = await readJson(request);
-        const snapshot = await publishSnapshotService(db, project, {
+        const snapshot = await publishSnapshotService(db, authorized, {
           workspace_id: typeof body.workspace_id === "string" ? body.workspace_id : null,
           agent: typeof body.agent === "string" ? body.agent : null,
           content: body.content,
@@ -149,8 +148,8 @@ export async function handleApi(
         return json(snapshot, 201);
       }
       if (tail.length === 2 && tail[1] === "latest" && method === "GET") {
-        authorizeProject(principal, project, readScope);
-        const snapshot = await latestSnapshotService(db, project);
+        const authorized = await authorize(db, principal, selector, "read");
+        const snapshot = await latestSnapshotService(db, authorized);
         if (!snapshot) throw notFound("no context snapshot published");
         return json(snapshot);
       }
