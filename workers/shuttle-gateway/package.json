@@ -1,0 +1,22 @@
+{
+  "name": "shuttle-gateway-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloud-hosted Shuttle gateway: stateless MCP + resource API over Cloudflare Workers and D1.",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "migrate:local": "wrangler d1 migrations apply shuttle --local",
+    "migrate:remote": "wrangler d1 migrations apply shuttle --remote"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240909.0",
+    "@types/node": "^22.19.21",
+    "typescript": "^5.5.4",
+    "vitest": "^2.0.5",
+    "wrangler": "^3.78.0"
+  }
+}
