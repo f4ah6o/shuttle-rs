@@ -30,10 +30,12 @@ CREATE TABLE workspaces (
   FOREIGN KEY (project_id) REFERENCES projects(id)
 );
 
--- Append-only shared event log. The event id is the primary key so imports
--- and offline retries are idempotent: replaying an id is a no-op.
+-- Append-only shared event log. Canonical identity is (project_id, id): the
+-- client-supplied event id is project-scoped, never globally unique. This keeps
+-- replays/imports idempotent within a project while making cross-project
+-- collisions impossible and future export/import/sharding straightforward.
 CREATE TABLE events (
-  id TEXT PRIMARY KEY,
+  id TEXT NOT NULL,
   project_id TEXT NOT NULL,
   workspace_id TEXT,
   event_type TEXT NOT NULL,
@@ -47,6 +49,7 @@ CREATE TABLE events (
   repo_dirty INTEGER,
   metadata_json TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL,
+  PRIMARY KEY (project_id, id),
   FOREIGN KEY (project_id) REFERENCES projects(id)
 );
 
@@ -54,10 +57,11 @@ CREATE INDEX idx_events_project_created ON events(project_id, created_at);
 CREATE INDEX idx_events_project_type_created ON events(project_id, event_type, created_at);
 
 CREATE TABLE event_tags (
+  project_id TEXT NOT NULL,
   event_id TEXT NOT NULL,
   tag TEXT NOT NULL,
-  PRIMARY KEY (event_id, tag),
-  FOREIGN KEY (event_id) REFERENCES events(id)
+  PRIMARY KEY (project_id, event_id, tag),
+  FOREIGN KEY (project_id, event_id) REFERENCES events(project_id, id)
 );
 
 CREATE INDEX idx_event_tags_tag ON event_tags(tag);

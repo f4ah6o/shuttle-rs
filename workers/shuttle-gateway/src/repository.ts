@@ -137,17 +137,21 @@ export async function createWorkspace(
   return workspace;
 }
 
-async function loadTags(db: Database, eventId: string): Promise<string[]> {
-  const rows = await db.query("SELECT tag FROM event_tags WHERE event_id = ? ORDER BY tag", [
-    eventId,
-  ]);
+async function loadTags(db: Database, projectId: string, eventId: string): Promise<string[]> {
+  const rows = await db.query(
+    "SELECT tag FROM event_tags WHERE project_id = ? AND event_id = ? ORDER BY tag",
+    [projectId, eventId],
+  );
   return rows.map((row) => String(row.tag));
 }
 
-async function getEvent(db: Database, eventId: string): Promise<Event | null> {
-  const row = await db.first("SELECT * FROM events WHERE id = ?", [eventId]);
+async function getEvent(db: Database, projectId: string, eventId: string): Promise<Event | null> {
+  const row = await db.first("SELECT * FROM events WHERE project_id = ? AND id = ?", [
+    projectId,
+    eventId,
+  ]);
   if (!row) return null;
-  return rowToEvent(row, await loadTags(db, eventId));
+  return rowToEvent(row, await loadTags(db, projectId, eventId));
 }
 
 /**
@@ -161,7 +165,9 @@ export async function appendEvent(
 ): Promise<AppendResult> {
   const id = (input.event_id && input.event_id.trim()) || newId();
 
-  const existing = await getEvent(db, id);
+  // Dedupe is scoped to the project: the same client event id in two different
+  // projects is two distinct events, never a cross-project hit.
+  const existing = await getEvent(db, projectId, id);
   if (existing) {
     return { event: existing, deduplicated: true };
   }
@@ -221,8 +227,8 @@ export async function appendEvent(
       ],
     },
     ...tags.map((tag) => ({
-      sql: "INSERT OR IGNORE INTO event_tags (event_id, tag) VALUES (?, ?)",
-      params: [event.id, tag],
+      sql: "INSERT OR IGNORE INTO event_tags (project_id, event_id, tag) VALUES (?, ?, ?)",
+      params: [event.project_id, event.id, tag],
     })),
   ];
 
@@ -260,7 +266,7 @@ export async function listEvents(
   );
   const events: Event[] = [];
   for (const row of rows) {
-    events.push(rowToEvent(row, await loadTags(db, String(row.id))));
+    events.push(rowToEvent(row, await loadTags(db, projectId, String(row.id))));
   }
   return events;
 }

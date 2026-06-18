@@ -81,6 +81,43 @@ describe("application services", () => {
     expect(replay.event.id).toBe(first.event.id);
   });
 
+  it("treats the same client event id in two projects as distinct events", async () => {
+    const alpha = await createProjectService(db, OWNER, { slug: "alpha" });
+    const beta = await createProjectService(db, OWNER, { slug: "beta" });
+
+    const inAlpha = await appendEventService(db, alpha, {
+      event_id: "shared-id",
+      event_type: "memory",
+      agent: "codex",
+      session_id: "s",
+      content: "alpha content",
+    });
+    const inBeta = await appendEventService(db, beta, {
+      event_id: "shared-id",
+      event_type: "memory",
+      agent: "codex",
+      session_id: "s",
+      content: "beta content",
+    });
+
+    // Same id, different projects: neither is a dedupe hit and content is
+    // isolated — the dedupe lookup never crosses the project boundary.
+    expect(inAlpha.deduplicated).toBe(false);
+    expect(inBeta.deduplicated).toBe(false);
+    expect(inAlpha.event.content).toBe("alpha content");
+    expect(inBeta.event.content).toBe("beta content");
+
+    const replayBeta = await appendEventService(db, beta, {
+      event_id: "shared-id",
+      event_type: "memory",
+      agent: "codex",
+      session_id: "s",
+      content: "beta content",
+    });
+    expect(replayBeta.deduplicated).toBe(true);
+    expect(replayBeta.event.content).toBe("beta content");
+  });
+
   it("does not leak memory between two projects", async () => {
     const alpha = await createProjectService(db, OWNER, { slug: "alpha" });
     const beta = await createProjectService(db, OWNER, { slug: "beta" });

@@ -84,6 +84,31 @@ describe("resource API", () => {
     expect(cannotCreate.status).toBe(403);
   });
 
+  it("disables the bootstrap token once an admin token is minted", async () => {
+    // The bootstrap token works initially.
+    const created = await call("POST", "/api/projects", { token: ADMIN, body: { slug: "alpha" } });
+    expect(created.status).toBe(201);
+
+    // Mint a persistent admin token using the bootstrap token.
+    const mint = await call("POST", "/api/tokens", { token: ADMIN, body: { scopes: ["admin"] } });
+    expect(mint.status).toBe(201);
+    const { token: adminToken } = (await mint.json()) as { token: string };
+
+    // The bootstrap token is now rejected — it is genuinely one-time.
+    const afterBootstrap = await call("POST", "/api/projects", {
+      token: ADMIN,
+      body: { slug: "beta" },
+    });
+    expect(afterBootstrap.status).toBe(401);
+
+    // The minted admin token continues to work.
+    const withAdmin = await call("POST", "/api/projects", {
+      token: adminToken,
+      body: { slug: "beta" },
+    });
+    expect(withAdmin.status).toBe(201);
+  });
+
   it("publishes and reads the latest context snapshot", async () => {
     await call("POST", "/api/projects", { token: ADMIN, body: { slug: "alpha" } });
     await call("POST", "/api/projects/alpha/context-snapshots", {

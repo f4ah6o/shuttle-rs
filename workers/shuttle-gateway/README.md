@@ -22,10 +22,15 @@ Git.
 - **Per-request project selection.** Every MCP tool and API endpoint resolves an
   explicit project and authorizes it per request. There is no process-global
   "current project", so one client's selection cannot affect another's.
-- **Idempotent events.** Events are keyed by id; replaying an id is a no-op and
-  reports `deduplicated: true`, so retries and imports are safe.
+- **Canonical identity `(project_id, event_id)`.** A client-supplied event id is
+  project-scoped, not globally unique. Replaying an id within a project is a
+  no-op that reports `deduplicated: true`, while the same id in another project
+  is a distinct event — cross-project collisions are impossible. This keeps
+  retries/imports idempotent and future export/import/sharding simple.
 - **Scoped credentials.** Local agents authenticate with scoped personal access
   tokens (`read`/`write`/`admin`), stored as SHA-256 hashes in `project_grants`.
+  The bootstrap admin token is genuinely one-time: it works only until the first
+  admin token is minted, then it is rejected.
 
 ## Endpoints
 
@@ -77,13 +82,21 @@ wrangler secret put ADMIN_BOOTSTRAP_TOKEN
 npm run deploy
 ```
 
-After deploy, use the bootstrap token once to create a project and mint scoped
-tokens:
+After deploy, use the bootstrap token once to mint a persistent admin token.
+Minting an admin token consumes the bootstrap token: it is rejected afterwards,
+so use the new admin token for everything else.
 
 ```bash
+# 1. Mint a persistent admin token with the bootstrap token (one-time).
+curl -sX POST "$URL/api/tokens" -H "authorization: Bearer $BOOTSTRAP" \
+  -H 'content-type: application/json' -d '{"scopes":["admin"]}'
+# -> { "token": "stl_...", "scopes": ["admin"], ... }   save this
+
+# 2. Create a project with the admin token.
 curl -sX POST "$URL/api/projects" -H "authorization: Bearer $ADMIN" \
   -H 'content-type: application/json' -d '{"slug":"my-project"}'
 
+# 3. Mint project-scoped tokens for local agents.
 curl -sX POST "$URL/api/tokens" -H "authorization: Bearer $ADMIN" \
   -H 'content-type: application/json' \
   -d '{"project":"my-project","scopes":["read","write"]}'

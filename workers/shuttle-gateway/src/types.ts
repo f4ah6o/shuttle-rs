@@ -52,7 +52,11 @@ export const EVENT_TYPES = [
 export type EventType = (typeof EVENT_TYPES)[number];
 
 export interface EventInput {
-  /** Optional client-supplied id. Replaying the same id is idempotent. */
+  /**
+   * Optional client-supplied id. Identity is `(project_id, event_id)`, so the
+   * id is project-scoped: replaying it within the same project is idempotent,
+   * and the same id in another project is a distinct event.
+   */
   event_id?: string | null;
   event_type: EventType;
   agent: string;

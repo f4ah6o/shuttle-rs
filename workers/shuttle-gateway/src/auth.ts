@@ -22,10 +22,24 @@ function bearerToken(request: Request): string | null {
   return token.trim();
 }
 
+async function hasAdminGrant(db: Database, ownerId: string): Promise<boolean> {
+  const rows = await db.query("SELECT scopes FROM project_grants WHERE owner_id = ?", [ownerId]);
+  return rows.some((row) =>
+    String(row.scopes)
+      .split(",")
+      .map((scope) => scope.trim())
+      .includes("admin"),
+  );
+}
+
 /**
- * Identify the caller from a bearer token. The bootstrap admin token maps to
- * the configured owner with full scope; all other tokens are scoped personal
- * access tokens stored as SHA-256 hashes in `project_grants`.
+ * Identify the caller from a bearer token.
+ *
+ * The bootstrap admin token is genuinely one-time: it is accepted only until
+ * the first persistent admin token is minted for the owner. After that it is
+ * rejected, so it cannot serve as a permanent admin bearer. All other tokens
+ * are scoped personal access tokens stored as SHA-256 hashes in
+ * `project_grants`.
  */
 export async function authenticate(
   request: Request,
@@ -41,6 +55,11 @@ export async function authenticate(
     const expected = await sha256Hex(env.ADMIN_BOOTSTRAP_TOKEN);
     if (presented === expected) {
       const ownerId = env.ADMIN_OWNER_ID ?? "owner-local";
+      if (await hasAdminGrant(db, ownerId)) {
+        throw unauthorized(
+          "bootstrap token already consumed; an admin token has been minted",
+        );
+      }
       await ensureOwner(db, ownerId);
       return { ownerId, scopes: new Set<Scope>(["read", "write", "admin"]), projectId: null };
     }
