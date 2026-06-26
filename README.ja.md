@@ -293,8 +293,9 @@ OAuth client registration、authorization code、access token は gateway-local 
 に保存されます。backend token と OAuth admin token は secret manager または
 runtime-injected environment variable で渡してください。
 
-standard な `v*` release workflow は、同じ tag から Rust crate と gateway artifact
-を公開します。gateway 専用の release tag は不要です。
+standard な `v*` release workflow は Rust crate を公開します。gateway container
+artifact は別の `gateway-v*` tag から公開するため、gateway packaging は crates.io
+publish flow を実行せずに ship できます。
 
 LXC-oriented な gateway host 向けには、`v*` release tag で
 `shuttle-gateway-lxc-<target>.tar.gz` archive を公開します。archive には
@@ -303,7 +304,10 @@ LXC-oriented な gateway host 向けには、`v*` release tag で
 `/var/lib/shuttle-gateway` を使います。install 後に `projects.toml` と
 `shuttle-gateway.env` を編集してください。example file に実 token value を保存しないでください。
 
-同じ `v*` release で OCI image と architecture 別の OCI layout archive も公開します。
+gateway の `gateway-v*` release tag は OCI image と architecture 別の OCI layout
+archive を公開します。`gateway-v2026.6.9` tag は
+`ghcr.io/f4ah6o/shuttle-gateway:2026.6.9` と
+`ghcr.io/f4ah6o/shuttle-gateway:gateway-v2026.6.9` の両方を公開します。
 registry image は GHCR から pull できます。
 
 ```bash
@@ -321,6 +325,11 @@ docker run --rm \
   -e SHUTTLE_MAIN_BACKEND_TOKEN=<backend-token> \
   ghcr.io/f4ah6o/shuttle-gateway:<version>
 ```
+
+image には sample config として `/etc/shuttle-gateway/projects.toml` が含まれます。
+`/etc/shuttle-gateway` を mount すると bundled file は置き換えられるため、mount する
+directory には実際の `projects.toml` を置いてください。token value は file に保存せず、
+environment variable または secret manager で注入してください。
 
 Apple の `container` tool でも同じ OCI image を pull するか、release archive を
 load できます。
