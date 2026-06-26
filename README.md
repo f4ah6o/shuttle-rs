@@ -20,7 +20,9 @@ under the current Git repository.
 Use [AGENTS.md](./AGENTS.md) as the canonical workflow guide for coding agents.
 Tool-specific setup paths are available for [opencode](./docs/opencode.md),
 [Claude Code](./docs/claude-code.md), and [Codex](./docs/codex.md). Claude Code
-can also use [CLAUDE.md](./CLAUDE.md) as its conventional entrypoint.
+can also use [CLAUDE.md](./CLAUDE.md) as its conventional entrypoint. To run
+Codex Desktop and Claude Desktop from the same queue, see
+[Desktop Collaboration](./docs/desktop-collaboration.md).
 
 Install the bundled Codex skill for Shuttle:
 
@@ -109,6 +111,15 @@ stl handoff request claude "Please continue this branch"
 stl handoff list
 stl handoff accept <handoff-id>
 stl handoff done <handoff-id>
+```
+
+Start and manage a shared desktop-agent task:
+
+```bash
+stl collab start "Implement the checkout flow" --agents codex,claude
+stl collab status
+stl collab nudge claude "Please review the validation output"
+stl collab pass claude <task-id> "Implementation is done; please review"
 ```
 
 Promote an important message into durable project state:

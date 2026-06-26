@@ -20,7 +20,8 @@
 coding agent 向けの標準 workflow は [AGENTS.md](./AGENTS.md) にあります。
 tool 別の setup は [opencode](./docs/opencode.md)、[Claude Code](./docs/claude-code.md)、
 [Codex](./docs/codex.md) を参照してください。Claude Code では、慣例的な入口として
-[CLAUDE.md](./CLAUDE.md) も使えます。
+[CLAUDE.md](./CLAUDE.md) も使えます。Codex Desktop と Claude Desktop を同じ queue
+で動かす場合は [Desktop Collaboration](./docs/desktop-collaboration.md) を参照してください。
 
 Shuttle の Codex skill を install します。
 
@@ -108,6 +109,15 @@ stl handoff request claude "Please continue this branch"
 stl handoff list
 stl handoff accept <handoff-id>
 stl handoff done <handoff-id>
+```
+
+desktop agent で共有する task を開始・管理します。
+
+```bash
+stl collab start "Implement the checkout flow" --agents codex,claude
+stl collab status
+stl collab nudge claude "Please review the validation output"
+stl collab pass claude <task-id> "Implementation is done; please review"
 ```
 
 残すべき message は durable project state に昇格できます。
