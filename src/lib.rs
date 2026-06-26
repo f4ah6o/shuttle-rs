@@ -1,5 +1,6 @@
 pub mod adapter;
 pub mod app;
+pub mod collab;
 pub mod context;
 pub mod core;
 pub mod gateway;
