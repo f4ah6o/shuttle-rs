@@ -94,6 +94,10 @@ enum Command {
         #[command(subcommand)]
         command: HandoffCommand,
     },
+    Collab {
+        #[command(subcommand)]
+        command: CollabCommand,
+    },
     Mesh {
         #[command(subcommand)]
         command: MeshCommand,
@@ -153,6 +157,25 @@ enum HandoffCommand {
     },
     Done {
         id: Uuid,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CollabCommand {
+    Start {
+        content: String,
+        #[arg(long, value_delimiter = ',', default_value = "codex,claude")]
+        agents: Vec<String>,
+    },
+    Status,
+    Nudge {
+        agent: String,
+        content: String,
+    },
+    Pass {
+        agent: String,
+        task_id: Uuid,
+        note: String,
     },
 }
 
@@ -670,6 +693,80 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Command::Collab { command } => {
+            let store = open_store(&env)?;
+            match command {
+                CollabCommand::Start { content, agents } => {
+                    let start = shuttle_rs::collab::start_events(
+                        env.workspace_id.clone(),
+                        env.agent.clone(),
+                        env.session_id.clone(),
+                        content,
+                        agents,
+                    );
+                    let task = block_on(store.append(with_repo_metadata(start.task, &env)))?;
+                    let mut messages = Vec::new();
+                    for message in start.messages {
+                        messages.push(block_on(store.append(with_repo_metadata(message, &env)))?);
+                    }
+                    let output_value = shuttle_rs::collab::CollabStart { task, messages };
+                    output(cli.json, &output_value, || {
+                        format!(
+                            "started collab task {} and notified {} agent(s)",
+                            output_value.task.id,
+                            output_value.messages.len()
+                        )
+                    })?;
+                }
+                CollabCommand::Status => {
+                    let status = block_on(shuttle_rs::collab::status(&store, &env.workspace_id))?;
+                    output(cli.json, &status, || format_collab_status(&status))?;
+                }
+                CollabCommand::Nudge { agent, content } => {
+                    let nudge = shuttle_rs::collab::nudge_event(
+                        env.workspace_id.clone(),
+                        env.agent.clone(),
+                        env.session_id.clone(),
+                        agent.clone(),
+                        content,
+                    );
+                    let message = block_on(store.append(with_repo_metadata(nudge.message, &env)))?;
+                    let output_value = shuttle_rs::collab::CollabNudge { message };
+                    output(cli.json, &output_value, || {
+                        format!("sent collab message to {agent}")
+                    })?;
+                }
+                CollabCommand::Pass {
+                    agent,
+                    task_id,
+                    note,
+                } => {
+                    block_on(shuttle_rs::task::ensure_task_exists(
+                        &store,
+                        &env.workspace_id,
+                        task_id,
+                    ))?;
+                    let pass = shuttle_rs::collab::pass_events(
+                        env.workspace_id.clone(),
+                        env.agent.clone(),
+                        env.session_id.clone(),
+                        agent.clone(),
+                        task_id,
+                        note,
+                    );
+                    let task_update =
+                        block_on(store.append(with_repo_metadata(pass.task_update, &env)))?;
+                    let handoff = block_on(store.append(with_repo_metadata(pass.handoff, &env)))?;
+                    let output_value = shuttle_rs::collab::CollabPass {
+                        task_update,
+                        handoff,
+                    };
+                    output(cli.json, &output_value, || {
+                        format!("passed task {task_id} to {agent}")
+                    })?;
+                }
+            }
+        }
         Command::Mesh { command } => {
             let store = open_store(&env)?;
             match command {
@@ -1014,6 +1111,7 @@ impl Command {
             Self::Bug { .. } => "bug",
             Self::Task { .. } => "task",
             Self::Handoff { .. } => "handoff",
+            Self::Collab { .. } => "collab",
             Self::Mesh { .. } => "mesh",
             Self::Context { .. } => "context",
             Self::App { .. } => "app",
@@ -1617,6 +1715,14 @@ fn push_event_section(output: &mut String, title: &str, events: &[Event]) {
         output.push_str(&format!("- {}: {}\n", title, event.content));
     }
     output.push('\n');
+}
+
+fn format_collab_status(status: &shuttle_rs::collab::CollabStatus) -> String {
+    let mut output = String::new();
+    push_task_section(&mut output, "Active Tasks", &status.tasks);
+    push_handoff_section(&mut output, "Pending Handoffs", &status.pending_handoffs);
+    push_event_section(&mut output, "Recent Messages", &status.recent_messages);
+    output.trim_end().to_owned()
 }
 
 fn output<T, F>(json: bool, value: &T, text: F) -> Result<()>

@@ -254,6 +254,82 @@ async fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
             let event = runtime.store.append(event).await?;
             serde_json::to_value(event).map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
+        "shuttle_collab_start" => {
+            let content = string_arg(&args, "content")?;
+            let agents = string_list_arg(&args, "agents")
+                .unwrap_or_else(|| vec!["codex".to_owned(), "claude".to_owned()]);
+            let start = crate::collab::start_events(
+                runtime.workspace_id.clone(),
+                runtime.agent.clone(),
+                runtime.session_id.clone(),
+                content,
+                agents,
+            );
+            let task = runtime
+                .store
+                .append(with_repo_metadata(start.task, runtime))
+                .await?;
+            let mut messages = Vec::new();
+            for message in start.messages {
+                messages.push(
+                    runtime
+                        .store
+                        .append(with_repo_metadata(message, runtime))
+                        .await?,
+                );
+            }
+            serde_json::to_value(crate::collab::CollabStart { task, messages })
+                .map_err(|err| ShuttleError::Serialization(err.to_string()))
+        }
+        "shuttle_collab_status" => {
+            let status = crate::collab::status(&runtime.store, &runtime.workspace_id).await?;
+            serde_json::to_value(status).map_err(|err| ShuttleError::Serialization(err.to_string()))
+        }
+        "shuttle_collab_nudge" => {
+            let to_agent = string_arg(&args, "agent")?;
+            let content = string_arg(&args, "content")?;
+            let nudge = crate::collab::nudge_event(
+                runtime.workspace_id.clone(),
+                runtime.agent.clone(),
+                runtime.session_id.clone(),
+                to_agent,
+                content,
+            );
+            let message = runtime
+                .store
+                .append(with_repo_metadata(nudge.message, runtime))
+                .await?;
+            serde_json::to_value(crate::collab::CollabNudge { message })
+                .map_err(|err| ShuttleError::Serialization(err.to_string()))
+        }
+        "shuttle_collab_pass" => {
+            let to_agent = string_arg(&args, "agent")?;
+            let task_id = Uuid::parse_str(&string_arg(&args, "task_id")?)
+                .map_err(|err| ShuttleError::Store(err.to_string()))?;
+            let note = string_arg(&args, "note")?;
+            crate::task::ensure_task_exists(&runtime.store, &runtime.workspace_id, task_id).await?;
+            let pass = crate::collab::pass_events(
+                runtime.workspace_id.clone(),
+                runtime.agent.clone(),
+                runtime.session_id.clone(),
+                to_agent,
+                task_id,
+                note,
+            );
+            let task_update = runtime
+                .store
+                .append(with_repo_metadata(pass.task_update, runtime))
+                .await?;
+            let handoff = runtime
+                .store
+                .append(with_repo_metadata(pass.handoff, runtime))
+                .await?;
+            serde_json::to_value(crate::collab::CollabPass {
+                task_update,
+                handoff,
+            })
+            .map_err(|err| ShuttleError::Serialization(err.to_string()))
+        }
         "shuttle_repo_context" | "context" => {
             let context = crate::context::assemble_context(
                 &runtime.store,
@@ -326,6 +402,25 @@ fn string_arg(args: &Value, name: &str) -> Result<String> {
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
         .ok_or_else(|| ShuttleError::Store(format!("missing string argument: {name}")))
+}
+
+fn string_list_arg(args: &Value, name: &str) -> Option<Vec<String>> {
+    let value = args.get(name)?;
+    if let Some(items) = value.as_array() {
+        return Some(
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect(),
+        );
+    }
+    value.as_str().map(|items| {
+        items
+            .split(',')
+            .map(|item| item.trim().to_owned())
+            .collect()
+    })
 }
 
 fn tools() -> Vec<Tool> {
@@ -420,6 +515,26 @@ fn tools() -> Vec<Tool> {
             event_output_schema(),
         ),
         tool(
+            "shuttle_collab_start",
+            "Start a shared Shuttle collaboration task and notify peer agents",
+            collab_output_schema(),
+        ),
+        tool(
+            "shuttle_collab_status",
+            "Read shared Shuttle collaboration status",
+            collab_output_schema(),
+        ),
+        tool(
+            "shuttle_collab_nudge",
+            "Send a collaboration message to another agent",
+            collab_output_schema(),
+        ),
+        tool(
+            "shuttle_collab_pass",
+            "Update a task and request a handoff to another agent",
+            collab_output_schema(),
+        ),
+        tool(
             "shuttle_repo_context",
             "Read assembled repo context",
             context_output_schema(),
@@ -467,6 +582,12 @@ fn structured_content(tool_name: Option<&str>, value: &Value) -> Value {
             | "shuttle_handoff_done",
         ) => json!({ "event": value }),
         Some(
+            "shuttle_collab_start"
+            | "shuttle_collab_status"
+            | "shuttle_collab_nudge"
+            | "shuttle_collab_pass",
+        ) => json!({ "collab": value }),
+        Some(
             "recall"
             | "inbox"
             | "history"
@@ -505,6 +626,10 @@ fn handoffs_output_schema() -> Value {
         json!({ "handoffs": array_schema(handoff_schema()) }),
         vec!["handoffs"],
     )
+}
+
+fn collab_output_schema() -> Value {
+    json!({ "type": "object", "additionalProperties": true })
 }
 
 fn context_output_schema() -> Value {
@@ -769,6 +894,10 @@ mod tests {
         assert!(names.contains(&"shuttle_handoff_list"));
         assert!(names.contains(&"shuttle_handoff_accept"));
         assert!(names.contains(&"shuttle_handoff_done"));
+        assert!(names.contains(&"shuttle_collab_start"));
+        assert!(names.contains(&"shuttle_collab_status"));
+        assert!(names.contains(&"shuttle_collab_nudge"));
+        assert!(names.contains(&"shuttle_collab_pass"));
         assert!(tools
             .iter()
             .all(|tool| tool.output_schema["type"] == "object"));
@@ -866,6 +995,65 @@ mod tests {
         let handoff_json = response_text_json(&handoff_list);
         assert_eq!(handoff_json[0]["status"], "accepted");
         assert_eq!(handoff_json[0]["to_agent"], "claude");
+    }
+
+    #[test]
+    fn collab_tools_round_trip() {
+        let repo = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        init_git_repo(repo.path());
+        let store = SqliteEventStore::open(data.path().join("shuttle.db")).unwrap();
+        let runtime = McpRuntime {
+            store,
+            cwd: repo.path().to_path_buf(),
+            workspace_id: "workspace".into(),
+            agent: "codex".into(),
+            session_id: "session".into(),
+        };
+
+        let start = futures_executor::block_on(handle_request(
+            &runtime,
+            tool_request(
+                "shuttle_collab_start",
+                json!({ "content": "ship together", "agents": ["codex", "claude"] }),
+            ),
+        ));
+        let start_json = response_text_json(&start);
+        let task_id = start_json["task"]["id"].as_str().unwrap().to_owned();
+        assert_eq!(
+            start["result"]["structuredContent"]["collab"]["messages"][0]["metadata_json"]["to"],
+            "claude"
+        );
+
+        futures_executor::block_on(handle_request(
+            &runtime,
+            tool_request(
+                "shuttle_collab_nudge",
+                json!({ "agent": "claude", "content": "please look" }),
+            ),
+        ));
+        let pass = futures_executor::block_on(handle_request(
+            &runtime,
+            tool_request(
+                "shuttle_collab_pass",
+                json!({ "agent": "claude", "task_id": task_id, "note": "please continue" }),
+            ),
+        ));
+        assert_eq!(
+            pass["result"]["structuredContent"]["collab"]["handoff"]["metadata_json"]["to"],
+            "claude"
+        );
+
+        let status = futures_executor::block_on(handle_request(
+            &runtime,
+            tool_request("shuttle_collab_status", json!({})),
+        ));
+        let status_json = response_text_json(&status);
+        assert_eq!(status_json["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            status["result"]["structuredContent"]["collab"]["pending_handoffs"][0]["status"],
+            "pending"
+        );
     }
 
     fn tool_request(name: &str, arguments: Value) -> Request {

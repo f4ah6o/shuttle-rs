@@ -1,0 +1,13 @@
+.git
+.gitignore
+.dockerignore
+.shuttle
+target
+dist
+
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+
+.DS_Store

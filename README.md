@@ -20,7 +20,9 @@ under the current Git repository.
 Use [AGENTS.md](./AGENTS.md) as the canonical workflow guide for coding agents.
 Tool-specific setup paths are available for [opencode](./docs/opencode.md),
 [Claude Code](./docs/claude-code.md), and [Codex](./docs/codex.md). Claude Code
-can also use [CLAUDE.md](./CLAUDE.md) as its conventional entrypoint.
+can also use [CLAUDE.md](./CLAUDE.md) as its conventional entrypoint. To run
+Codex Desktop and Claude Desktop from the same queue, see
+[Desktop Collaboration](./docs/desktop-collaboration.md).
 
 Install the bundled Codex skill for Shuttle:
 
@@ -109,6 +111,15 @@ stl handoff request claude "Please continue this branch"
 stl handoff list
 stl handoff accept <handoff-id>
 stl handoff done <handoff-id>
+```
+
+Start and manage a shared desktop-agent task:
+
+```bash
+stl collab start "Implement the checkout flow" --agents codex,claude
+stl collab status
+stl collab nudge claude "Please review the validation output"
+stl collab pass claude <task-id> "Implementation is done; please review"
 ```
 
 Promote an important message into durable project state:
@@ -323,9 +334,9 @@ OAuth client registrations, authorization codes, and access tokens are stored in
 gateway-local SQLite databases. Backend tokens and OAuth admin tokens should be
 provided by a secret manager or runtime-injected environment variables.
 
-The standard `v*` release workflow publishes the Rust crate and gateway
-artifacts from the same tag; a separate gateway-specific release tag is not
-required.
+The standard `v*` release workflow publishes the Rust crate. Gateway container
+artifacts are published from separate `gateway-v*` tags so gateway packaging can
+ship without running the crates.io publish flow.
 
 For LXC-oriented gateway hosts, `v*` release tags publish archives named
 `shuttle-gateway-lxc-<target>.tar.gz`. Each archive contains
@@ -335,8 +346,11 @@ For LXC-oriented gateway hosts, `v*` release tags publish archives named
 `shuttle-gateway.env` after installation; do not store real token values in the
 example files.
 
-The same `v*` releases also publish OCI images and per-architecture OCI layout
-archives. Pull the registry image from GHCR:
+Gateway `gateway-v*` release tags publish OCI images and per-architecture OCI
+layout archives. A `gateway-v2026.6.9` tag publishes both
+`ghcr.io/f4ah6o/shuttle-gateway:2026.6.9` and
+`ghcr.io/f4ah6o/shuttle-gateway:gateway-v2026.6.9`. Pull the registry image
+from GHCR:
 
 ```bash
 docker pull ghcr.io/f4ah6o/shuttle-gateway:<version>
@@ -353,6 +367,11 @@ docker run --rm \
   -e SHUTTLE_MAIN_BACKEND_TOKEN=<backend-token> \
   ghcr.io/f4ah6o/shuttle-gateway:<version>
 ```
+
+The image includes `/etc/shuttle-gateway/projects.toml` as a sample config.
+Mounting `/etc/shuttle-gateway` replaces that bundled file, so the mounted
+directory must contain your real `projects.toml`. Keep token values out of the
+file and inject them with environment variables or a secret manager.
 
 Apple's `container` tool can pull the same OCI image or load a release archive:
 
