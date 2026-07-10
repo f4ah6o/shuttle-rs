@@ -62,7 +62,6 @@ impl SqliteEventStore {
             CREATE INDEX IF NOT EXISTS idx_events_workspace_created ON events(workspace_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_events_agent_created ON events(agent, created_at);
             CREATE INDEX IF NOT EXISTS idx_event_tags_tag ON event_tags(tag);
-
             CREATE TABLE IF NOT EXISTS adapter_registry (
                 id TEXT PRIMARY KEY NOT NULL,
                 name TEXT NOT NULL,
@@ -89,6 +88,19 @@ impl SqliteEventStore {
         ensure_column(&conn, "bit_repo_id", "TEXT")?;
         ensure_column(&conn, "repo_dirty", "INTEGER")?;
         ensure_column(&conn, "metadata_json", "TEXT NOT NULL DEFAULT '{}'")?;
+        conn.execute_batch(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_initial_claim
+                ON events(
+                    workspace_id,
+                    json_extract(metadata_json, '$.run_id'),
+                    json_extract(metadata_json, '$.step_id')
+                )
+                WHERE event_type = 'workflow'
+                  AND json_extract(metadata_json, '$.action') = 'claimed';
+            "#,
+        )
+        .map_err(to_store_error)?;
         backfill_event_tags(&conn)?;
         Ok(())
     }

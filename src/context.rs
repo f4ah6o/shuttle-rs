@@ -3,6 +3,7 @@ use std::process::Command;
 
 use crate::core::{Event, EventFilter, EventStore, EventType, Result, ShuttleError};
 use crate::task::{HandoffStatus, HandoffSummary, TaskStatus, TaskSummary};
+use crate::workflow::WorkflowRun;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +22,7 @@ pub struct Context {
     pub pending_handoffs: Vec<HandoffSummary>,
     pub recent_completed_handoffs: Vec<HandoffSummary>,
     pub inbox: Vec<Event>,
+    pub active_workflows: Vec<WorkflowRun>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +115,7 @@ pub async fn assemble_context(
         .cloned()
         .collect();
     let inbox = inbox_events(store, workspace_id, agent).await?;
+    let active_workflows = crate::workflow::active_runs(store, workspace_id).await?;
 
     Ok(Context {
         repo: status.repo_path,
@@ -129,6 +132,7 @@ pub async fn assemble_context(
         pending_handoffs,
         recent_completed_handoffs,
         inbox,
+        active_workflows,
     })
 }
 
@@ -180,7 +184,7 @@ async fn inbox_events(
             })
             .await?,
     );
-    events.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    events.sort_by_key(|event| std::cmp::Reverse(event.created_at));
     events.truncate(20);
     Ok(events)
 }

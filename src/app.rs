@@ -169,6 +169,7 @@ async fn dashboard(headers: HeaderMap, State(runtime): State<AppRuntime>) -> Res
             pending_handoffs: Vec::new(),
             recent_completed_handoffs: Vec::new(),
             inbox: Vec::new(),
+            active_workflows: Vec::new(),
         }),
     })
     .into_response()

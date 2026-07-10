@@ -98,6 +98,10 @@ enum Command {
         #[command(subcommand)]
         command: CollabCommand,
     },
+    Workflow {
+        #[command(subcommand)]
+        command: WorkflowCommand,
+    },
     Mesh {
         #[command(subcommand)]
         command: MeshCommand,
@@ -176,6 +180,67 @@ enum CollabCommand {
         agent: String,
         task_id: Uuid,
         note: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkflowCommand {
+    List,
+    Show {
+        id: String,
+    },
+    Start {
+        id: String,
+        #[arg(long, default_value = "{}")]
+        input: String,
+    },
+    Status {
+        run_id: Option<Uuid>,
+    },
+    Resume {
+        run_id: Uuid,
+    },
+    Step {
+        #[command(subcommand)]
+        command: WorkflowStepCommand,
+    },
+    Reconcile {
+        run_id: Uuid,
+        step_id: String,
+        #[arg(long, default_value = "{}")]
+        output: String,
+        #[arg(long)]
+        approval: Option<String>,
+    },
+    Complete {
+        run_id: Uuid,
+    },
+    Abort {
+        run_id: Uuid,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkflowStepCommand {
+    Claim {
+        run_id: Uuid,
+        step_id: String,
+        #[arg(long)]
+        takeover: bool,
+    },
+    Complete {
+        run_id: Uuid,
+        step_id: String,
+        #[arg(long, default_value = "{}")]
+        output: String,
+        #[arg(long)]
+        approval: Option<String>,
+    },
+    Fail {
+        run_id: Uuid,
+        step_id: String,
+        #[arg(long, default_value = "{}")]
+        error: String,
     },
 }
 
@@ -287,6 +352,7 @@ enum SkillCommand {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum SkillTarget {
     Codex,
+    Claude,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -767,6 +833,219 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Command::Workflow { command } => {
+            let store = open_store(&env)?;
+            let repo = PathBuf::from(shuttle_rs::context::repo_status(&env.cwd)?.repo_path);
+            match command {
+                WorkflowCommand::List => {
+                    let manifest = shuttle_rs::workflow::load_manifest(&repo)?;
+                    output(cli.json, &manifest.workflows, || {
+                        manifest
+                            .workflows
+                            .iter()
+                            .map(|workflow| {
+                                format!(
+                                    "{}\t{}\t{}",
+                                    workflow.id,
+                                    workflow.title,
+                                    workflow.spec.display()
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })?;
+                }
+                WorkflowCommand::Show { id } => {
+                    let manifest = shuttle_rs::workflow::load_manifest(&repo)?;
+                    let workflow = shuttle_rs::workflow::definition(&manifest, &id)?;
+                    output(cli.json, workflow, || {
+                        format!(
+                            "{}: {} ({})",
+                            workflow.id,
+                            workflow.title,
+                            workflow.spec.display()
+                        )
+                    })?;
+                }
+                WorkflowCommand::Start { id, input } => {
+                    let manifest = shuttle_rs::workflow::load_manifest(&repo)?;
+                    let workflow = shuttle_rs::workflow::definition(&manifest, &id)?;
+                    let input = parse_json_arg("input", &input)?;
+                    let event = shuttle_rs::workflow::start_event(
+                        env.workspace_id.clone(),
+                        env.agent.clone(),
+                        env.session_id.clone(),
+                        workflow,
+                        input,
+                    );
+                    let event = block_on(store.append(with_repo_metadata(event, &env)))?;
+                    let run_id = event.metadata_json["run_id"].as_str().unwrap_or_default();
+                    output(cli.json, &event, || {
+                        format!("started workflow {id}: {run_id}")
+                    })?;
+                }
+                WorkflowCommand::Status { run_id } => {
+                    if let Some(run_id) = run_id {
+                        let run =
+                            block_on(shuttle_rs::workflow::run(&store, &env.workspace_id, run_id))?;
+                        output(cli.json, &run, || format_workflow_run(&run))?;
+                    } else {
+                        let runs = block_on(shuttle_rs::workflow::runs(&store, &env.workspace_id))?;
+                        output(cli.json, &runs, || {
+                            runs.iter()
+                                .map(format_workflow_run)
+                                .collect::<Vec<_>>()
+                                .join("\n\n")
+                        })?;
+                    }
+                }
+                WorkflowCommand::Resume { run_id } => {
+                    let run =
+                        block_on(shuttle_rs::workflow::run(&store, &env.workspace_id, run_id))?;
+                    output(cli.json, &run, || format_workflow_run(&run))?;
+                }
+                WorkflowCommand::Step { command } => match command {
+                    WorkflowStepCommand::Claim {
+                        run_id,
+                        step_id,
+                        takeover,
+                    } => {
+                        let run =
+                            block_on(shuttle_rs::workflow::run(&store, &env.workspace_id, run_id))?;
+                        let action =
+                            shuttle_rs::workflow::validate_claim(&run, &step_id, takeover)?;
+                        let event = shuttle_rs::workflow::action_event(
+                            env.workspace_id.clone(),
+                            env.agent.clone(),
+                            env.session_id.clone(),
+                            run_id,
+                            action,
+                            Some(&step_id),
+                            Some(json!({ "takeover": takeover })),
+                        );
+                        let event = block_on(store.append(with_repo_metadata(event, &env)))?;
+                        output(cli.json, &event, || {
+                            format!("claimed workflow step {step_id}")
+                        })?;
+                    }
+                    WorkflowStepCommand::Complete {
+                        run_id,
+                        step_id,
+                        output: value,
+                        approval,
+                    } => {
+                        let run =
+                            block_on(shuttle_rs::workflow::run(&store, &env.workspace_id, run_id))?;
+                        shuttle_rs::workflow::validate_complete(
+                            &run,
+                            &step_id,
+                            &env.agent,
+                            approval.as_deref(),
+                        )?;
+                        let checkpoint = json!({
+                            "output": parse_json_arg("output", &value)?,
+                            "approval": approval,
+                        });
+                        let event = shuttle_rs::workflow::action_event(
+                            env.workspace_id.clone(),
+                            env.agent.clone(),
+                            env.session_id.clone(),
+                            run_id,
+                            "completed_step",
+                            Some(&step_id),
+                            Some(checkpoint),
+                        );
+                        let event = block_on(store.append(with_repo_metadata(event, &env)))?;
+                        output(cli.json, &event, || {
+                            format!("completed workflow step {step_id}")
+                        })?;
+                    }
+                    WorkflowStepCommand::Fail {
+                        run_id,
+                        step_id,
+                        error,
+                    } => {
+                        let run =
+                            block_on(shuttle_rs::workflow::run(&store, &env.workspace_id, run_id))?;
+                        let step = shuttle_rs::workflow::validate_step_claimed(&run, &step_id)?;
+                        anyhow::ensure!(
+                            step.claimed_by.as_deref() == Some(env.agent.as_str()),
+                            "workflow step is claimed by another agent; use takeover first"
+                        );
+                        let event = shuttle_rs::workflow::action_event(
+                            env.workspace_id.clone(),
+                            env.agent.clone(),
+                            env.session_id.clone(),
+                            run_id,
+                            "failed_step",
+                            Some(&step_id),
+                            Some(parse_json_arg("error", &error)?),
+                        );
+                        let event = block_on(store.append(with_repo_metadata(event, &env)))?;
+                        output(cli.json, &event, || {
+                            format!("failed workflow step {step_id}")
+                        })?;
+                    }
+                },
+                WorkflowCommand::Reconcile {
+                    run_id,
+                    step_id,
+                    output: value,
+                    approval,
+                } => {
+                    let run =
+                        block_on(shuttle_rs::workflow::run(&store, &env.workspace_id, run_id))?;
+                    shuttle_rs::workflow::validate_reconcile(&run, &step_id, approval.as_deref())?;
+                    let checkpoint = json!({
+                        "output": parse_json_arg("output", &value)?,
+                        "approval": approval,
+                    });
+                    let event = shuttle_rs::workflow::action_event(
+                        env.workspace_id.clone(),
+                        env.agent.clone(),
+                        env.session_id.clone(),
+                        run_id,
+                        "reconciled",
+                        Some(&step_id),
+                        Some(checkpoint),
+                    );
+                    let event = block_on(store.append(with_repo_metadata(event, &env)))?;
+                    output(cli.json, &event, || {
+                        format!("reconciled workflow step {step_id}")
+                    })?;
+                }
+                WorkflowCommand::Complete { run_id } => {
+                    let run =
+                        block_on(shuttle_rs::workflow::run(&store, &env.workspace_id, run_id))?;
+                    shuttle_rs::workflow::validate_run_complete(&run)?;
+                    let event = shuttle_rs::workflow::action_event(
+                        env.workspace_id.clone(),
+                        env.agent.clone(),
+                        env.session_id.clone(),
+                        run_id,
+                        "completed",
+                        None,
+                        None,
+                    );
+                    let event = block_on(store.append(with_repo_metadata(event, &env)))?;
+                    output(cli.json, &event, || format!("completed workflow {run_id}"))?;
+                }
+                WorkflowCommand::Abort { run_id } => {
+                    block_on(shuttle_rs::workflow::run(&store, &env.workspace_id, run_id))?;
+                    let event = shuttle_rs::workflow::action_event(
+                        env.workspace_id.clone(),
+                        env.agent.clone(),
+                        env.session_id.clone(),
+                        run_id,
+                        "aborted",
+                        None,
+                        None,
+                    );
+                    let event = block_on(store.append(with_repo_metadata(event, &env)))?;
+                    output(cli.json, &event, || format!("aborted workflow {run_id}"))?;
+                }
+            }
+        }
         Command::Mesh { command } => {
             let store = open_store(&env)?;
             match command {
@@ -1112,6 +1391,7 @@ impl Command {
             Self::Task { .. } => "task",
             Self::Handoff { .. } => "handoff",
             Self::Collab { .. } => "collab",
+            Self::Workflow { .. } => "workflow",
             Self::Mesh { .. } => "mesh",
             Self::Context { .. } => "context",
             Self::App { .. } => "app",
@@ -1476,6 +1756,7 @@ impl SkillTarget {
     fn as_str(self) -> &'static str {
         match self {
             Self::Codex => "codex",
+            Self::Claude => "claude",
         }
     }
 }
@@ -1501,6 +1782,11 @@ fn skill_install_path(target: SkillTarget) -> Result<PathBuf> {
             .join("skills")
             .join("shuttle")
             .join("SKILL.md")),
+        SkillTarget::Claude => Ok(home_dir()?
+            .join(".claude")
+            .join("skills")
+            .join("shuttle")
+            .join("SKILL.md")),
     }
 }
 
@@ -1513,11 +1799,11 @@ fn home_dir() -> Result<PathBuf> {
 
 fn skill_content(target: SkillTarget) -> &'static str {
     match target {
-        SkillTarget::Codex => CODEX_SKILL,
+        SkillTarget::Codex | SkillTarget::Claude => SHUTTLE_SKILL,
     }
 }
 
-const CODEX_SKILL: &str = r#"---
+const SHUTTLE_SKILL: &str = r#"---
 name: shuttle
 description: Use when working with Shuttle/stl local-first agent memory, tasks, handoffs, messages, mesh sync, MCP app server, or shuttle-gateway multi-project web chat setup.
 ---
@@ -1535,11 +1821,21 @@ stl recall "current task"
 stl task list
 ```
 
-If the current shell does not set `SHUTTLE_AGENT`, set the repo-local identity:
+If the current shell does not set `SHUTTLE_AGENT`, inspect the repo-local identity and set it to the current client when needed:
 
 ```bash
-stl identity set codex
+stl identity current
 ```
+
+## Repository workflows
+
+- If `shuttle.workflows.toml` exists, run `stl workflow list` and `stl workflow status` before starting workflow work.
+- Start a run with `stl workflow start <workflow-id>` and read the referenced repository spec.
+- Claim each next step with `stl workflow step claim <run-id> <step-id>` before executing it.
+- Record structured results with `stl workflow step complete <run-id> <step-id> --output '<json>'`.
+- Resume another agent's claimed step with `--takeover` (only valid while the step is claimed). Retry a failed step by claiming it again without `--takeover`.
+- Never replay a non-idempotent step when status is `needs_reconcile`; inspect the external system and use `stl workflow reconcile`. If the step requires approval, pass the same `--approval` evidence to `reconcile`.
+- The repository spec is the source of truth for business behavior. Shuttle stores execution state and checkpoints.
 
 ## Local memory and coordination
 
@@ -1626,6 +1922,27 @@ fn with_repo_metadata(mut event: Event, env: &RuntimeEnv) -> Event {
     event
 }
 
+fn parse_json_arg(name: &str, value: &str) -> Result<serde_json::Value> {
+    serde_json::from_str(value).with_context(|| format!("invalid JSON for --{name}"))
+}
+
+fn format_workflow_run(run: &shuttle_rs::workflow::WorkflowRun) -> String {
+    let next = run
+        .steps
+        .iter()
+        .find(|step| step.status != shuttle_rs::workflow::StepStatus::Completed)
+        .map(|step| format!("{} ({:?})", step.id, step.status))
+        .unwrap_or_else(|| "none".to_owned());
+    format!(
+        "[{}] {} status={:?}\n- spec: {}\n- next: {}",
+        run.id,
+        run.workflow_id,
+        run.status,
+        run.spec.display(),
+        next
+    )
+}
+
 fn format_context(context: &shuttle_rs::context::Context) -> String {
     let mut output = format!(
         "Repository\n- path: {}\n- branch: {}\n- commit: {}\n- dirty: {}\n",
@@ -1642,6 +1959,18 @@ fn format_context(context: &shuttle_rs::context::Context) -> String {
     }
     push_task_section(&mut output, "Open Tasks", &context.open_tasks);
     push_task_section(&mut output, "Claimed Tasks", &context.claimed_tasks);
+    output.push_str("Active Workflows\n");
+    if context.active_workflows.is_empty() {
+        output.push_str("- none\n\n");
+    } else {
+        for run in &context.active_workflows {
+            output.push_str(&format!(
+                "- {}\n",
+                format_workflow_run(run).replace('\n', " ")
+            ));
+        }
+        output.push('\n');
+    }
     push_event_section(&mut output, "Recent Decisions", &context.recent_decisions);
     push_event_section(&mut output, "Related Memories", &context.related_memories);
     push_event_section(&mut output, "Recent Messages", &context.recent_messages);
@@ -2008,6 +2337,28 @@ mod tests {
         assert!(content.contains("name: shuttle"));
         assert!(content.contains("stl context"));
         assert!(content.contains("SHUTTLE_OAUTH_ADMIN_TOKEN"));
+    }
+
+    #[test]
+    fn claude_skill_install_uses_shared_workflow_instructions() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        env::set_var("HOME", dir.path());
+
+        let install = install_skill(SkillTarget::Claude).unwrap();
+
+        env::remove_var("HOME");
+        let path = dir
+            .path()
+            .join(".claude")
+            .join("skills")
+            .join("shuttle")
+            .join("SKILL.md");
+        let content = fs::read_to_string(&path).unwrap();
+        assert_eq!(install.target, "claude");
+        assert_eq!(install.path, path.display().to_string());
+        assert!(content.contains("stl workflow status"));
+        assert!(content.contains("needs_reconcile"));
     }
 
     #[test]

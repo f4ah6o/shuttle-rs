@@ -36,6 +36,32 @@ Preview the generated skill without writing it:
 stl skill print codex
 ```
 
+The same integration is available for Claude Code:
+
+```bash
+stl skill install claude
+```
+
+## Repository Workflows
+
+Repositories can declare agent-independent workflows in
+`shuttle.workflows.toml`. The manifest points to repository-owned specs and
+classifies each step as `read_only`, `idempotent`, or `non_idempotent`; Shuttle
+stores run state and checkpoints but does not replace the business spec.
+
+```bash
+stl workflow list
+stl workflow start daily-triage
+stl workflow step claim <run-id> read-spec
+stl workflow step complete <run-id> read-spec --output '{"read":true}'
+stl workflow status <run-id>
+```
+
+Use `--takeover` when another agent resumes a claimed step. Taking over an
+interrupted `non_idempotent` step changes it to `needs_reconcile`; inspect the
+external system and record the result with `stl workflow reconcile` instead of
+blindly repeating the operation.
+
 ## Phase 1 Commands
 
 Initialize local storage:
