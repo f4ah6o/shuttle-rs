@@ -209,6 +209,8 @@ enum WorkflowCommand {
         step_id: String,
         #[arg(long, default_value = "{}")]
         output: String,
+        #[arg(long)]
+        approval: Option<String>,
     },
     Complete {
         run_id: Uuid,
@@ -910,13 +912,14 @@ fn main() -> Result<()> {
                     } => {
                         let run =
                             block_on(shuttle_rs::workflow::run(&store, &env.workspace_id, run_id))?;
-                        shuttle_rs::workflow::validate_claim(&run, &step_id, takeover)?;
+                        let action =
+                            shuttle_rs::workflow::validate_claim(&run, &step_id, takeover)?;
                         let event = shuttle_rs::workflow::action_event(
                             env.workspace_id.clone(),
                             env.agent.clone(),
                             env.session_id.clone(),
                             run_id,
-                            if takeover { "taken_over" } else { "claimed" },
+                            action,
                             Some(&step_id),
                             Some(json!({ "takeover": takeover })),
                         );
@@ -988,18 +991,15 @@ fn main() -> Result<()> {
                     run_id,
                     step_id,
                     output: value,
+                    approval,
                 } => {
                     let run =
                         block_on(shuttle_rs::workflow::run(&store, &env.workspace_id, run_id))?;
-                    let step = run
-                        .steps
-                        .iter()
-                        .find(|step| step.id == step_id)
-                        .context("unknown workflow step")?;
-                    anyhow::ensure!(
-                        step.status == shuttle_rs::workflow::StepStatus::NeedsReconcile,
-                        "workflow step does not need reconciliation"
-                    );
+                    shuttle_rs::workflow::validate_reconcile(&run, &step_id, approval.as_deref())?;
+                    let checkpoint = json!({
+                        "output": parse_json_arg("output", &value)?,
+                        "approval": approval,
+                    });
                     let event = shuttle_rs::workflow::action_event(
                         env.workspace_id.clone(),
                         env.agent.clone(),
@@ -1007,7 +1007,7 @@ fn main() -> Result<()> {
                         run_id,
                         "reconciled",
                         Some(&step_id),
-                        Some(parse_json_arg("output", &value)?),
+                        Some(checkpoint),
                     );
                     let event = block_on(store.append(with_repo_metadata(event, &env)))?;
                     output(cli.json, &event, || {
@@ -1833,7 +1833,8 @@ stl identity current
 - Start a run with `stl workflow start <workflow-id>` and read the referenced repository spec.
 - Claim each next step with `stl workflow step claim <run-id> <step-id>` before executing it.
 - Record structured results with `stl workflow step complete <run-id> <step-id> --output '<json>'`.
-- Resume another agent's claimed step with `--takeover`. Never replay a non-idempotent step when status is `needs_reconcile`; inspect the external system and use `stl workflow reconcile`.
+- Resume another agent's claimed step with `--takeover` (only valid while the step is claimed). Retry a failed step by claiming it again without `--takeover`.
+- Never replay a non-idempotent step when status is `needs_reconcile`; inspect the external system and use `stl workflow reconcile`. If the step requires approval, pass the same `--approval` evidence to `reconcile`.
 - The repository spec is the source of truth for business behavior. Shuttle stores execution state and checkpoints.
 
 ## Local memory and coordination

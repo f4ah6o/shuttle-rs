@@ -377,13 +377,13 @@ async fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             let run = crate::workflow::run(&runtime.store, &runtime.workspace_id, run_id).await?;
-            crate::workflow::validate_claim(&run, &step_id, takeover)?;
+            let action = crate::workflow::validate_claim(&run, &step_id, takeover)?;
             let event = crate::workflow::action_event(
                 runtime.workspace_id.clone(),
                 runtime.agent.clone(),
                 runtime.session_id.clone(),
                 run_id,
-                if takeover { "taken_over" } else { "claimed" },
+                action,
                 Some(&step_id),
                 Some(json!({ "takeover": takeover })),
             );
@@ -450,16 +450,12 @@ async fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
                 .map_err(|err| ShuttleError::Store(err.to_string()))?;
             let step_id = string_arg(&args, "step_id")?;
             let run = crate::workflow::run(&runtime.store, &runtime.workspace_id, run_id).await?;
-            let step = run
-                .steps
-                .iter()
-                .find(|step| step.id == step_id)
-                .ok_or_else(|| ShuttleError::Store(format!("unknown workflow step: {step_id}")))?;
-            if step.status != crate::workflow::StepStatus::NeedsReconcile {
-                return Err(ShuttleError::Store(
-                    "workflow step does not need reconciliation".to_owned(),
-                ));
-            }
+            let approval = args.get("approval").and_then(Value::as_str);
+            crate::workflow::validate_reconcile(&run, &step_id, approval)?;
+            let checkpoint = json!({
+                "output": args.get("output").cloned().unwrap_or_else(|| json!({})),
+                "approval": approval,
+            });
             let event = crate::workflow::action_event(
                 runtime.workspace_id.clone(),
                 runtime.agent.clone(),
@@ -467,7 +463,7 @@ async fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
                 run_id,
                 "reconciled",
                 Some(&step_id),
-                args.get("output").cloned(),
+                Some(checkpoint),
             );
             let event = runtime
                 .store

@@ -355,7 +355,8 @@ fn apply_action(run: &mut WorkflowRun, event: &Event, action: &str) -> Result<()
     run.updated_at = event.created_at;
     run.source_event_ids.push(event.id);
     match action {
-        "claimed" | "taken_over" | "completed_step" | "failed_step" | "reconciled" => {
+        "claimed" | "reclaimed" | "taken_over" | "completed_step" | "failed_step"
+        | "reconciled" => {
             let step_id = metadata_string(event, "step_id")?;
             let step = run
                 .steps
@@ -363,7 +364,7 @@ fn apply_action(run: &mut WorkflowRun, event: &Event, action: &str) -> Result<()
                 .find(|step| step.id == step_id)
                 .ok_or_else(|| ShuttleError::Store(format!("unknown workflow step: {step_id}")))?;
             match action {
-                "claimed" | "taken_over" => {
+                "claimed" | "reclaimed" | "taken_over" => {
                     if action == "taken_over"
                         && step.status == StepStatus::Claimed
                         && step.kind == StepKind::NonIdempotent
@@ -372,6 +373,9 @@ fn apply_action(run: &mut WorkflowRun, event: &Event, action: &str) -> Result<()
                         run.status = RunStatus::NeedsReconcile;
                     } else {
                         step.status = StepStatus::Claimed;
+                        if run.status == RunStatus::Failed {
+                            run.status = RunStatus::Active;
+                        }
                     }
                     step.claimed_by = Some(event.agent.clone());
                     run.current_step = Some(step_id.to_owned());
@@ -418,7 +422,7 @@ fn metadata_uuid(event: &Event, key: &str) -> Result<Uuid> {
         .map_err(|err| ShuttleError::Serialization(err.to_string()))
 }
 
-pub fn validate_claim(run: &WorkflowRun, step_id: &str, takeover: bool) -> Result<()> {
+pub fn validate_claim(run: &WorkflowRun, step_id: &str, takeover: bool) -> Result<&'static str> {
     if !matches!(
         run.status,
         RunStatus::Active | RunStatus::Failed | RunStatus::NeedsReconcile
@@ -437,14 +441,37 @@ pub fn validate_claim(run: &WorkflowRun, step_id: &str, takeover: bool) -> Resul
         ));
     }
     match expected.status {
-        StepStatus::Pending | StepStatus::Failed => Ok(()),
-        StepStatus::Claimed if takeover => Ok(()),
+        StepStatus::Pending | StepStatus::Failed if takeover => invalid(format!(
+            "workflow step {step_id} is not claimed; claim it without takeover"
+        )),
+        StepStatus::Pending => Ok("claimed"),
+        StepStatus::Failed => Ok("reclaimed"),
+        StepStatus::Claimed if takeover => Ok("taken_over"),
         StepStatus::Claimed => invalid(format!("workflow step {step_id} is already claimed")),
         StepStatus::NeedsReconcile => {
             invalid(format!("workflow step {step_id} needs reconciliation"))
         }
         StepStatus::Completed => unreachable!(),
     }
+}
+
+pub fn validate_reconcile(run: &WorkflowRun, step_id: &str, approval: Option<&str>) -> Result<()> {
+    let step = run
+        .steps
+        .iter()
+        .find(|step| step.id == step_id)
+        .ok_or_else(|| ShuttleError::Store(format!("unknown workflow step: {step_id}")))?;
+    if step.status != StepStatus::NeedsReconcile {
+        return invalid(format!(
+            "workflow step {step_id} does not need reconciliation"
+        ));
+    }
+    if step.approval_required && approval.is_none_or(|approval| approval.trim().is_empty()) {
+        return invalid(format!(
+            "workflow step {step_id} requires approval evidence"
+        ));
+    }
+    Ok(())
 }
 
 pub fn validate_complete(
@@ -669,5 +696,111 @@ kind = "read_only"
             validate_complete(&run, "approve", "claude", Some("user approved payload")).is_err()
         );
         assert!(validate_complete(&run, "approve", "codex", Some("user approved payload")).is_ok());
+    }
+
+    #[test]
+    fn failed_step_can_be_reclaimed_despite_initial_claim_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(dir.path().join("shuttle.db")).unwrap();
+        let start = start_event(
+            "ws".into(),
+            "claude".into(),
+            "s1".into(),
+            &workflow(),
+            json!({}),
+        );
+        let run_id = metadata_uuid(&start, "run_id").unwrap();
+        futures_executor::block_on(store.append(start)).unwrap();
+        for (agent, action) in [("claude", "claimed"), ("claude", "failed_step")] {
+            let event = action_event(
+                "ws".into(),
+                agent.into(),
+                "s1".into(),
+                run_id,
+                action,
+                Some("read"),
+                None,
+            );
+            futures_executor::block_on(store.append(event)).unwrap();
+        }
+
+        let run_state = futures_executor::block_on(run(&store, "ws", run_id)).unwrap();
+        assert_eq!(run_state.steps[0].status, StepStatus::Failed);
+        assert_eq!(
+            validate_claim(&run_state, "read", false).unwrap(),
+            "reclaimed"
+        );
+
+        let reclaim = action_event(
+            "ws".into(),
+            "codex".into(),
+            "s2".into(),
+            run_id,
+            "reclaimed",
+            Some("read"),
+            None,
+        );
+        futures_executor::block_on(store.append(reclaim)).unwrap();
+        let run_state = futures_executor::block_on(run(&store, "ws", run_id)).unwrap();
+        assert_eq!(run_state.steps[0].status, StepStatus::Claimed);
+        assert_eq!(run_state.steps[0].claimed_by.as_deref(), Some("codex"));
+        assert_eq!(run_state.status, RunStatus::Active);
+    }
+
+    #[test]
+    fn takeover_is_rejected_unless_step_is_claimed() {
+        let run = WorkflowRun {
+            id: Uuid::new_v4(),
+            workflow_id: "x".into(),
+            title: "x".into(),
+            spec: "x".into(),
+            status: RunStatus::Active,
+            input: json!({}),
+            current_step: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            source_event_ids: vec![],
+            steps: vec![StepSummary {
+                id: "read".into(),
+                title: "Read".into(),
+                kind: StepKind::ReadOnly,
+                approval_required: false,
+                status: StepStatus::Pending,
+                claimed_by: None,
+                output: None,
+            }],
+        };
+
+        assert!(validate_claim(&run, "read", true).is_err());
+        assert_eq!(validate_claim(&run, "read", false).unwrap(), "claimed");
+    }
+
+    #[test]
+    fn reconcile_requires_approval_evidence_when_step_demands_it() {
+        let run = WorkflowRun {
+            id: Uuid::new_v4(),
+            workflow_id: "x".into(),
+            title: "x".into(),
+            spec: "x".into(),
+            status: RunStatus::NeedsReconcile,
+            input: json!({}),
+            current_step: Some("write".into()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            source_event_ids: vec![],
+            steps: vec![StepSummary {
+                id: "write".into(),
+                title: "Write".into(),
+                kind: StepKind::NonIdempotent,
+                approval_required: true,
+                status: StepStatus::NeedsReconcile,
+                claimed_by: Some("codex".into()),
+                output: None,
+            }],
+        };
+
+        assert!(validate_reconcile(&run, "write", None).is_err());
+        assert!(validate_reconcile(&run, "write", Some("  ")).is_err());
+        assert!(validate_reconcile(&run, "write", Some("user approved")).is_ok());
     }
 }
