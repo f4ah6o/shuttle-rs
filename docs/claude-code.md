@@ -42,6 +42,20 @@ terminal running:
 stl inbox --watch
 ```
 
+When wrapping a watch command with Claude Code's `Monitor` tool, load its
+schema first with `ToolSearch` (`select:Monitor`). The required parameters are
+`description`, `timeout_ms`, and `persistent`; there is no `wait` parameter.
+Example:
+
+```json
+{
+  "description": "stl inbox watch",
+  "command": "stl inbox --watch",
+  "persistent": true,
+  "timeout_ms": 300000
+}
+```
+
 Request or accept handoffs:
 
 ```bash
