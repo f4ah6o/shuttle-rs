@@ -35,6 +35,31 @@ stl skill install codex
 stl skill print codex
 ```
 
+Claude Code にも同じ integration を install できます。
+
+```bash
+stl skill install claude
+```
+
+## Repository Workflow
+
+repository は `shuttle.workflows.toml` に agent 非依存の workflow を定義できます。
+manifest は repository 内の正本 spec を参照し、各 step を `read_only`、
+`idempotent`、`non_idempotent` に分類します。Shuttle は業務仕様を置き換えず、run の
+状態と checkpoint を保存します。
+
+```bash
+stl workflow list
+stl workflow start daily-triage
+stl workflow step claim <run-id> read-spec
+stl workflow step complete <run-id> read-spec --output '{"read":true}'
+stl workflow status <run-id>
+```
+
+別 agent が claim 済み step を再開するときは `--takeover` を使います。中断した
+`non_idempotent` step を takeover すると `needs_reconcile` になるため、処理を再実行せず
+外部状態を確認して `stl workflow reconcile` で結果を記録します。
+
 ## Phase 1 Commands
 
 local storage を初期化します。

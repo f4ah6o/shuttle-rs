@@ -18,6 +18,7 @@ pub enum EventType {
     Fact,
     Bug,
     Artifact,
+    Workflow,
 }
 
 impl EventType {
@@ -33,6 +34,7 @@ impl EventType {
             Self::Fact => "fact",
             Self::Bug => "bug",
             Self::Artifact => "artifact",
+            Self::Workflow => "workflow",
         }
     }
 }
@@ -52,6 +54,7 @@ impl TryFrom<&str> for EventType {
             "fact" => Ok(Self::Fact),
             "bug" => Ok(Self::Bug),
             "artifact" => Ok(Self::Artifact),
+            "workflow" => Ok(Self::Workflow),
             other => Err(ShuttleError::InvalidEventType(other.to_owned())),
         }
     }

@@ -12,3 +12,4 @@ pub mod oauth;
 pub mod store;
 pub mod task;
 pub mod telemetry;
+pub mod workflow;

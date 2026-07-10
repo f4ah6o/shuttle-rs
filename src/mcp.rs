@@ -330,6 +330,176 @@ async fn call_tool(runtime: &McpRuntime, params: Value) -> Result<Value> {
             })
             .map_err(|err| ShuttleError::Serialization(err.to_string()))
         }
+        "shuttle_workflow_list" => {
+            let status = crate::context::repo_status(&runtime.cwd)?;
+            let manifest = crate::workflow::load_manifest(&status.repo_path)?;
+            serde_json::to_value(manifest.workflows)
+                .map_err(|err| ShuttleError::Serialization(err.to_string()))
+        }
+        "shuttle_workflow_start" => {
+            let workflow_id = string_arg(&args, "workflow_id")?;
+            let status = crate::context::repo_status(&runtime.cwd)?;
+            let manifest = crate::workflow::load_manifest(&status.repo_path)?;
+            let workflow = crate::workflow::definition(&manifest, &workflow_id)?;
+            let event = crate::workflow::start_event(
+                runtime.workspace_id.clone(),
+                runtime.agent.clone(),
+                runtime.session_id.clone(),
+                workflow,
+                args.get("input").cloned().unwrap_or_else(|| json!({})),
+            );
+            let event = runtime
+                .store
+                .append(with_repo_metadata(event, runtime))
+                .await?;
+            serde_json::to_value(event).map_err(|err| ShuttleError::Serialization(err.to_string()))
+        }
+        "shuttle_workflow_status" => {
+            let value = if let Some(run_id) = args.get("run_id").and_then(Value::as_str) {
+                let run_id =
+                    Uuid::parse_str(run_id).map_err(|err| ShuttleError::Store(err.to_string()))?;
+                serde_json::to_value(
+                    crate::workflow::run(&runtime.store, &runtime.workspace_id, run_id).await?,
+                )
+            } else {
+                serde_json::to_value(
+                    crate::workflow::runs(&runtime.store, &runtime.workspace_id).await?,
+                )
+            };
+            value.map_err(|err| ShuttleError::Serialization(err.to_string()))
+        }
+        "shuttle_workflow_step_claim" => {
+            let run_id = Uuid::parse_str(&string_arg(&args, "run_id")?)
+                .map_err(|err| ShuttleError::Store(err.to_string()))?;
+            let step_id = string_arg(&args, "step_id")?;
+            let takeover = args
+                .get("takeover")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let run = crate::workflow::run(&runtime.store, &runtime.workspace_id, run_id).await?;
+            crate::workflow::validate_claim(&run, &step_id, takeover)?;
+            let event = crate::workflow::action_event(
+                runtime.workspace_id.clone(),
+                runtime.agent.clone(),
+                runtime.session_id.clone(),
+                run_id,
+                if takeover { "taken_over" } else { "claimed" },
+                Some(&step_id),
+                Some(json!({ "takeover": takeover })),
+            );
+            let event = runtime
+                .store
+                .append(with_repo_metadata(event, runtime))
+                .await?;
+            serde_json::to_value(event).map_err(|err| ShuttleError::Serialization(err.to_string()))
+        }
+        "shuttle_workflow_step_complete" => {
+            let run_id = Uuid::parse_str(&string_arg(&args, "run_id")?)
+                .map_err(|err| ShuttleError::Store(err.to_string()))?;
+            let step_id = string_arg(&args, "step_id")?;
+            let run = crate::workflow::run(&runtime.store, &runtime.workspace_id, run_id).await?;
+            let approval = args.get("approval").and_then(Value::as_str);
+            crate::workflow::validate_complete(&run, &step_id, &runtime.agent, approval)?;
+            let checkpoint = json!({
+                "output": args.get("output").cloned().unwrap_or_else(|| json!({})),
+                "approval": approval,
+            });
+            let event = crate::workflow::action_event(
+                runtime.workspace_id.clone(),
+                runtime.agent.clone(),
+                runtime.session_id.clone(),
+                run_id,
+                "completed_step",
+                Some(&step_id),
+                Some(checkpoint),
+            );
+            let event = runtime
+                .store
+                .append(with_repo_metadata(event, runtime))
+                .await?;
+            serde_json::to_value(event).map_err(|err| ShuttleError::Serialization(err.to_string()))
+        }
+        "shuttle_workflow_step_fail" => {
+            let run_id = Uuid::parse_str(&string_arg(&args, "run_id")?)
+                .map_err(|err| ShuttleError::Store(err.to_string()))?;
+            let step_id = string_arg(&args, "step_id")?;
+            let run = crate::workflow::run(&runtime.store, &runtime.workspace_id, run_id).await?;
+            let step = crate::workflow::validate_step_claimed(&run, &step_id)?;
+            if step.claimed_by.as_deref() != Some(runtime.agent.as_str()) {
+                return Err(ShuttleError::Store(
+                    "workflow step is claimed by another agent; use takeover first".to_owned(),
+                ));
+            }
+            let event = crate::workflow::action_event(
+                runtime.workspace_id.clone(),
+                runtime.agent.clone(),
+                runtime.session_id.clone(),
+                run_id,
+                "failed_step",
+                Some(&step_id),
+                args.get("error").cloned(),
+            );
+            let event = runtime
+                .store
+                .append(with_repo_metadata(event, runtime))
+                .await?;
+            serde_json::to_value(event).map_err(|err| ShuttleError::Serialization(err.to_string()))
+        }
+        "shuttle_workflow_reconcile" => {
+            let run_id = Uuid::parse_str(&string_arg(&args, "run_id")?)
+                .map_err(|err| ShuttleError::Store(err.to_string()))?;
+            let step_id = string_arg(&args, "step_id")?;
+            let run = crate::workflow::run(&runtime.store, &runtime.workspace_id, run_id).await?;
+            let step = run
+                .steps
+                .iter()
+                .find(|step| step.id == step_id)
+                .ok_or_else(|| ShuttleError::Store(format!("unknown workflow step: {step_id}")))?;
+            if step.status != crate::workflow::StepStatus::NeedsReconcile {
+                return Err(ShuttleError::Store(
+                    "workflow step does not need reconciliation".to_owned(),
+                ));
+            }
+            let event = crate::workflow::action_event(
+                runtime.workspace_id.clone(),
+                runtime.agent.clone(),
+                runtime.session_id.clone(),
+                run_id,
+                "reconciled",
+                Some(&step_id),
+                args.get("output").cloned(),
+            );
+            let event = runtime
+                .store
+                .append(with_repo_metadata(event, runtime))
+                .await?;
+            serde_json::to_value(event).map_err(|err| ShuttleError::Serialization(err.to_string()))
+        }
+        "shuttle_workflow_complete" | "shuttle_workflow_abort" => {
+            let run_id = Uuid::parse_str(&string_arg(&args, "run_id")?)
+                .map_err(|err| ShuttleError::Store(err.to_string()))?;
+            let run = crate::workflow::run(&runtime.store, &runtime.workspace_id, run_id).await?;
+            let action = if name == "shuttle_workflow_complete" {
+                crate::workflow::validate_run_complete(&run)?;
+                "completed"
+            } else {
+                "aborted"
+            };
+            let event = crate::workflow::action_event(
+                runtime.workspace_id.clone(),
+                runtime.agent.clone(),
+                runtime.session_id.clone(),
+                run_id,
+                action,
+                None,
+                None,
+            );
+            let event = runtime
+                .store
+                .append(with_repo_metadata(event, runtime))
+                .await?;
+            serde_json::to_value(event).map_err(|err| ShuttleError::Serialization(err.to_string()))
+        }
         "shuttle_repo_context" | "context" => {
             let context = crate::context::assemble_context(
                 &runtime.store,
@@ -535,6 +705,51 @@ fn tools() -> Vec<Tool> {
             collab_output_schema(),
         ),
         tool(
+            "shuttle_workflow_list",
+            "List repository workflows",
+            workflow_output_schema(),
+        ),
+        tool(
+            "shuttle_workflow_start",
+            "Start a repository workflow run",
+            event_output_schema(),
+        ),
+        tool(
+            "shuttle_workflow_status",
+            "Read workflow run state",
+            workflow_output_schema(),
+        ),
+        tool(
+            "shuttle_workflow_step_claim",
+            "Claim the next workflow step",
+            event_output_schema(),
+        ),
+        tool(
+            "shuttle_workflow_step_complete",
+            "Checkpoint a completed workflow step",
+            event_output_schema(),
+        ),
+        tool(
+            "shuttle_workflow_step_fail",
+            "Record a failed workflow step",
+            event_output_schema(),
+        ),
+        tool(
+            "shuttle_workflow_reconcile",
+            "Resolve an interrupted non-idempotent workflow step",
+            event_output_schema(),
+        ),
+        tool(
+            "shuttle_workflow_complete",
+            "Complete a workflow run after all steps finish",
+            event_output_schema(),
+        ),
+        tool(
+            "shuttle_workflow_abort",
+            "Abort a workflow run",
+            event_output_schema(),
+        ),
+        tool(
             "shuttle_repo_context",
             "Read assembled repo context",
             context_output_schema(),
@@ -579,7 +794,14 @@ fn structured_content(tool_name: Option<&str>, value: &Value) -> Value {
             | "shuttle_task_done"
             | "shuttle_handoff_request"
             | "shuttle_handoff_accept"
-            | "shuttle_handoff_done",
+            | "shuttle_handoff_done"
+            | "shuttle_workflow_start"
+            | "shuttle_workflow_step_claim"
+            | "shuttle_workflow_step_complete"
+            | "shuttle_workflow_step_fail"
+            | "shuttle_workflow_reconcile"
+            | "shuttle_workflow_complete"
+            | "shuttle_workflow_abort",
         ) => json!({ "event": value }),
         Some(
             "shuttle_collab_start"
@@ -599,6 +821,9 @@ fn structured_content(tool_name: Option<&str>, value: &Value) -> Value {
         }
         Some("tasks" | "shuttle_task_list") => json!({ "tasks": value }),
         Some("shuttle_handoff_list") => json!({ "handoffs": value }),
+        Some("shuttle_workflow_list" | "shuttle_workflow_status") => {
+            json!({ "workflow": value })
+        }
         _ => value.clone(),
     }
 }
@@ -632,6 +857,10 @@ fn collab_output_schema() -> Value {
     json!({ "type": "object", "additionalProperties": true })
 }
 
+fn workflow_output_schema() -> Value {
+    json!({ "type": "object", "additionalProperties": true })
+}
+
 fn context_output_schema() -> Value {
     object_schema(
         json!({
@@ -649,6 +878,7 @@ fn context_output_schema() -> Value {
             "pending_handoffs": array_schema(handoff_schema()),
             "recent_completed_handoffs": array_schema(handoff_schema()),
             "inbox": array_schema(event_schema()),
+            "active_workflows": array_schema(json!({ "type": "object", "additionalProperties": true })),
         }),
         vec![
             "repo",
@@ -664,6 +894,7 @@ fn context_output_schema() -> Value {
             "pending_handoffs",
             "recent_completed_handoffs",
             "inbox",
+            "active_workflows",
         ],
     )
 }
@@ -898,6 +1129,15 @@ mod tests {
         assert!(names.contains(&"shuttle_collab_status"));
         assert!(names.contains(&"shuttle_collab_nudge"));
         assert!(names.contains(&"shuttle_collab_pass"));
+        assert!(names.contains(&"shuttle_workflow_list"));
+        assert!(names.contains(&"shuttle_workflow_start"));
+        assert!(names.contains(&"shuttle_workflow_status"));
+        assert!(names.contains(&"shuttle_workflow_step_claim"));
+        assert!(names.contains(&"shuttle_workflow_step_complete"));
+        assert!(names.contains(&"shuttle_workflow_step_fail"));
+        assert!(names.contains(&"shuttle_workflow_reconcile"));
+        assert!(names.contains(&"shuttle_workflow_complete"));
+        assert!(names.contains(&"shuttle_workflow_abort"));
         assert!(tools
             .iter()
             .all(|tool| tool.output_schema["type"] == "object"));
@@ -1053,6 +1293,76 @@ mod tests {
         assert_eq!(
             status["result"]["structuredContent"]["collab"]["pending_handoffs"][0]["status"],
             "pending"
+        );
+    }
+
+    #[test]
+    fn workflow_tools_round_trip() {
+        let repo = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        init_git_repo(repo.path());
+        fs::create_dir(repo.path().join("docs")).unwrap();
+        fs::write(repo.path().join("docs/workflow.md"), "workflow spec").unwrap();
+        fs::write(
+            repo.path().join(crate::workflow::MANIFEST_FILE),
+            r#"
+version = 1
+[[workflow]]
+id = "daily"
+title = "Daily"
+spec = "docs/workflow.md"
+[[workflow.step]]
+id = "read"
+title = "Read"
+kind = "read_only"
+"#,
+        )
+        .unwrap();
+        let runtime = McpRuntime {
+            store: SqliteEventStore::open(data.path().join("shuttle.db")).unwrap(),
+            cwd: repo.path().to_path_buf(),
+            workspace_id: "workspace".into(),
+            agent: "codex".into(),
+            session_id: "session".into(),
+        };
+
+        let start = futures_executor::block_on(handle_request(
+            &runtime,
+            tool_request(
+                "shuttle_workflow_start",
+                json!({ "workflow_id": "daily", "input": { "date": "2026-07-10" } }),
+            ),
+        ));
+        let run_id = response_text_json(&start)["metadata_json"]["run_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        futures_executor::block_on(handle_request(
+            &runtime,
+            tool_request(
+                "shuttle_workflow_step_claim",
+                json!({ "run_id": run_id, "step_id": "read" }),
+            ),
+        ));
+        futures_executor::block_on(handle_request(
+            &runtime,
+            tool_request(
+                "shuttle_workflow_step_complete",
+                json!({ "run_id": run_id, "step_id": "read", "output": { "read": true } }),
+            ),
+        ));
+        let status = futures_executor::block_on(handle_request(
+            &runtime,
+            tool_request("shuttle_workflow_status", json!({ "run_id": run_id })),
+        ));
+
+        assert_eq!(
+            response_text_json(&status)["steps"][0]["status"],
+            "completed"
+        );
+        assert_eq!(
+            status["result"]["structuredContent"]["workflow"]["workflow_id"],
+            "daily"
         );
     }
 
