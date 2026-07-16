@@ -180,7 +180,7 @@ async fn inbox_events(
             })
             .await?,
     );
-    events.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    events.sort_by_key(|event| std::cmp::Reverse(event.created_at));
     events.truncate(20);
     Ok(events)
 }

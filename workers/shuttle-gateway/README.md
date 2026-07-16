@@ -49,8 +49,8 @@ POST   /api/tokens                                    mint scoped PAT (admin)
 POST   /api/projects                                  create project (admin)
 GET    /api/projects                                  list projects
 POST   /api/projects/{project}/workspaces
-POST   /api/projects/{project}/events                 append (idempotent)
-GET    /api/projects/{project}/events
+POST   /api/projects/{project}/events                 append (idempotent; optional created_at)
+GET    /api/projects/{project}/events                 ?limit=&event_type=&before=<created_at>|<id>
 POST   /api/projects/{project}/recall
 POST   /api/projects/{project}/context-snapshots
 GET    /api/projects/{project}/context-snapshots/latest
@@ -109,9 +109,23 @@ curl -sX POST "$URL/api/tokens" -H "authorization: Bearer $ADMIN" \
   -d '{"project":"my-project","scopes":["read","write"]}'
 ```
 
+## Syncing repo-local event logs
+
+The `stl sync` command imports/exports repo-local `.shuttle/shuttle.db` event
+logs against this Worker (see "Cloud Sync" in the repository `AGENTS.md`).
+Two Worker features support it:
+
+- **Client-supplied `created_at`.** The append body accepts an optional
+  ISO-8601 `created_at` so imported history keeps its original ordering;
+  server time is used when absent.
+- **Keyset pagination.** `GET .../events` accepts
+  `before=<created_at>|<id>` matching the listing order
+  (`created_at DESC, id DESC`) and responds with
+  `{ events, has_more, next_before }`, so pulls are not capped by the
+  500-event page limit.
+
 ## Not yet implemented (tracked in #46)
 
 - OAuth 2.1 for ChatGPT/Claude.ai web clients (PAT auth is in place first).
 - R2 offload for large snapshots/archives and Queue/Vectorize enrichment.
-- Importing existing repo-local `.shuttle/shuttle.db` event logs.
 - A richer task/handoff projection matching the local Rust model.

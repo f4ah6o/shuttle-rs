@@ -1458,6 +1458,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1482,6 +1488,114 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "shuttle-app"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "futures-executor",
+ "serde",
+ "serde_json",
+ "shuttle-context",
+ "shuttle-core",
+ "shuttle-mcp",
+ "shuttle-memory",
+ "shuttle-message",
+ "shuttle-store",
+ "shuttle-task",
+ "tokio",
+]
+
+[[package]]
+name = "shuttle-context"
+version = "0.1.0"
+dependencies = [
+ "futures-executor",
+ "serde",
+ "shuttle-core",
+ "shuttle-store",
+ "shuttle-task",
+ "tempfile",
+]
+
+[[package]]
+name = "shuttle-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
+name = "shuttle-mcp"
+version = "0.1.0"
+dependencies = [
+ "futures-executor",
+ "serde",
+ "serde_json",
+ "shuttle-context",
+ "shuttle-core",
+ "shuttle-memory",
+ "shuttle-message",
+ "shuttle-store",
+ "shuttle-task",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
+name = "shuttle-memory"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "shuttle-core",
+]
+
+[[package]]
+name = "shuttle-mesh"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "futures-executor",
+ "serde",
+ "serde_json",
+ "shuttle-core",
+ "shuttle-memory",
+ "shuttle-message",
+ "shuttle-store",
+ "shuttle-task",
+ "tempfile",
+]
+
+[[package]]
+name = "shuttle-message"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "shuttle-core",
+]
+
+[[package]]
+name = "shuttle-remote"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "futures-executor",
+ "serde",
+ "serde_json",
+ "shuttle-core",
+ "shuttle-memory",
+ "shuttle-store",
+ "tempfile",
+ "ureq",
+ "uuid",
+]
 
 [[package]]
 name = "shuttle-rs"
@@ -1513,6 +1627,34 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "ureq",
+ "uuid",
+]
+
+[[package]]
+name = "shuttle-store"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures-executor",
+ "rusqlite",
+ "serde_json",
+ "shuttle-core",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
+name = "shuttle-task"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "futures-executor",
+ "serde",
+ "serde_json",
+ "shuttle-core",
+ "shuttle-store",
+ "tempfile",
  "uuid",
 ]
 
@@ -1559,6 +1701,31 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "stl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "futures-executor",
+ "serde",
+ "serde_json",
+ "shuttle-app",
+ "shuttle-context",
+ "shuttle-core",
+ "shuttle-mcp",
+ "shuttle-memory",
+ "shuttle-mesh",
+ "shuttle-message",
+ "shuttle-remote",
+ "shuttle-store",
+ "shuttle-task",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
 
 [[package]]
 name = "strsim"
@@ -2053,6 +2220,7 @@ dependencies = [
  "getrandom 0.4.2",
  "js-sys",
  "serde_core",
+ "sha1_smol",
  "wasm-bindgen",
 ]
 
