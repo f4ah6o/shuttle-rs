@@ -1,3 +1,26 @@
+[workspace]
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/shuttle-rs/shuttle-rs"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures-executor = "0.3"
+rusqlite = { version = "0.31", features = ["bundled", "chrono", "uuid"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "process", "signal", "time"] }
+uuid = { version = "1", features = ["serde", "v4", "v5"] }
+
 [package]
 name = "shuttle-rs"
 version = "2026.6.9"

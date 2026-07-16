@@ -5,8 +5,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# The published `stl` binary is built from the root `shuttle-rs` package; this
+# development mirror emits `stl-dev` so the two targets don't collide in the
+# shared workspace target directory.
 [[bin]]
-name = "stl"
+name = "stl-dev"
 path = "src/main.rs"
 
 [dependencies]

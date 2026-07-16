@@ -142,12 +142,8 @@ enum AppCommand {
 
 #[derive(Debug, Subcommand)]
 enum SkillCommand {
-    Install {
-        target: SkillTarget,
-    },
-    Print {
-        target: SkillTarget,
-    },
+    Install { target: SkillTarget },
+    Print { target: SkillTarget },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -509,8 +505,9 @@ fn main() -> Result<()> {
                 Some(SyncCommand::Init) => {
                     let settings = resolve_remote_settings(&env, &overrides)?;
                     let path = env.shuttle_dir.join("remote.json");
-                    fs::create_dir_all(&env.shuttle_dir)
-                        .with_context(|| format!("failed to create {}", env.shuttle_dir.display()))?;
+                    fs::create_dir_all(&env.shuttle_dir).with_context(|| {
+                        format!("failed to create {}", env.shuttle_dir.display())
+                    })?;
                     settings.save(&path)?;
                     output(cli.json, &settings, || {
                         format!(
@@ -820,7 +817,10 @@ fn resolve_remote_settings(
 fn remote_api(
     env: &RuntimeEnv,
     overrides: &SyncOverrides,
-) -> Result<(shuttle_remote::HttpRemoteApi, shuttle_remote::RemoteSettings)> {
+) -> Result<(
+    shuttle_remote::HttpRemoteApi,
+    shuttle_remote::RemoteSettings,
+)> {
     let settings = resolve_remote_settings(env, overrides)?;
     let token_env = settings
         .token_env

@@ -384,7 +384,6 @@ mod tests {
                 events: RefCell::new(Vec::new()),
             }
         }
-
     }
 
     impl RemoteApi for FakeRemoteApi {
