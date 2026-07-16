@@ -77,6 +77,10 @@ production.
 
 ## Deploy
 
+For a full step-by-step guide (wrangler auth, `wrangler.toml` configuration,
+verification, and connecting local repositories), see
+[docs/deploy-cloudflare.md](../../docs/deploy-cloudflare.md). Short version:
+
 ```bash
 # create the D1 database and copy its id into wrangler.toml
 wrangler d1 create shuttle

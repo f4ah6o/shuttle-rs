@@ -164,8 +164,9 @@ events visible in the receiving workspace.
 ## Cloud Sync (Cloudflare gateway)
 
 Share the local event log across machines through the cloud shuttle-gateway
-(the Cloudflare Worker in `workers/shuttle-gateway/`). Configure once per
-repository, then push/pull:
+(the Cloudflare Worker in `workers/shuttle-gateway/`). To stand up the gateway
+itself, see [docs/deploy-cloudflare.md](./docs/deploy-cloudflare.md). Configure
+once per repository, then push/pull:
 
 ```bash
 export SHUTTLE_GATEWAY_TOKEN=stl_...   # scoped PAT minted by the gateway
