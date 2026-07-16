@@ -1366,7 +1366,7 @@ fn main() -> Result<()> {
                     output(cli.json, &summary, || {
                         format!(
                             "indexed {} ({}) on {} as project type '{}'",
-                            summary.repo, &summary.commit, summary.branch, summary.project_type
+                            summary.repo, summary.commit, summary.branch, summary.project_type
                         )
                     })?;
                 }

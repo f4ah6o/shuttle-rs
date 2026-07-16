@@ -44,7 +44,7 @@ pub async fn inbox(store: &impl EventStore, agent: &str) -> Result<Vec<Event>> {
             })
             .await?,
     );
-    events.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    events.sort_by_key(|event| std::cmp::Reverse(event.created_at));
     Ok(events)
 }
 
