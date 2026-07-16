@@ -379,6 +379,11 @@ container run \
   ghcr.io/f4ah6o/shuttle-gateway:<version>
 ```
 
+代わりに cloud-hosted な gateway を通して machine 間で event log を共有するには、
+`workers/shuttle-gateway/` の Cloudflare Worker をデプロイし
+([docs/deploy-cloudflare.ja.md](./docs/deploy-cloudflare.ja.md) を参照)、
+`stl sync` で同期します([AGENTS.md](./AGENTS.md) の「Cloud Sync」を参照)。
+
 Shuttle instance 間で event log を同期します。
 
 ```bash
