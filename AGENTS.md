@@ -160,3 +160,24 @@ stl mesh sync /path/to/peer/.shuttle/shuttle.db
 
 Mesh sync preserves stable event ids, skips duplicates, and keeps imported
 events visible in the receiving workspace.
+
+## Cloud Sync (Cloudflare gateway)
+
+Share the local event log across machines through the cloud shuttle-gateway
+(the Cloudflare Worker in `workers/shuttle-gateway/`). Configure once per
+repository, then push/pull:
+
+```bash
+export SHUTTLE_GATEWAY_TOKEN=stl_...   # scoped PAT minted by the gateway
+stl sync init --url https://<gateway-host> --project my-project
+stl sync push   # upload local events (idempotent by event id)
+stl sync pull   # download gateway events into this workspace
+stl sync        # both: push, then pull
+```
+
+`stl sync init` writes `.shuttle/remote.json` (URL, project, and optionally
+the token env var name via `--token-env`); the token itself is never stored.
+Flags override the saved settings, and `SHUTTLE_GATEWAY_URL` /
+`SHUTTLE_GATEWAY_PROJECT` work as fallbacks. Like mesh sync, cloud sync
+preserves event ids, keeps original timestamps, skips duplicates, and makes
+pulled events visible in the receiving workspace.

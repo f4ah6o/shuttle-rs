@@ -34,6 +34,20 @@ function scopeList(value: unknown): Scope[] {
 }
 
 /**
+ * Keyset cursor for event listing: `<created_at>|<id>`, matching the listing
+ * order `created_at DESC, id DESC`. Split on the first `|` because RFC3339
+ * timestamps never contain one, while a client-supplied id could.
+ */
+function parseBeforeCursor(raw: string | null): { createdAt: string; id: string } | undefined {
+  if (!raw) return undefined;
+  const separator = raw.indexOf("|");
+  if (separator <= 0 || separator === raw.length - 1) {
+    throw badRequest("invalid before cursor; expected <created_at>|<id>");
+  }
+  return { createdAt: raw.slice(0, separator), id: raw.slice(separator + 1) };
+}
+
+/**
  * Resource-oriented API. MCP tools and these endpoints call the same
  * application services, so neither one is a privileged path. Every project
  * operation goes through `authorize`, which is the only way to obtain the
@@ -113,6 +127,7 @@ export async function handleApi(
           tags: Array.isArray(body.tags) ? body.tags.map(String) : [],
           context: (body.context as ContextEnvelope) ?? null,
           metadata: (body.metadata as Record<string, unknown>) ?? null,
+          created_at: typeof body.created_at === "string" ? body.created_at : null,
         });
         return json(result, result.deduplicated ? 200 : 201);
       }
@@ -120,12 +135,19 @@ export async function handleApi(
         const authorized = await authorize(db, principal, selector, "read");
         const url = new URL(request.url);
         const typeParam = url.searchParams.get("event_type");
-        const limit = Number(url.searchParams.get("limit") ?? "50");
+        const rawLimit = Number(url.searchParams.get("limit") ?? "50");
+        const limit = Math.max(1, Math.min(Number.isFinite(rawLimit) ? rawLimit : 50, 500));
         const events = await listEventsService(db, authorized, {
           eventType: (typeParam as EventType) ?? undefined,
-          limit: Number.isFinite(limit) ? limit : 50,
+          limit,
+          before: parseBeforeCursor(url.searchParams.get("before")),
         });
-        return json({ events });
+        const last = events[events.length - 1];
+        return json({
+          events,
+          has_more: events.length === limit,
+          next_before: last ? `${last.created_at}|${last.id}` : null,
+        });
       }
     }
 

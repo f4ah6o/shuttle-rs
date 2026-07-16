@@ -22,6 +22,7 @@ shuttle-core = { path = "../shuttle-core" }
 shuttle-memory = { path = "../shuttle-memory" }
 shuttle-message = { path = "../shuttle-message" }
 shuttle-mesh = { path = "../shuttle-mesh" }
+shuttle-remote = { path = "../shuttle-remote" }
 shuttle-mcp = { path = "../shuttle-mcp" }
 shuttle-store = { path = "../shuttle-store" }
 shuttle-task = { path = "../shuttle-task" }

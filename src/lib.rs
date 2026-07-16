@@ -9,6 +9,7 @@ pub mod memory;
 pub mod mesh;
 pub mod message;
 pub mod oauth;
+pub mod remote;
 pub mod store;
 pub mod task;
 pub mod telemetry;
