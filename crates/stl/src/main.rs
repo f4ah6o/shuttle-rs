@@ -68,6 +68,20 @@ enum Command {
         #[command(subcommand)]
         command: MeshCommand,
     },
+    /// Sync the local event log with a cloud shuttle-gateway over Cloudflare.
+    Sync {
+        #[command(subcommand)]
+        command: Option<SyncCommand>,
+        /// Gateway base URL (overrides .shuttle/remote.json and SHUTTLE_GATEWAY_URL).
+        #[arg(long, global = true)]
+        url: Option<String>,
+        /// Project id or slug on the gateway.
+        #[arg(long, global = true)]
+        project: Option<String>,
+        /// Name of the environment variable holding the bearer token.
+        #[arg(long = "token-env", global = true)]
+        token_env: Option<String>,
+    },
     Context {
         #[arg(long)]
         repo: bool,
@@ -109,6 +123,16 @@ enum MeshCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum SyncCommand {
+    /// Persist gateway URL/project (and optional token env name) in .shuttle/remote.json.
+    Init,
+    /// Push local events to the gateway.
+    Push,
+    /// Pull gateway events into the local store.
+    Pull,
+}
+
+#[derive(Debug, Subcommand)]
 enum AppCommand {
     Serve {
         #[arg(long, default_value = "127.0.0.1:8787")]
@@ -118,12 +142,8 @@ enum AppCommand {
 
 #[derive(Debug, Subcommand)]
 enum SkillCommand {
-    Install {
-        target: SkillTarget,
-    },
-    Print {
-        target: SkillTarget,
-    },
+    Install { target: SkillTarget },
+    Print { target: SkillTarget },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -470,6 +490,81 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Command::Sync {
+            command,
+            url,
+            project,
+            token_env,
+        } => {
+            let overrides = SyncOverrides {
+                url,
+                project,
+                token_env,
+            };
+            match command {
+                Some(SyncCommand::Init) => {
+                    let settings = resolve_remote_settings(&env, &overrides)?;
+                    let path = env.shuttle_dir.join("remote.json");
+                    fs::create_dir_all(&env.shuttle_dir).with_context(|| {
+                        format!("failed to create {}", env.shuttle_dir.display())
+                    })?;
+                    settings.save(&path)?;
+                    output(cli.json, &settings, || {
+                        format!(
+                            "saved gateway settings for project '{}' to {}",
+                            settings.project,
+                            path.display()
+                        )
+                    })?;
+                }
+                Some(SyncCommand::Push) => {
+                    let store = open_store(&env)?;
+                    let (api, _) = remote_api(&env, &overrides)?;
+                    let report = block_on(shuttle_remote::push(&store, &api))?;
+                    output(cli.json, &report, || {
+                        format!(
+                            "pushed {} event(s) ({} already on gateway)",
+                            report.pushed, report.deduplicated
+                        )
+                    })?;
+                }
+                Some(SyncCommand::Pull) => {
+                    let store = open_store(&env)?;
+                    let (api, settings) = remote_api(&env, &overrides)?;
+                    let report = block_on(shuttle_remote::pull(
+                        &store,
+                        &api,
+                        &env.workspace_id,
+                        &settings.project,
+                    ))?;
+                    output(cli.json, &report, || {
+                        format!(
+                            "pulled {} event(s) over {} page(s) ({} duplicate)",
+                            report.imported, report.pages, report.skipped_duplicates
+                        )
+                    })?;
+                }
+                None => {
+                    let store = open_store(&env)?;
+                    let (api, settings) = remote_api(&env, &overrides)?;
+                    let report = block_on(shuttle_remote::sync(
+                        &store,
+                        &api,
+                        &env.workspace_id,
+                        &settings.project,
+                    ))?;
+                    output(cli.json, &report, || {
+                        format!(
+                            "synced with gateway: pushed {} ({} duplicate), pulled {} ({} duplicate)",
+                            report.push.pushed,
+                            report.push.deduplicated,
+                            report.pull.imported,
+                            report.pull.skipped_duplicates
+                        )
+                    })?;
+                }
+            }
+        }
         Command::Context { repo, branch } => {
             if repo && branch {
                 anyhow::bail!("--repo and --branch cannot be used together");
@@ -671,6 +766,76 @@ fn open_peer_store(path: &Path) -> Result<SqliteEventStore> {
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
     SqliteEventStore::open(path).with_context(|| format!("failed to open {}", path.display()))
+}
+
+#[derive(Debug, Default)]
+struct SyncOverrides {
+    url: Option<String>,
+    project: Option<String>,
+    token_env: Option<String>,
+}
+
+const DEFAULT_GATEWAY_TOKEN_ENV: &str = "SHUTTLE_GATEWAY_TOKEN";
+
+/// Resolve gateway settings: CLI flags win, then `.shuttle/remote.json`, then
+/// `SHUTTLE_GATEWAY_URL` / `SHUTTLE_GATEWAY_PROJECT`. The token is never read
+/// here — only the name of the environment variable that holds it.
+fn resolve_remote_settings(
+    env: &RuntimeEnv,
+    overrides: &SyncOverrides,
+) -> Result<shuttle_remote::RemoteSettings> {
+    let saved = shuttle_remote::RemoteSettings::load(env.shuttle_dir.join("remote.json")).ok();
+    let url = overrides
+        .url
+        .clone()
+        .or_else(|| saved.as_ref().map(|settings| settings.url.clone()))
+        .or_else(|| env::var("SHUTTLE_GATEWAY_URL").ok())
+        .filter(|url| !url.trim().is_empty())
+        .context(
+            "gateway URL is not configured; pass --url, run `stl sync init --url <url> --project <project>`, or set SHUTTLE_GATEWAY_URL",
+        )?;
+    let project = overrides
+        .project
+        .clone()
+        .or_else(|| saved.as_ref().map(|settings| settings.project.clone()))
+        .or_else(|| env::var("SHUTTLE_GATEWAY_PROJECT").ok())
+        .filter(|project| !project.trim().is_empty())
+        .context(
+            "gateway project is not configured; pass --project, run `stl sync init`, or set SHUTTLE_GATEWAY_PROJECT",
+        )?;
+    let token_env = overrides
+        .token_env
+        .clone()
+        .or_else(|| saved.and_then(|settings| settings.token_env));
+    Ok(shuttle_remote::RemoteSettings {
+        url,
+        project,
+        token_env,
+    })
+}
+
+fn remote_api(
+    env: &RuntimeEnv,
+    overrides: &SyncOverrides,
+) -> Result<(
+    shuttle_remote::HttpRemoteApi,
+    shuttle_remote::RemoteSettings,
+)> {
+    let settings = resolve_remote_settings(env, overrides)?;
+    let token_env = settings
+        .token_env
+        .clone()
+        .unwrap_or_else(|| DEFAULT_GATEWAY_TOKEN_ENV.to_owned());
+    let token = env::var(&token_env)
+        .ok()
+        .filter(|token| !token.trim().is_empty())
+        .with_context(|| format!("gateway token is not set; export {token_env}"))?;
+    let api = shuttle_remote::HttpRemoteApi::new(shuttle_remote::RemoteConfig {
+        url: settings.url.clone(),
+        project: settings.project.clone(),
+        token,
+    });
+    Ok((api, settings))
 }
 
 fn load_peer_workspace_id(database_path: &Path) -> Option<String> {

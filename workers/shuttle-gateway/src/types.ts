@@ -66,6 +66,12 @@ export interface EventInput {
   tags?: string[];
   context?: ContextEnvelope | null;
   metadata?: Record<string, unknown> | null;
+  /**
+   * Optional client-supplied creation time (ISO-8601). Used when importing
+   * pre-existing local event logs so history keeps its original ordering.
+   * Server time is used when absent.
+   */
+  created_at?: string | null;
 }
 
 export interface Event {

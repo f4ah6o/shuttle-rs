@@ -200,7 +200,7 @@ export async function appendEvent(
     repo_dirty: repo?.dirty ?? null,
     metadata_json: metadata,
     tags,
-    created_at: nowIso(),
+    created_at: input.created_at ?? nowIso(),
   };
 
   const statements: Statement[] = [
@@ -241,6 +241,8 @@ export interface ListEventsOptions {
   eventTypes?: EventType[];
   workspaceId?: string;
   limit?: number;
+  /** Keyset cursor: return only events strictly older than this position. */
+  before?: { createdAt: string; id: string };
 }
 
 export async function listEvents(
@@ -258,6 +260,10 @@ export async function listEvents(
   if (options.workspaceId) {
     clauses.push("workspace_id = ?");
     params.push(options.workspaceId);
+  }
+  if (options.before) {
+    clauses.push("(created_at < ? OR (created_at = ? AND id < ?))");
+    params.push(options.before.createdAt, options.before.createdAt, options.before.id);
   }
   const limit = Math.max(1, Math.min(options.limit ?? 50, 500));
   const rows = await db.query(
@@ -308,7 +314,7 @@ export async function latestSnapshot(
   projectId: string,
 ): Promise<ContextSnapshot | null> {
   const row = await db.first(
-    "SELECT * FROM context_snapshots WHERE project_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+    "SELECT * FROM context_snapshots WHERE project_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
     [projectId],
   );
   if (!row) return null;

@@ -2277,6 +2277,14 @@ mod tests {
         calls: Mutex<Vec<(String, Vec<String>)>>,
     }
 
+    fn test_repo_path() -> PathBuf {
+        std::env::temp_dir().join("shuttle-gateway-test-repo")
+    }
+
+    fn toml_path(path: &Path) -> String {
+        format!("{:?}", path.to_string_lossy().to_string())
+    }
+
     #[async_trait]
     impl Runner for FakeRunner {
         async fn run(
@@ -2299,7 +2307,7 @@ mod tests {
                 "demo".to_owned(),
                 ProjectConfig {
                     backend: ProjectBackendKind::Local,
-                    repo: Some(PathBuf::from("/tmp/demo")),
+                    repo: Some(test_repo_path()),
                     db: None,
                     url: String::new(),
                     token_env: None,
@@ -2317,7 +2325,12 @@ mod tests {
         std::fs::write(&path, "[projects.demo]\nrepo = \"relative\"\n").unwrap();
         assert!(GatewayConfig::load(&path).is_err());
 
-        std::fs::write(&path, "[projects.demo]\nrepo = \"/tmp/demo\"\n").unwrap();
+        let repo = dir.path().join("demo");
+        std::fs::write(
+            &path,
+            format!("[projects.demo]\nrepo = {}\n", toml_path(&repo)),
+        )
+        .unwrap();
         let cfg = GatewayConfig::load(&path).unwrap();
         assert_eq!(cfg.server.addr, default_addr());
         assert_eq!(cfg.auth.bearer_token_env, "SHUTTLE_GATEWAY_TOKEN");
@@ -2328,9 +2341,13 @@ mod tests {
     fn config_normalizes_oauth_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("projects.toml");
+        let repo = dir.path().join("demo");
         std::fs::write(
             &path,
-            "[oauth]\npublic_url = \"https://shuttle.example.test/\"\n\n[projects.demo]\nrepo = \"/tmp/demo\"\n",
+            format!(
+                "[oauth]\npublic_url = \"https://shuttle.example.test/\"\n\n[projects.demo]\nrepo = {}\n",
+                toml_path(&repo)
+            ),
         )
         .unwrap();
         let cfg = GatewayConfig::load(&path).unwrap();
@@ -2374,9 +2391,13 @@ mod tests {
     fn config_rejects_none_listener_on_non_loopback() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("projects.toml");
+        let repo = dir.path().join("demo");
         std::fs::write(
             &path,
-            "[[listeners]]\nname = \"open\"\naddr = \"0.0.0.0:8787\"\nauth = \"none\"\n\n[projects.demo]\nrepo = \"/tmp/demo\"\n",
+            format!(
+                "[[listeners]]\nname = \"open\"\naddr = \"0.0.0.0:8787\"\nauth = \"none\"\n\n[projects.demo]\nrepo = {}\n",
+                toml_path(&repo)
+            ),
         )
         .unwrap();
 
@@ -2942,7 +2963,8 @@ mod tests {
         std::fs::write(
             &path,
             format!(
-                "[defaults]\nproject = \"demo\"\n\n[projects.demo]\nbackend = \"local\"\nrepo = \"/tmp/demo\"\n{extra}"
+                "[defaults]\nproject = \"demo\"\n\n[projects.demo]\nbackend = \"local\"\nrepo = {}\n{extra}",
+                toml_path(&test_repo_path())
             ),
         )
         .unwrap();
@@ -2981,7 +3003,7 @@ mod tests {
                 "demo".to_owned(),
                 ProjectConfig {
                     backend: ProjectBackendKind::Local,
-                    repo: Some(PathBuf::from("/tmp/demo")),
+                    repo: Some(test_repo_path()),
                     db: None,
                     url: String::new(),
                     token_env: None,

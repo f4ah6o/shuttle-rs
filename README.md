@@ -411,6 +411,11 @@ container run \
   ghcr.io/f4ah6o/shuttle-gateway:<version>
 ```
 
+To share event logs across machines through a cloud-hosted gateway instead,
+deploy the Cloudflare Worker in `workers/shuttle-gateway/` — see
+[docs/deploy-cloudflare.md](./docs/deploy-cloudflare.md) — and sync with
+`stl sync` (see "Cloud Sync" in [AGENTS.md](./AGENTS.md)).
+
 Synchronize event logs between Shuttle instances:
 
 ```bash

@@ -99,9 +99,18 @@ export function appendEventService(
     tags?: string[];
     context?: ContextEnvelope | null;
     metadata?: Record<string, unknown> | null;
+    created_at?: string | null;
   },
 ): Promise<AppendResult> {
   requireNonEmpty(input.content, "content is required");
+  let createdAt: string | null = null;
+  if (input.created_at != null && input.created_at.trim()) {
+    const trimmed = input.created_at.trim();
+    if (Number.isNaN(Date.parse(trimmed))) {
+      throw badRequest(`invalid created_at ${JSON.stringify(trimmed)}`);
+    }
+    createdAt = trimmed;
+  }
   return appendEvent(db, authorized.project.id, {
     event_id: input.event_id ?? null,
     event_type: normalizeEventType(input.event_type),
@@ -112,6 +121,7 @@ export function appendEventService(
     tags: input.tags ?? [],
     context: input.context ?? null,
     metadata: input.metadata ?? null,
+    created_at: createdAt,
   });
 }
 
@@ -136,7 +146,11 @@ export function rememberService(
 export function listEventsService(
   db: Database,
   authorized: AuthorizedProject,
-  options: { eventType?: EventType; limit?: number } = {},
+  options: {
+    eventType?: EventType;
+    limit?: number;
+    before?: { createdAt: string; id: string };
+  } = {},
 ): Promise<Event[]> {
   return listEvents(db, authorized.project.id, options);
 }
