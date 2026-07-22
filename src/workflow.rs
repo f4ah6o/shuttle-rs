@@ -423,6 +423,18 @@ fn metadata_uuid(event: &Event, key: &str) -> Result<Uuid> {
 }
 
 pub fn validate_claim(run: &WorkflowRun, step_id: &str, takeover: bool) -> Result<&'static str> {
+    validate_claim_for_agent(run, step_id, takeover, None)
+}
+
+/// Validate a claim while allowing a retry by the current owner. The cloud
+/// gateway performs the authoritative atomic check; this local validation only
+/// prevents avoidable invalid requests before they cross the network.
+pub fn validate_claim_for_agent(
+    run: &WorkflowRun,
+    step_id: &str,
+    takeover: bool,
+    agent: Option<&str>,
+) -> Result<&'static str> {
     if !matches!(
         run.status,
         RunStatus::Active | RunStatus::Failed | RunStatus::NeedsReconcile
@@ -447,6 +459,17 @@ pub fn validate_claim(run: &WorkflowRun, step_id: &str, takeover: bool) -> Resul
         StepStatus::Pending => Ok("claimed"),
         StepStatus::Failed => Ok("reclaimed"),
         StepStatus::Claimed if takeover => Ok("taken_over"),
+        StepStatus::Claimed
+            if agent.is_some_and(|agent| {
+                run.steps
+                    .iter()
+                    .find(|step| step.id == step_id)
+                    .and_then(|step| step.claimed_by.as_deref())
+                    == Some(agent)
+            }) =>
+        {
+            Ok("claimed")
+        }
         StepStatus::Claimed => invalid(format!("workflow step {step_id} is already claimed")),
         StepStatus::NeedsReconcile => {
             invalid(format!("workflow step {step_id} needs reconciliation"))

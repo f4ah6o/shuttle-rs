@@ -4,8 +4,8 @@
 
 このガイドでは、cloud shuttle-gateway
 ([`workers/shuttle-gateway/`](../workers/shuttle-gateway/) の Cloudflare
-Worker)を、新規の Cloudflare アカウントから、project・token の作成、ローカル
-リポジトリの同期までを通してデプロイする手順を説明します。
+Worker)を会社の Cloudflare アカウントへ、既存の `obr-grp.com` ゾーンと
+Cloudflare Access を使ってデプロイする手順を説明します。
 
 この Worker は、Cloudflare D1 を永続的な共有 event store として使う、
 stateless な MCP endpoint とリソース指向の HTTP API です。Rust 製の
@@ -15,8 +15,8 @@ gateway については、リポジトリ [README](../README.ja.md) の
 
 ## 前提条件
 
-- Workers と D1 が有効な Cloudflare アカウント(開始時点では free tier で
-  十分です)。
+- Workers と D1 が有効な会社の Cloudflare アカウント。
+- 同じアカウントで管理している `obr-grp.com` ゾーン。
 - Node.js 20 以上と npm。
 - ローカルにチェックアウトしたリポジトリ。
 
@@ -59,16 +59,53 @@ migrations_dir = "migrations"
 
 引き続き `wrangler.toml` で:
 
-- `PUBLIC_URL` — デプロイされた Worker の公開 base URL(例:
-  `https://shuttle-gateway.<your-subdomain>.workers.dev`、または custom
-  domain)。MCP/OAuth metadata に反映されます。
-- `ADMIN_OWNER_ID` — bootstrap admin token に紐づく owner id。デフォルトの
-  `owner-local` のままで問題ありません。最初の scoped token の発行と最初の
-  project 作成にのみ使われます。
+- `PUBLIC_URL` — デプロイされた Worker の base URL。今回の値は
+  `https://shuttle.obr-grp.com` です。MCP/OAuth metadata に反映されます。
+- `ADMIN_OWNER_ID` — 共有 tenant の固定 owner id。今回の値は `obr-grp` です。
+- `ACCESS_TEAM_DOMAIN` — Cloudflare Access team の issuer URL。例:
+  `https://<team-name>.cloudflareaccess.com`。
+- `ACCESS_APPLICATION_AUD` — この hostname を保護する Access application の
+  Application Audience (AUD) tag。
 
-`workers.dev` の URL がまだ分からない場合は、一度デプロイ(手順 5)して
-wrangler が出力する URL を控え、`PUBLIC_URL` を設定して再デプロイして
-ください。
+チェックイン済みの設定は `workers_dev = false` と custom domain
+`shuttle.obr-grp.com` を使います。`workers.dev` の公開 endpoint は有効に
+しないでください。
+
+最初の実クライアント接続前に、Cloudflare Access で
+`shuttle.obr-grp.com/*` の Self-hosted application を作成し、次の allow policy
+を設定します:
+
+1. 人間の MCP client 用に Cloudflare account member 全員を許可する policy。
+2. terminal と agent 用に Service Auth service token を許可する policy。
+
+Access のログイン画面に「Send login code」(One-time PIN)しか表示されない
+場合は、Allow policy の Include に対象メールアドレスまたはメールドメイン
+も追加してください。`cloudflare_account_member` selector は Cloudflare
+identity provider で評価されるため、それだけでは OTP login を許可しません。
+
+Application の Advanced settings で Managed OAuth を有効にします。Access の
+team domain と application の AUD tag を `wrangler.toml` の
+`ACCESS_TEAM_DOMAIN` と `ACCESS_APPLICATION_AUD` に設定してください。Worker
+自身も `Cf-Access-Jwt-Assertion` の署名・issuer・audience を検証します。
+header だけを信頼しないでください。`/api/health` も保護対象に含めます。
+health は公開 liveness endpoint ではありません。
+
+ChatGPT web の MCP client を接続する場合は、Managed OAuth の
+「Allowed redirect URIs」に次の URI パターンを追加してください:
+
+```text
+https://chatgpt.com/connector/oauth/*
+```
+
+ChatGPT は `/connector/oauth/` 以下に callback ID を付けて使用します。
+`chatgpt.com` 全体を許可せず、このパスだけを許可してください。古い
+ChatGPT connector のため、次の固定URIも残します:
+
+```text
+https://chatgpt.com/connector_platform_oauth_redirect
+```
+
+許可されていない URI のままだと Dynamic Client Registration が拒否されます。
 
 ## 3. migration を適用する
 
@@ -94,6 +131,7 @@ npx wrangler secret put ADMIN_BOOTSTRAP_TOKEN
 
 bootstrap token は文字どおり one-time です。最初の `admin` scope の token が
 発行されるまでのみ有効で、以降は恒久的に拒否されます。
+admin token を安全に保存したあと、bootstrap secret は削除してください。
 
 ## 5. デプロイする
 
@@ -101,11 +139,18 @@ bootstrap token は文字どおり one-time です。最初の `admin` scope の
 npm run deploy
 ```
 
-wrangler がデプロイ先 URL を出力します。Worker の health を確認します:
+Worker の health を確認します。Access の Service Auth header と PAT の両方が
+必要です:
 
 ```bash
-curl -s https://<gateway-host>/api/health
-curl -s https://<gateway-host>/mcp        # MCP health
+curl -s https://shuttle.obr-grp.com/api/health \
+  -H "CF-Access-Client-Id: $CLOUDFLARE_ACCESS_CLIENT_ID" \
+  -H "CF-Access-Client-Secret: $CLOUDFLARE_ACCESS_CLIENT_SECRET" \
+  -H "authorization: Bearer $SHUTTLE_GATEWAY_TOKEN"
+curl -s https://shuttle.obr-grp.com/mcp \
+  -H "CF-Access-Client-Id: $CLOUDFLARE_ACCESS_CLIENT_ID" \
+  -H "CF-Access-Client-Secret: $CLOUDFLARE_ACCESS_CLIENT_SECRET" \
+  -H "authorization: Bearer $SHUTTLE_GATEWAY_TOKEN"        # MCP health
 ```
 
 ## 6. token と project を bootstrap する
@@ -115,49 +160,61 @@ admin token の発行によって bootstrap token は消費されるため、レ
 必ず保存してください。
 
 ```bash
-URL=https://<gateway-host>
+URL=https://shuttle.obr-grp.com
+ACCESS_HEADERS=(
+  -H "CF-Access-Client-Id: $CLOUDFLARE_ACCESS_CLIENT_ID"
+  -H "CF-Access-Client-Secret: $CLOUDFLARE_ACCESS_CLIENT_SECRET"
+)
 
 # 1. bootstrap token で永続 admin token を発行する(one-time)。
-curl -sX POST "$URL/api/tokens" -H "authorization: Bearer $BOOTSTRAP" \
+curl -sX POST "$URL/api/tokens" "${ACCESS_HEADERS[@]}" -H "authorization: Bearer $BOOTSTRAP" \
   -H 'content-type: application/json' -d '{"scopes":["admin"]}'
 # -> { "token": "stl_...", "scopes": ["admin"], ... }   これを保存する
 
 # 2. admin token で project を作成する。
-curl -sX POST "$URL/api/projects" -H "authorization: Bearer $ADMIN" \
-  -H 'content-type: application/json' -d '{"slug":"my-project"}'
+curl -sX POST "$URL/api/projects" "${ACCESS_HEADERS[@]}" -H "authorization: Bearer $ADMIN" \
+  -H 'content-type: application/json' -d '{"slug":"taskforward"}'
 
 # 3. ローカル agent 用に project スコープの token を発行する。
-curl -sX POST "$URL/api/tokens" -H "authorization: Bearer $ADMIN" \
+curl -sX POST "$URL/api/tokens" "${ACCESS_HEADERS[@]}" -H "authorization: Bearer $ADMIN" \
   -H 'content-type: application/json' \
-  -d '{"project":"my-project","scopes":["read","write"]}'
+  -d '{"project":"taskforward","scopes":["read","write"],"agent_id":"linux-codex","client_instance_id":"linux-codex"}'
 ```
 
 token は `read`/`write`/`admin` scope の personal access token で、サーバー
 側には SHA-256 hash のみが保存されます。紛失した token は復元できないため、
 再発行してください。
 
-## 7. ローカルリポジトリを接続する
+## 7. ローカルリポジトリを接続する(移行時のみ)
 
-gateway と同期する各リポジトリで、手順 6 の project スコープ token を使って
-`stl sync` を設定します:
+`stl sync` は既存の repo-local `.shuttle` を D1 へ移行する間、および
+local-mode リポジトリとの互換性のために残っています。移行対象では、手順 6
+の project スコープ token を使って次を実行します:
 
 ```bash
 export SHUTTLE_GATEWAY_TOKEN=stl_...   # gateway が発行した scoped PAT
-stl sync init --url https://<gateway-host> --project my-project
+stl sync init --url https://shuttle.obr-grp.com --project taskforward
 stl sync push   # ローカル event をアップロード(event id で冪等)
 stl sync pull   # gateway の event をこの workspace にダウンロード
 stl sync        # 両方: push してから pull
 ```
 
 `stl sync init` は `.shuttle/remote.json`(URL、project、`--token-env` 指定
-時は token の環境変数名)を書き出します。token 自体は保存されません。sync の
-詳細な仕様は [AGENTS.md](../AGENTS.md) の「Cloud Sync (Cloudflare gateway)」
-を参照してください。
+時は token の環境変数名)を書き出します。token 自体は保存されません。
+`taskforward` では D1 の件数・内容・動作を確認して local `.shuttle` を削除
+した後、`SHUTTLE_GATEWAY_URL`、`SHUTTLE_GATEWAY_PROJECT`、
+`SHUTTLE_GATEWAY_TOKEN`、`SHUTTLE_CLIENT_INSTANCE_ID` が設定されていれば
+`stl` は自動的に cloud-first mode になります。offline の local fallback は
+作りません。freeze、Box backup、件数検証、削除の順序は
+[taskforward の cloud 仕様](../../taskforward/docs/spec/shuttle-cloud.md)を
+参照してください。
 
-Streamable HTTP を話せる MCP client は、`Authorization: Bearer stl_...`
-header 付きで `https://<gateway-host>/mcp` に接続できます。ChatGPT/Claude.ai
-の web client 向け OAuth 2.1 は未実装(issue #46 で追跡中)のため、現時点では
-PAT ベースの client のみ対応です。
+headless MCP client と local repository は、Cloudflare Access Service Auth
+header と `Authorization: Bearer stl_...` header を付けて
+`https://shuttle.obr-grp.com/mcp` に接続します。ChatGPT や Claude.ai のような
+interactive MCP client は Cloudflare Access Managed OAuth を discovery して
+接続し、Shuttle PAT は受け取りません。OAuth user は共有 `obr-grp` tenant の
+read/write を使い、admin 操作は PAT のみです。
 
 ## ローカル開発
 
@@ -196,5 +253,11 @@ token は再デプロイ後も維持されます。
 - **実行時に `node:` モジュール解決エラーになる** — `wrangler.toml` に
   `compatibility_flags = ["nodejs_compat"]` があることを確認してください。
 - **`stl sync` の認証が失敗する** — 現在の shell で
-  `SHUTTLE_GATEWAY_TOKEN` が export されていること、token の project が
-  `stl sync init` の `--project` slug と一致していることを確認してください。
+  `SHUTTLE_GATEWAY_TOKEN` と Cloudflare Access Service Auth が注入されて
+  いること、token の project が `stl sync init` の `--project` slug と一致
+  していることを確認してください。
+- **OAuth request が Worker から 401 になる** — Access application で Managed
+  OAuth が有効で、account-member policy が user を許可していること、
+  `ACCESS_TEAM_DOMAIN` と `ACCESS_APPLICATION_AUD` が Access application と
+  一致していることを確認してください。Worker は署名済みの
+  `Cf-Access-Jwt-Assertion` を要求します。

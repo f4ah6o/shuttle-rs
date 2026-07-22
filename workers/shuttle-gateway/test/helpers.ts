@@ -26,8 +26,9 @@ export class NodeSqliteDatabase implements Database {
 
   constructor() {
     this.db = new DatabaseSync(":memory:");
-    const schema = readFileSync(join(here, "..", "migrations", "0001_init.sql"), "utf8");
-    this.db.exec(schema);
+    for (const migration of ["0001_init.sql", "0002_cloud_first.sql"]) {
+      this.db.exec(readFileSync(join(here, "..", "migrations", migration), "utf8"));
+    }
   }
 
   async query<T extends Row = Row>(sql: string, params: unknown[] = []): Promise<T[]> {
@@ -39,8 +40,9 @@ export class NodeSqliteDatabase implements Database {
     return (row as T | undefined) ?? null;
   }
 
-  async run(sql: string, params: unknown[] = []): Promise<void> {
-    this.db.prepare(sql).run(...(params as never[]));
+  async run(sql: string, params: unknown[] = []): Promise<number> {
+    const result = this.db.prepare(sql).run(...(params as never[])) as { changes?: number };
+    return result.changes ?? 0;
   }
 
   async batch(statements: Statement[]): Promise<void> {
@@ -60,9 +62,12 @@ export class NodeSqliteDatabase implements Database {
 export function makeRequest(
   method: string,
   path: string,
-  options: { token?: string; body?: unknown } = {},
+  options: { token?: string; body?: unknown; headers?: Record<string, string> } = {},
 ): Request {
-  const headers: Record<string, string> = { "content-type": "application/json" };
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    ...(options.headers ?? {}),
+  };
   if (options.token) headers.authorization = `Bearer ${options.token}`;
   return new Request(`https://gateway.test${path}`, {
     method,

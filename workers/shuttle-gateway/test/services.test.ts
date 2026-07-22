@@ -9,6 +9,7 @@ import {
 import type { Database } from "../src/database.js";
 import {
   appendEventService,
+  claimTaskService,
   completeTaskService,
   createProjectService,
   createTaskService,
@@ -25,6 +26,8 @@ const principal: Principal = {
   ownerId: OWNER,
   scopes: new Set(["read", "write", "admin"]),
   projectId: null,
+  agentId: "test-agent",
+  clientInstanceId: "test-client",
 };
 const admin = authorizeAccount(principal, "admin");
 
@@ -166,6 +169,95 @@ describe("application services", () => {
     expect(tasks[0].status).toBe("done");
   });
 
+  it("keeps legacy local task ids addressable after migration", async () => {
+    await createProjectService(db, admin, { slug: "alpha" });
+    await appendEventService(db, await writable("alpha"), {
+      event_id: "legacy-task-id",
+      event_type: "task",
+      agent: "codex",
+      session_id: "legacy-session",
+      title: "task",
+      content: "migrate the old task",
+      tags: ["task_open"],
+      metadata: { action: "created", status: "open" },
+    });
+
+    const beforeClaim = await listTasksService(db, await readable("alpha"));
+    expect(beforeClaim).toMatchObject([
+      { task_id: "legacy-task-id", title: "migrate the old task", status: "open" },
+    ]);
+
+    await appendEventService(db, await writable("alpha"), {
+      event_id: "legacy-claim-id",
+      event_type: "task",
+      agent: "old-codex",
+      session_id: "legacy-claim-session",
+      title: "task claim",
+      content: "claimed task legacy-task-id",
+      tags: ["task:claimed", "task_ref:legacy-task-id"],
+      metadata: {
+        action: "claimed",
+        status: "claimed",
+        task_id: "legacy-task-id",
+        claimed_by: "old-codex",
+      },
+    });
+    expect((await listTasksService(db, await readable("alpha")))[0]).toMatchObject({
+      status: "claimed",
+      claimed_by: "old-codex",
+    });
+    await expect(
+      claimTaskService(db, await writable("alpha"), "legacy-task-id", {
+        session_id: "competing-session",
+      }),
+    ).rejects.toThrow(/claim conflict/);
+
+    await claimTaskService(db, await writable("alpha"), "legacy-task-id", {
+      session_id: "takeover-session",
+      takeover: true,
+      reason: "old agent is no longer running",
+    });
+    await completeTaskService(db, await writable("alpha"), "legacy-task-id");
+
+    const afterDone = await listTasksService(db, await readable("alpha"));
+    expect(afterDone[0]).toMatchObject({ task_id: "legacy-task-id", status: "done" });
+  });
+
+  it("atomically claims tasks, is idempotent for the same agent, and rejects a competitor", async () => {
+    await createProjectService(db, admin, { slug: "alpha" });
+    const writableProject = await writable("alpha");
+    const { task_id } = await createTaskService(db, writableProject, { title: "claim me" });
+
+    const first = await claimTaskService(db, writableProject, task_id, {
+      session_id: "first-session",
+    });
+    expect(first.deduplicated).toBe(false);
+    expect(first.event.agent).toBe("test-agent");
+
+    const retry = await claimTaskService(db, writableProject, task_id, {
+      session_id: "retry-session",
+    });
+    expect(retry.deduplicated).toBe(true);
+    expect(retry.event.id).toBe(first.event.id);
+
+    const other: Principal = {
+      ...principal,
+      agentId: "other-agent",
+    };
+    const otherProject = await authorize(db, other, "alpha", "write");
+    await expect(
+      claimTaskService(db, otherProject, task_id, { session_id: "other-session" }),
+    ).rejects.toThrow(/already claimed|claim conflict/);
+
+    const takeover = await claimTaskService(db, otherProject, task_id, {
+      session_id: "takeover-session",
+      takeover: true,
+      reason: "original agent stopped responding",
+    });
+    expect(takeover.takeover).toBe(true);
+    expect(takeover.event.agent).toBe("other-agent");
+  });
+
   it("publishes and reads the latest context snapshot", async () => {
     await createProjectService(db, admin, { slug: "alpha" });
     await publishSnapshotService(db, await writable("alpha"), {
@@ -181,7 +273,13 @@ describe("application services", () => {
 
   it("denies write access to a read-only principal", async () => {
     await createProjectService(db, admin, { slug: "alpha" });
-    const reader: Principal = { ownerId: OWNER, scopes: new Set(["read"]), projectId: null };
+    const reader: Principal = {
+      ownerId: OWNER,
+      scopes: new Set(["read"]),
+      projectId: null,
+      agentId: "reader",
+      clientInstanceId: null,
+    };
     await expect(authorize(db, reader, "alpha", "write")).rejects.toThrow(/write/);
   });
 });

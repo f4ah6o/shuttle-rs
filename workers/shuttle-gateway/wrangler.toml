@@ -1,22 +1,32 @@
 name = "shuttle-gateway"
 main = "src/index.ts"
-compatibility_date = "2024-09-23"
+compatibility_date = "2026-07-20"
 compatibility_flags = ["nodejs_compat"]
+workers_dev = false
+
+[[routes]]
+pattern = "shuttle.obr-grp.com"
+custom_domain = true
 
 # Authoritative shared event store. D1 owns projects, workspaces, events,
 # event tags, project grants, and context-snapshot metadata.
 [[d1_databases]]
 binding = "DB"
 database_name = "shuttle"
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "0035e863-346f-4047-adec-d093a94b0622"
 migrations_dir = "migrations"
 
 # Public base URL of the deployed Worker; surfaced in MCP/OAuth metadata.
 [vars]
-PUBLIC_URL = ""
+PUBLIC_URL = "https://shuttle.obr-grp.com"
+ACCESS_TEAM_DOMAIN = "https://obaragroup.cloudflareaccess.com"
+ACCESS_APPLICATION_AUD = "a4b0c01b5b988c66d365448ab4fad300a0c32619c7d7b186a0c2b925cae3eda5"
 # Owner id associated with the bootstrap admin token. Used only to mint the
 # first scoped tokens and create the first projects.
-ADMIN_OWNER_ID = "owner-local"
+ADMIN_OWNER_ID = "obr-grp"
+
+[observability]
+enabled = true
 
 # Secrets (set with `wrangler secret put`):
 #   ADMIN_BOOTSTRAP_TOKEN  one-time admin bearer used to create projects and

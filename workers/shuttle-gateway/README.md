@@ -34,21 +34,29 @@ Git.
   no-op that reports `deduplicated: true`, while the same id in another project
   is a distinct event — cross-project collisions are impossible. This keeps
   retries/imports idempotent and future export/import/sharding simple.
-- **Scoped credentials.** Local agents authenticate with scoped personal access
-  tokens (`read`/`write`/`admin`), stored as SHA-256 hashes in `project_grants`.
+- **Scoped credentials.** Local agents authenticate with Cloudflare Access
+  Service Auth plus scoped personal access tokens (`read`/`write`/`admin`),
+  stored as SHA-256 hashes in `project_grants`. PAT grants carry the
+  server-side agent and client-instance identity used by claims.
   The bootstrap admin token is genuinely one-time: it works only until the first
   admin token is minted, then it is rejected.
 
 ## Endpoints
 
 ```
-GET    /api/health                                    (no auth)
+GET    /api/health                                    authenticated
 POST   /mcp                                           Streamable HTTP MCP
 GET    /mcp                                            MCP health
 POST   /api/tokens                                    mint scoped PAT (admin)
 POST   /api/projects                                  create project (admin)
 GET    /api/projects                                  list projects
 POST   /api/projects/{project}/workspaces
+GET    /api/projects/{project}/tasks
+POST   /api/projects/{project}/tasks
+POST   /api/projects/{project}/tasks/{id}/claim       atomic claim
+POST   /api/projects/{project}/tasks/{id}/update
+POST   /api/projects/{project}/tasks/{id}/done
+POST   /api/projects/{project}/workflows/{run}/steps/{step}/claim
 POST   /api/projects/{project}/events                 append (idempotent; optional created_at)
 GET    /api/projects/{project}/events                 ?limit=&event_type=&before=<created_at>|<id>
 POST   /api/projects/{project}/recall
@@ -60,7 +68,25 @@ MCP tools (`tools/list`, `tools/call`) call the same application services as the
 API: `shuttle_projects`, `shuttle_project_create`, `shuttle_remember`,
 `shuttle_recall`, `shuttle_context`, `shuttle_context_publish`,
 `shuttle_task_create`, `shuttle_task_list`, `shuttle_task_update`,
-`shuttle_task_done`.
+`shuttle_task_claim`, `shuttle_task_done`.
+
+## Authentication
+
+The production deployment uses Cloudflare Access Managed OAuth for interactive
+MCP clients. Access restricts `shuttle.obr-grp.com/*` to the company's
+Cloudflare account members, and the Worker verifies the signed
+`Cf-Access-Jwt-Assertion` before mapping the user to the shared `obr-grp`
+tenant with `read`/`write` access. The stable Access JWT `sub` becomes the
+event `agent_id`.
+
+Headless agents and local `stl` commands continue to use Cloudflare Access
+Service Auth plus a project-scoped Shuttle PAT. Admin operations remain PAT
+only; OAuth users cannot create projects or mint tokens.
+
+For ChatGPT web MCP clients, allow the callback-ID pattern
+`https://chatgpt.com/connector/oauth/*` in Cloudflare Access Managed OAuth.
+Retain the older exact callback URI
+`https://chatgpt.com/connector_platform_oauth_redirect` for compatibility.
 
 ## Develop
 
@@ -88,32 +114,47 @@ wrangler d1 create shuttle
 # apply migrations
 npm run migrate:remote
 
+# configure a Cloudflare Access self-hosted app for shuttle.obr-grp.com/*,
+# enable Managed OAuth, and set ACCESS_TEAM_DOMAIN/AUD in wrangler.toml
+
 # set the one-time bootstrap admin token, then deploy
 wrangler secret put ADMIN_BOOTSTRAP_TOKEN
 npm run deploy
 ```
 
+The checked-in configuration publishes only the custom domain
+`shuttle.obr-grp.com` (`workers_dev = false`). Protect the whole hostname in
+Cloudflare Access, including `/api/health`; the Rust client sends the Access
+service-auth headers from `CLOUDFLARE_ACCESS_CLIENT_ID` and
+`CLOUDFLARE_ACCESS_CLIENT_SECRET` in addition to the PAT.
+
 After deploy, use the bootstrap token once to mint a persistent admin token.
 Minting an admin token consumes the bootstrap token: it is rejected afterwards,
-so use the new admin token for everything else.
+so use the new admin token for everything else. Delete the bootstrap secret after
+the admin token has been stored safely.
 
 ```bash
+ACCESS_HEADERS=(
+  -H "CF-Access-Client-Id: $CLOUDFLARE_ACCESS_CLIENT_ID"
+  -H "CF-Access-Client-Secret: $CLOUDFLARE_ACCESS_CLIENT_SECRET"
+)
+
 # 1. Mint a persistent admin token with the bootstrap token (one-time).
-curl -sX POST "$URL/api/tokens" -H "authorization: Bearer $BOOTSTRAP" \
+curl -sX POST "$URL/api/tokens" "${ACCESS_HEADERS[@]}" -H "authorization: Bearer $BOOTSTRAP" \
   -H 'content-type: application/json' -d '{"scopes":["admin"]}'
 # -> { "token": "stl_...", "scopes": ["admin"], ... }   save this
 
 # 2. Create a project with the admin token.
-curl -sX POST "$URL/api/projects" -H "authorization: Bearer $ADMIN" \
+curl -sX POST "$URL/api/projects" "${ACCESS_HEADERS[@]}" -H "authorization: Bearer $ADMIN" \
   -H 'content-type: application/json' -d '{"slug":"my-project"}'
 
 # 3. Mint project-scoped tokens for local agents.
-curl -sX POST "$URL/api/tokens" -H "authorization: Bearer $ADMIN" \
+curl -sX POST "$URL/api/tokens" "${ACCESS_HEADERS[@]}" -H "authorization: Bearer $ADMIN" \
   -H 'content-type: application/json' \
-  -d '{"project":"my-project","scopes":["read","write"]}'
+  -d '{"project":"my-project","scopes":["read","write"],"agent_id":"linux-codex","client_instance_id":"linux-codex"}'
 ```
 
-## Syncing repo-local event logs
+## Syncing repo-local event logs (migration / local-mode compatibility)
 
 The `stl sync` command imports/exports repo-local `.shuttle/shuttle.db` event
 logs against this Worker (see "Cloud Sync" in the repository `AGENTS.md`).
@@ -130,6 +171,5 @@ Two Worker features support it:
 
 ## Not yet implemented (tracked in #46)
 
-- OAuth 2.1 for ChatGPT/Claude.ai web clients (PAT auth is in place first).
 - R2 offload for large snapshots/archives and Queue/Vectorize enrichment.
-- A richer task/handoff projection matching the local Rust model.
+- Richer handoff/workflow resource endpoints beyond the canonical event API.

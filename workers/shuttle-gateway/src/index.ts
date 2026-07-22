@@ -15,14 +15,18 @@ export async function handle(request: Request, env: Env, db: Database): Promise<
 
 async function route(request: Request, env: Env, db: Database): Promise<Response> {
   const url = new URL(request.url);
-  const path = url.pathname;
+  // Some MCP clients normalize a server URL by appending a trailing slash.
+  // Treat the canonical endpoint and that equivalent form identically.
+  const path = url.pathname === "/mcp/" ? "/mcp" : url.pathname;
 
   if (request.method === "OPTIONS") {
     return new Response(null, { status: 204, headers: CORS_HEADERS });
   }
 
-  // Health check requires no authentication.
+  // Access protects the Worker at the edge; application authentication is
+  // still required so direct Worker invocations fail closed as well.
   if (path === "/api/health" && request.method === "GET") {
+    await authenticate(request, env, db);
     return json({ status: "ok", service: "shuttle-gateway" });
   }
 

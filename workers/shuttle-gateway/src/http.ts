@@ -4,7 +4,7 @@ export const CORS_HEADERS: Record<string, string> = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
   "access-control-allow-headers":
-    "accept,authorization,content-type,mcp-protocol-version,mcp-session-id",
+    "accept,authorization,content-type,cf-access-client-id,cf-access-client-secret,mcp-protocol-version,mcp-session-id",
   "access-control-expose-headers": "mcp-session-id",
 };
 

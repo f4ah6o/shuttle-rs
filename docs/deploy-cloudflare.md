@@ -3,9 +3,9 @@
 [日本語版](./deploy-cloudflare.ja.md)
 
 This guide walks through deploying the cloud shuttle-gateway — the Cloudflare
-Worker in [`workers/shuttle-gateway/`](../workers/shuttle-gateway/) — from a
-fresh Cloudflare account to a running gateway with projects, tokens, and local
-repositories syncing against it.
+Worker in [`workers/shuttle-gateway/`](../workers/shuttle-gateway/) — in a
+company Cloudflare account with a custom domain, Cloudflare Access, projects,
+tokens, and local repositories syncing against it.
 
 The Worker is a stateless MCP endpoint plus a resource-oriented HTTP API backed
 by Cloudflare D1, which owns the durable shared event store. It is independent
@@ -15,8 +15,8 @@ the `packaging/` directory.
 
 ## Prerequisites
 
-- A Cloudflare account with Workers and D1 enabled (the free tier is enough to
-  start).
+- A company Cloudflare account with Workers and D1 enabled.
+- The `obr-grp.com` zone active in that same account.
 - Node.js 20 or newer and npm.
 - The repository checked out locally.
 
@@ -60,15 +60,56 @@ migrations_dir = "migrations"
 
 Still in `wrangler.toml`:
 
-- `PUBLIC_URL` — the public base URL of the deployed Worker (for example
-  `https://shuttle-gateway.<your-subdomain>.workers.dev`, or your custom
-  domain). It is surfaced in MCP/OAuth metadata.
-- `ADMIN_OWNER_ID` — the owner id associated with the bootstrap admin token.
-  The default `owner-local` is fine; it is only used to mint the first scoped
-  tokens and create the first projects.
+- `PUBLIC_URL` — the base URL of the deployed Worker. For this deployment use
+  `https://shuttle.obr-grp.com`; it is surfaced in MCP/OAuth metadata.
+- `ADMIN_OWNER_ID` — the stable shared tenant owner id. This deployment uses
+  `obr-grp`.
+- `ACCESS_TEAM_DOMAIN` — the Cloudflare Access team issuer URL, for example
+  `https://<team-name>.cloudflareaccess.com`.
+- `ACCESS_APPLICATION_AUD` — the Application Audience (AUD) tag for the Access
+  application protecting this hostname.
 
-If you don't know the `workers.dev` URL yet, you can deploy once (step 5),
-note the URL wrangler prints, set `PUBLIC_URL`, and deploy again.
+The checked-in configuration uses `workers_dev = false` and the custom domain
+`shuttle.obr-grp.com`. Keep the domain route and the D1 account aligned; do not
+enable a public `workers.dev` endpoint for the private taskforward deployment.
+
+Create a Cloudflare Access self-hosted application for
+`shuttle.obr-grp.com/*` before the first real client connection. Configure two
+allow policies:
+
+1. Cloudflare account members, for human MCP clients.
+2. Service Auth for the service tokens assigned to allowed terminals and
+   agents.
+
+If the Access login page exposes **Send login code** (One-time PIN), add the
+intended email address or email domain as an additional Include rule. The
+`cloudflare_account_member` selector is evaluated by the Cloudflare identity
+provider and does not by itself authorize an OTP login.
+
+In the application's Advanced settings, enable Managed OAuth. Copy the Access
+team domain and the application's AUD tag into `ACCESS_TEAM_DOMAIN` and
+`ACCESS_APPLICATION_AUD` in `wrangler.toml`. The Worker verifies the signed
+`Cf-Access-Jwt-Assertion` itself; do not trust the header without signature,
+issuer, and audience validation. Protect `/api/health` too; health is not a
+public liveness endpoint.
+
+For the ChatGPT web MCP client, add this URI pattern to Managed OAuth's
+**Allowed redirect URIs**:
+
+```text
+https://chatgpt.com/connector/oauth/*
+```
+
+ChatGPT uses a callback ID below `/connector/oauth/`. Keep the pattern scoped to
+that path instead of allowing the whole `chatgpt.com` origin. For older ChatGPT
+connector flows, also retain the exact URI below:
+
+```text
+https://chatgpt.com/connector_platform_oauth_redirect
+```
+
+Cloudflare rejects Dynamic Client Registration when the client's redirect URI
+is not in this allowlist.
 
 ## 3. Apply migrations
 
@@ -104,8 +145,14 @@ npm run deploy
 Wrangler prints the deployed URL. Verify the Worker is healthy:
 
 ```bash
-curl -s https://<gateway-host>/api/health
-curl -s https://<gateway-host>/mcp        # MCP health
+curl -s https://shuttle.obr-grp.com/api/health \
+  -H "CF-Access-Client-Id: $CLOUDFLARE_ACCESS_CLIENT_ID" \
+  -H "CF-Access-Client-Secret: $CLOUDFLARE_ACCESS_CLIENT_SECRET" \
+  -H "authorization: Bearer $SHUTTLE_GATEWAY_TOKEN"
+curl -s https://shuttle.obr-grp.com/mcp \
+  -H "CF-Access-Client-Id: $CLOUDFLARE_ACCESS_CLIENT_ID" \
+  -H "CF-Access-Client-Secret: $CLOUDFLARE_ACCESS_CLIENT_SECRET" \
+  -H "authorization: Bearer $SHUTTLE_GATEWAY_TOKEN"        # MCP health
 ```
 
 ## 6. Bootstrap tokens and projects
@@ -114,35 +161,40 @@ Use the bootstrap token exactly once to mint a persistent admin token. Minting
 the admin token consumes the bootstrap token, so save the response.
 
 ```bash
-URL=https://<gateway-host>
+URL=https://shuttle.obr-grp.com
+ACCESS_HEADERS=(
+  -H "CF-Access-Client-Id: $CLOUDFLARE_ACCESS_CLIENT_ID"
+  -H "CF-Access-Client-Secret: $CLOUDFLARE_ACCESS_CLIENT_SECRET"
+)
 
 # 1. Mint a persistent admin token with the bootstrap token (one-time).
-curl -sX POST "$URL/api/tokens" -H "authorization: Bearer $BOOTSTRAP" \
+curl -sX POST "$URL/api/tokens" "${ACCESS_HEADERS[@]}" -H "authorization: Bearer $BOOTSTRAP" \
   -H 'content-type: application/json' -d '{"scopes":["admin"]}'
 # -> { "token": "stl_...", "scopes": ["admin"], ... }   save this
 
 # 2. Create a project with the admin token.
-curl -sX POST "$URL/api/projects" -H "authorization: Bearer $ADMIN" \
-  -H 'content-type: application/json' -d '{"slug":"my-project"}'
+curl -sX POST "$URL/api/projects" "${ACCESS_HEADERS[@]}" -H "authorization: Bearer $ADMIN" \
+  -H 'content-type: application/json' -d '{"slug":"taskforward"}'
 
 # 3. Mint project-scoped tokens for local agents.
-curl -sX POST "$URL/api/tokens" -H "authorization: Bearer $ADMIN" \
+curl -sX POST "$URL/api/tokens" "${ACCESS_HEADERS[@]}" -H "authorization: Bearer $ADMIN" \
   -H 'content-type: application/json' \
-  -d '{"project":"my-project","scopes":["read","write"]}'
+  -d '{"project":"taskforward","scopes":["read","write"],"agent_id":"linux-codex","client_instance_id":"linux-codex"}'
 ```
 
 Tokens are personal access tokens scoped `read`/`write`/`admin` and are stored
 server-side only as SHA-256 hashes — a lost token cannot be recovered, only
 re-minted.
 
-## 7. Connect local repositories
+## 7. Connect local repositories (migration / local-mode compatibility)
 
-In each repository that should sync against the gateway, configure `stl sync`
-with a project-scoped token from step 6:
+`stl sync` remains for migrating an existing repo-local `.shuttle` database and
+for local-mode compatibility. Configure it with the project-scoped token from
+step 6 only during that migration:
 
 ```bash
 export SHUTTLE_GATEWAY_TOKEN=stl_...   # scoped PAT minted by the gateway
-stl sync init --url https://<gateway-host> --project my-project
+stl sync init --url https://shuttle.obr-grp.com --project taskforward
 stl sync push   # upload local events (idempotent by event id)
 stl sync pull   # download gateway events into this workspace
 stl sync        # both: push, then pull
@@ -150,13 +202,20 @@ stl sync        # both: push, then pull
 
 `stl sync init` writes `.shuttle/remote.json` (URL, project, and optionally
 the token env var name via `--token-env`); the token itself is never stored.
-See "Cloud Sync (Cloudflare gateway)" in [AGENTS.md](../AGENTS.md) for the
-full sync semantics.
+For `taskforward`, this is a one-time migration path. After the local
+`.shuttle` database is verified against D1 and removed, `stl` automatically
+uses cloud-first mode from `SHUTTLE_GATEWAY_URL`,
+`SHUTTLE_GATEWAY_PROJECT`, `SHUTTLE_GATEWAY_TOKEN`, and
+`SHUTTLE_CLIENT_INSTANCE_ID`; it does not create an offline local fallback.
+See [taskforward's cloud specification](../../taskforward/docs/spec/shuttle-cloud.md)
+for the freeze, backup, count verification, and deletion sequence.
 
-MCP clients that speak Streamable HTTP can point at
-`https://<gateway-host>/mcp` with an `Authorization: Bearer stl_...` header.
-OAuth 2.1 for ChatGPT/Claude.ai web clients is not yet implemented (tracked in
-issue #46), so PAT-based clients only for now.
+Headless MCP clients and local repositories use
+`https://shuttle.obr-grp.com/mcp` with both the Cloudflare Access Service Auth
+headers and an `Authorization: Bearer stl_...` header. Interactive MCP clients
+such as ChatGPT or Claude.ai discover and use Cloudflare Access Managed OAuth;
+they do not receive a Shuttle PAT. OAuth users are read/write within the shared
+`obr-grp` tenant, while admin operations remain PAT-only.
 
 ## Local development
 
@@ -195,5 +254,9 @@ survive redeploys.
 - **`node:` module resolution errors at runtime** — make sure
   `compatibility_flags = ["nodejs_compat"]` is present in `wrangler.toml`.
 - **`stl sync` authentication failures** — verify `SHUTTLE_GATEWAY_TOKEN` is
-  exported in the current shell and that the token's project matches the
-  `--project` slug used at `stl sync init`.
+  exported in the current shell, Access Service Auth is injected, and that the
+  token's project matches the `--project` slug used at `stl sync init`.
+- **OAuth requests return 401 from the Worker** — verify the Access application
+  is using Managed OAuth, the account-member policy allows the user, and
+  `ACCESS_TEAM_DOMAIN` plus `ACCESS_APPLICATION_AUD` match the Access app. The
+  Worker requires a valid signed `Cf-Access-Jwt-Assertion`.

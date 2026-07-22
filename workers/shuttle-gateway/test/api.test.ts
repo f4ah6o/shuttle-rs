@@ -17,8 +17,14 @@ describe("resource API", () => {
   const call = (method: string, path: string, options: { token?: string; body?: unknown } = {}) =>
     handle(makeRequest(method, path, options), env, db);
 
-  it("serves health without authentication", async () => {
-    const response = await call("GET", "/api/health");
+  it("protects health with authentication", async () => {
+    const response = await call("GET", "/api/health", { token: ADMIN });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ status: "ok" });
+  });
+
+  it("accepts an MCP URL with a trailing slash", async () => {
+    const response = await call("GET", "/mcp/", { token: ADMIN });
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ status: "ok" });
   });
@@ -167,6 +173,37 @@ describe("resource API", () => {
 
     const cannotCreate = await call("POST", "/api/projects", { token, body: { slug: "gamma" } });
     expect(cannotCreate.status).toBe(403);
+  });
+
+  it("returns 409 when a different agent races for a claimed task", async () => {
+    await call("POST", "/api/projects", { token: ADMIN, body: { slug: "alpha" } });
+    const firstMint = await call("POST", "/api/tokens", {
+      token: ADMIN,
+      body: { project: "alpha", scopes: ["read", "write"], agent_id: "agent-a" },
+    });
+    const secondMint = await call("POST", "/api/tokens", {
+      token: ADMIN,
+      body: { project: "alpha", scopes: ["read", "write"], agent_id: "agent-b" },
+    });
+    const { token: firstToken } = (await firstMint.json()) as { token: string };
+    const { token: secondToken } = (await secondMint.json()) as { token: string };
+
+    const created = await call("POST", "/api/projects/alpha/tasks", {
+      token: firstToken,
+      body: { title: "race me" },
+    });
+    const { task_id } = (await created.json()) as { task_id: string };
+    const firstClaim = await call("POST", `/api/projects/alpha/tasks/${task_id}/claim`, {
+      token: firstToken,
+      body: {},
+    });
+    expect(firstClaim.status).toBe(201);
+
+    const competingClaim = await call("POST", `/api/projects/alpha/tasks/${task_id}/claim`, {
+      token: secondToken,
+      body: {},
+    });
+    expect(competingClaim.status).toBe(409);
   });
 
   it("disables the bootstrap token once an admin token is minted", async () => {

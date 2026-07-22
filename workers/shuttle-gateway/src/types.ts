@@ -47,6 +47,7 @@ export const EVENT_TYPES = [
   "fact",
   "bug",
   "artifact",
+  "workflow",
 ] as const;
 
 export type EventType = (typeof EVENT_TYPES)[number];
@@ -106,9 +107,16 @@ export interface RecallResult {
 export interface TaskSummary {
   task_id: string;
   title: string;
-  status: "open" | "done";
+  status: "open" | "claimed" | "done";
+  claimed_by?: string | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface ClaimResult {
+  event: Event;
+  deduplicated: boolean;
+  takeover: boolean;
 }
 
 export interface ContextSnapshot {

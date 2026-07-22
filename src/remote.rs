@@ -8,7 +8,9 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -29,6 +31,10 @@ pub struct RemoteConfig {
     pub project: String,
     /// Bearer token with read/write scope for the project.
     pub token: String,
+    /// Optional Cloudflare Access service-auth client id.
+    pub access_client_id: Option<String>,
+    /// Optional Cloudflare Access service-auth client secret.
+    pub access_client_secret: Option<String>,
 }
 
 /// Persisted remote settings (`.shuttle/remote.json`). The token itself is
@@ -114,6 +120,24 @@ impl HttpRemoteApi {
         )
     }
 
+    pub fn config(&self) -> &RemoteConfig {
+        &self.config
+    }
+
+    fn auth(&self, request: ureq::Request) -> ureq::Request {
+        let request = request.set("authorization", &format!("Bearer {}", self.config.token));
+        let request = if let Some(value) = &self.config.access_client_id {
+            request.set("CF-Access-Client-Id", value)
+        } else {
+            request
+        };
+        if let Some(value) = &self.config.access_client_secret {
+            request.set("CF-Access-Client-Secret", value)
+        } else {
+            request
+        }
+    }
+
     fn handle_error(err: ureq::Error) -> ShuttleError {
         match err {
             ureq::Error::Status(status, response) => {
@@ -133,12 +157,225 @@ impl HttpRemoteApi {
     }
 }
 
+/// EventStore implementation for cloud-first repositories. It never creates
+/// or reads a repo-local SQLite database: D1 is the only state store and the
+/// Worker remains the authority for atomic task/workflow claims.
+pub struct CloudEventStore {
+    config: RemoteConfig,
+    agent: Arc<ureq::Agent>,
+    workspace_id: String,
+}
+
+impl CloudEventStore {
+    pub fn connect(
+        config: RemoteConfig,
+        client_instance_id: &str,
+        local_path_hint: Option<&str>,
+    ) -> Result<Self> {
+        let client = Arc::new(
+            ureq::AgentBuilder::new()
+                .timeout(std::time::Duration::from_secs(30))
+                .build(),
+        );
+        let mut store = Self {
+            config,
+            agent: client,
+            workspace_id: client_instance_id.to_owned(),
+        };
+        store.workspace_id = store.ensure_workspace(client_instance_id, local_path_hint)?;
+        Ok(store)
+    }
+
+    fn project_path(&self, suffix: &str) -> String {
+        format!(
+            "{}/api/projects/{}/{}",
+            self.config.url.trim_end_matches('/'),
+            self.config.project,
+            suffix.trim_start_matches('/')
+        )
+    }
+
+    fn auth(&self, request: ureq::Request) -> ureq::Request {
+        let request = request.set("authorization", &format!("Bearer {}", self.config.token));
+        let request = if let Some(value) = &self.config.access_client_id {
+            request.set("CF-Access-Client-Id", value)
+        } else {
+            request
+        };
+        if let Some(value) = &self.config.access_client_secret {
+            request.set("CF-Access-Client-Secret", value)
+        } else {
+            request
+        }
+    }
+
+    fn ensure_workspace(
+        &self,
+        client_instance_id: &str,
+        local_path_hint: Option<&str>,
+    ) -> Result<String> {
+        let response = self
+            .auth(self.agent.post(&self.project_path("workspaces")))
+            .send_json(json!({
+                "client_instance_id": client_instance_id,
+                "local_path_hint": local_path_hint,
+            }))
+            .map_err(cloud_error)?;
+        let value: Value = response
+            .into_json()
+            .map_err(|err| ShuttleError::Serialization(err.to_string()))?;
+        value["id"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| ShuttleError::Serialization("workspace response missing id".to_owned()))
+    }
+
+    fn append_json(&self, body: &Value) -> Result<Value> {
+        let action = body["metadata"]["action"].as_str();
+        let event_type = body["event_type"].as_str();
+        let (path, mut payload) = if event_type == Some("task") && action == Some("claimed") {
+            let task_id = body["metadata"]["task_id"].as_str().ok_or_else(|| {
+                ShuttleError::Serialization("task claim missing task_id".to_owned())
+            })?;
+            (
+                self.project_path(&format!("tasks/{task_id}/claim")),
+                body.clone(),
+            )
+        } else if event_type == Some("workflow")
+            && matches!(action, Some("claimed" | "reclaimed" | "taken_over"))
+        {
+            let run_id = body["metadata"]["run_id"].as_str().ok_or_else(|| {
+                ShuttleError::Serialization("workflow claim missing run_id".to_owned())
+            })?;
+            let step_id = body["metadata"]["step_id"].as_str().ok_or_else(|| {
+                ShuttleError::Serialization("workflow claim missing step_id".to_owned())
+            })?;
+            (
+                self.project_path(&format!("workflows/{run_id}/steps/{step_id}/claim")),
+                body.clone(),
+            )
+        } else {
+            (self.project_path("events"), body.clone())
+        };
+
+        let takeover = payload["metadata"]
+            .get("takeover")
+            .cloned()
+            .or_else(|| payload["metadata"]["value"].get("takeover").cloned());
+        let reason = payload["metadata"]
+            .get("takeover_reason")
+            .cloned()
+            .or_else(|| payload["metadata"]["value"].get("takeover_reason").cloned());
+        if let Some(takeover) = takeover {
+            payload["takeover"] = takeover;
+        }
+        if let Some(reason) = reason {
+            payload["reason"] = reason;
+        }
+        let response = self
+            .auth(self.agent.post(&path))
+            .send_json(payload)
+            .map_err(cloud_error)?;
+        response
+            .into_json()
+            .map_err(|err| ShuttleError::Serialization(err.to_string()))
+    }
+}
+
+fn cloud_error(err: ureq::Error) -> ShuttleError {
+    match err {
+        ureq::Error::Status(status, response) => {
+            let body = response.into_string().unwrap_or_default();
+            let snippet: String = body.chars().take(300).collect();
+            ShuttleError::Store(format!("gateway returned {status}: {snippet}"))
+        }
+        ureq::Error::Transport(error) => {
+            ShuttleError::Store(format!("gateway request failed: {error}"))
+        }
+    }
+}
+
+#[async_trait]
+impl EventStore for CloudEventStore {
+    async fn append(&self, event: Event) -> Result<Event> {
+        let mut body = event_to_push_body(&event);
+        body["context"]["workspace_id"] = json!(self.workspace_id);
+        let value = self.append_json(&body)?;
+        remote_to_event(&value["event"], &self.workspace_id, &self.config.project)
+    }
+
+    async fn list(&self, filter: EventFilter) -> Result<Vec<Event>> {
+        let mut before: Option<String> = None;
+        let mut all = Vec::new();
+        loop {
+            let mut request = self
+                .auth(self.agent.get(&self.project_path("events")))
+                .query("limit", "500");
+            if let Some(before) = before.as_deref() {
+                request = request.query("before", before);
+            }
+            let response = request.call().map_err(cloud_error)?;
+            let value: Value = response
+                .into_json()
+                .map_err(|err| ShuttleError::Serialization(err.to_string()))?;
+            let events = value["events"].as_array().cloned().unwrap_or_default();
+            let page_len = events.len();
+            for remote in events {
+                let event = remote_to_event(&remote, &self.workspace_id, &self.config.project)?;
+                if filter.id.is_some_and(|id| id != event.id)
+                    || filter
+                        .event_type
+                        .is_some_and(|kind| kind != event.event_type)
+                    || filter
+                        .agent
+                        .as_deref()
+                        .is_some_and(|agent| agent != event.agent)
+                    || filter.recipient.as_deref().is_some_and(|recipient| {
+                        event.metadata_json["to"].as_str() != Some(recipient)
+                    })
+                    || filter
+                        .tag
+                        .as_deref()
+                        .is_some_and(|tag| !event.tags.iter().any(|item| item == tag))
+                    || filter
+                        .tags
+                        .iter()
+                        .any(|tag| !event.tags.iter().any(|item| item == tag))
+                    || filter.query.as_deref().is_some_and(|query| {
+                        let query = query.to_lowercase();
+                        !format!(
+                            "{} {} {}",
+                            event.title.as_deref().unwrap_or_default(),
+                            event.content,
+                            event.metadata_json
+                        )
+                        .to_lowercase()
+                        .contains(&query)
+                    })
+                {
+                    continue;
+                }
+                all.push(event);
+            }
+            if !value["has_more"].as_bool().unwrap_or(false) || page_len == 0 {
+                break;
+            }
+            before = value["next_before"].as_str().map(str::to_owned);
+            if before.is_none() {
+                break;
+            }
+        }
+        if let Some(limit) = filter.limit {
+            all.truncate(limit as usize);
+        }
+        Ok(all)
+    }
+}
+
 impl RemoteApi for HttpRemoteApi {
     fn append_event(&self, body: &Value) -> Result<AppendOutcome> {
         let response = self
-            .agent
-            .post(&self.events_url())
-            .set("authorization", &format!("Bearer {}", self.config.token))
+            .auth(self.agent.post(&self.events_url()))
             .send_json(body.clone())
             .map_err(Self::handle_error)?;
         let value: Value = response
@@ -151,9 +388,7 @@ impl RemoteApi for HttpRemoteApi {
 
     fn list_events(&self, limit: u32, before: Option<&str>) -> Result<EventsPage> {
         let mut request = self
-            .agent
-            .get(&self.events_url())
-            .set("authorization", &format!("Bearer {}", self.config.token))
+            .auth(self.agent.get(&self.events_url()))
             .query("limit", &limit.to_string());
         if let Some(before) = before {
             request = request.query("before", before);

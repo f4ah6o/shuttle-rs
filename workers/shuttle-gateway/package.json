@@ -12,11 +12,14 @@
     "migrate:local": "wrangler d1 migrations apply shuttle --local",
     "migrate:remote": "wrangler d1 migrations apply shuttle --remote"
   },
+  "dependencies": {
+    "jose": "^6.2.4"
+  },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20240909.0",
+    "@cloudflare/workers-types": "^5.20260719.1",
     "@types/node": "^22.19.21",
     "typescript": "^5.5.4",
     "vitest": "^2.0.5",
-    "wrangler": "^3.78.0"
+    "wrangler": "^4.113.0"
   }
 }

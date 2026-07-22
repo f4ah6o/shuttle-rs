@@ -17,8 +17,8 @@ export interface Database {
   query<T extends Row = Row>(sql: string, params?: unknown[]): Promise<T[]>;
   /** Run a query returning the first row, or null. */
   first<T extends Row = Row>(sql: string, params?: unknown[]): Promise<T | null>;
-  /** Run a statement for its side effects. */
-  run(sql: string, params?: unknown[]): Promise<void>;
+  /** Run a statement and return the number of changed rows. */
+  run(sql: string, params?: unknown[]): Promise<number>;
   /** Run several statements atomically. */
   batch(statements: Statement[]): Promise<void>;
 }
@@ -42,11 +42,12 @@ export class D1Database_ implements Database {
       .first<T>()) as T | null;
   }
 
-  async run(sql: string, params: unknown[] = []): Promise<void> {
-    await this.db
+  async run(sql: string, params: unknown[] = []): Promise<number> {
+    const result = await this.db
       .prepare(sql)
       .bind(...params)
       .run();
+    return result.meta.changes;
   }
 
   async batch(statements: Statement[]): Promise<void> {

@@ -2,6 +2,7 @@ import type { Database, Row, Statement } from "./database.js";
 import { newId, nowIso } from "./ids.js";
 import type {
   AppendResult,
+  ClaimResult,
   ContextSnapshot,
   Event,
   EventInput,
@@ -116,6 +117,21 @@ export async function createWorkspace(
   projectId: string,
   input: { client_instance_id: string; local_path_hint?: string | null },
 ): Promise<Workspace> {
+  const existing = await db.first(
+    "SELECT * FROM workspaces WHERE project_id = ? AND client_instance_id = ?",
+    [projectId, input.client_instance_id],
+  );
+  if (existing) {
+    if (input.local_path_hint && input.local_path_hint !== existing.local_path_hint) {
+      await db.run("UPDATE workspaces SET local_path_hint = ? WHERE id = ?", [
+        input.local_path_hint,
+        existing.id,
+      ]);
+    }
+    const refreshed = await db.first("SELECT * FROM workspaces WHERE id = ?", [existing.id]);
+    return rowToWorkspace(refreshed ?? existing);
+  }
+
   const workspace: Workspace = {
     id: newId(),
     project_id: projectId,
@@ -137,6 +153,16 @@ export async function createWorkspace(
   return workspace;
 }
 
+function rowToWorkspace(row: Row): Workspace {
+  return {
+    id: String(row.id),
+    project_id: String(row.project_id),
+    client_instance_id: String(row.client_instance_id),
+    local_path_hint: (row.local_path_hint as string | null) ?? null,
+    created_at: String(row.created_at),
+  };
+}
+
 async function loadTags(db: Database, projectId: string, eventId: string): Promise<string[]> {
   const rows = await db.query(
     "SELECT tag FROM event_tags WHERE project_id = ? AND event_id = ? ORDER BY tag",
@@ -145,13 +171,149 @@ async function loadTags(db: Database, projectId: string, eventId: string): Promi
   return rows.map((row) => String(row.tag));
 }
 
-async function getEvent(db: Database, projectId: string, eventId: string): Promise<Event | null> {
+export async function getEvent(db: Database, projectId: string, eventId: string): Promise<Event | null> {
   const row = await db.first("SELECT * FROM events WHERE project_id = ? AND id = ?", [
     projectId,
     eventId,
   ]);
   if (!row) return null;
   return rowToEvent(row, await loadTags(db, projectId, eventId));
+}
+
+export interface AtomicClaimInput {
+  table: "task_claims" | "workflow_step_claims";
+  key: Record<string, string>;
+  event: Event;
+  claimed_by: string;
+  takeover: boolean;
+  takeover_reason?: string | null;
+}
+
+/**
+ * Claim a task/workflow step and append its audit event in one D1 batch.
+ *
+ * The event id doubles as a private claim operation id. A competing request
+ * can therefore never append an audit event merely because another request
+ * already owns the row: the conditional event INSERT only matches the claim
+ * operation that actually changed the row.
+ */
+export async function appendAtomicClaim(
+  db: Database,
+  input: AtomicClaimInput,
+): Promise<ClaimResult> {
+  const keyColumns = Object.keys(input.key);
+  if (keyColumns.length === 0) throw new Error("atomic claim requires a key");
+  const keyValues = keyColumns.map((column) => input.key[column]);
+  const keyWhere = keyColumns.map((column) => `${column} = ?`).join(" AND ");
+  const keyWhereWithProject = `project_id = ? AND ${keyWhere}`;
+  const table = input.table;
+  const now = input.event.created_at;
+
+  const columns = ["project_id", ...keyColumns, "claimed_by", "claim_event_id", "takeover_reason", "created_at", "updated_at"];
+  const placeholders = columns.map(() => "?").join(", ");
+  const insertParams = [
+    input.event.project_id,
+    ...keyValues,
+    null,
+    null,
+    null,
+    now,
+    now,
+  ];
+  const updateSet = [
+    "claimed_by = ?",
+    "claim_event_id = ?",
+    "takeover_reason = ?",
+    "updated_at = ?",
+  ].join(", ");
+  const updateParams = [
+    input.claimed_by,
+    input.event.id,
+    input.takeover_reason ?? null,
+    now,
+    input.event.project_id,
+    ...keyValues,
+    input.takeover ? 1 : 0,
+    input.claimed_by,
+  ];
+
+  const event = input.event;
+  const statements: Statement[] = [
+    {
+      sql: `INSERT OR IGNORE INTO ${table} (${columns.join(", ")}) VALUES (${placeholders})`,
+      params: insertParams,
+    },
+    {
+      sql: `UPDATE ${table} SET ${updateSet}
+            WHERE ${keyWhereWithProject}
+              AND (claimed_by IS NULL OR (? = 1 AND claimed_by <> ?))`,
+      params: updateParams,
+    },
+    {
+      sql: `INSERT OR IGNORE INTO events (
+              id, project_id, workspace_id, event_type, agent, session_id, title, content,
+              git_remote, branch, commit_hash, repo_dirty, metadata_json, created_at
+            )
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            WHERE EXISTS (
+              SELECT 1 FROM ${table}
+              WHERE ${keyWhereWithProject} AND claim_event_id = ? AND claimed_by = ?
+            )`,
+      params: [
+        event.id,
+        event.project_id,
+        event.workspace_id,
+        event.event_type,
+        event.agent,
+        event.session_id,
+        event.title,
+        event.content,
+        event.git_remote,
+        event.branch,
+        event.commit_hash,
+        event.repo_dirty === null ? null : event.repo_dirty ? 1 : 0,
+        JSON.stringify(event.metadata_json),
+        event.created_at,
+        event.project_id,
+        ...keyValues,
+        event.id,
+        input.claimed_by,
+      ],
+    },
+    ...event.tags.map((tag) => ({
+      sql: `INSERT OR IGNORE INTO event_tags (project_id, event_id, tag)
+            SELECT ?, ?, ?
+            WHERE EXISTS (SELECT 1 FROM ${table}
+                          WHERE ${keyWhereWithProject} AND claim_event_id = ? AND claimed_by = ?)`,
+      params: [
+        event.project_id,
+        event.id,
+        tag,
+        event.project_id,
+        ...keyValues,
+        event.id,
+        input.claimed_by,
+      ],
+    })),
+  ];
+  await db.batch(statements);
+
+  const claim = await db.first(
+    `SELECT claimed_by, claim_event_id FROM ${table} WHERE ${keyWhereWithProject}`,
+    [event.project_id, ...keyValues],
+  );
+  const claimedBy = (claim?.claimed_by as string | null) ?? null;
+  const claimEventId = (claim?.claim_event_id as string | null) ?? null;
+  if (claimEventId === event.id) {
+    const stored = await getEvent(db, event.project_id, event.id);
+    if (!stored) throw new Error("claim succeeded without an audit event");
+    return { event: stored, deduplicated: false, takeover: input.takeover };
+  }
+  if (claimedBy === input.claimed_by && claimEventId) {
+    const stored = await getEvent(db, event.project_id, claimEventId);
+    if (stored) return { event: stored, deduplicated: true, takeover: false };
+  }
+  throw new Error(`claim conflict: already claimed by ${claimedBy ?? "another agent"}`);
 }
 
 /**
@@ -233,6 +395,62 @@ export async function appendEvent(
   ];
 
   await db.batch(statements);
+
+  // Migration pushes use the ordinary idempotent event endpoint rather than
+  // the live atomic-claim endpoint. Keep the mutable claim projections in
+  // step with those historical claim events too, so applying migrations before
+  // importing a frozen local log does not erase ownership.
+  const action = metadata.action;
+  if (event.event_type === "task" && action === "claimed") {
+    const taskId = metadata.task_id;
+    if (typeof taskId === "string" && taskId.trim()) {
+      await db.run(
+        `INSERT INTO task_claims
+           (project_id, task_id, claimed_by, claim_event_id, takeover_reason, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(project_id, task_id) DO UPDATE SET
+           claimed_by = excluded.claimed_by,
+           claim_event_id = excluded.claim_event_id,
+           takeover_reason = excluded.takeover_reason,
+           updated_at = excluded.updated_at`,
+        [
+          event.project_id,
+          taskId,
+          typeof metadata.claimed_by === "string" ? metadata.claimed_by : event.agent,
+          event.id,
+          typeof metadata.takeover_reason === "string" ? metadata.takeover_reason : null,
+          event.created_at,
+          event.created_at,
+        ],
+      );
+    }
+  }
+  if (event.event_type === "workflow" && ["claimed", "reclaimed", "taken_over"].includes(String(action))) {
+    const runId = metadata.run_id;
+    const stepId = metadata.step_id;
+    if (typeof runId === "string" && runId.trim() && typeof stepId === "string" && stepId.trim()) {
+      await db.run(
+        `INSERT INTO workflow_step_claims
+           (project_id, run_id, step_id, claimed_by, claim_event_id, takeover_reason, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(project_id, run_id, step_id) DO UPDATE SET
+           claimed_by = excluded.claimed_by,
+           claim_event_id = excluded.claim_event_id,
+           takeover_reason = excluded.takeover_reason,
+           updated_at = excluded.updated_at`,
+        [
+          event.project_id,
+          runId,
+          stepId,
+          event.agent,
+          event.id,
+          typeof metadata.takeover_reason === "string" ? metadata.takeover_reason : null,
+          event.created_at,
+          event.created_at,
+        ],
+      );
+    }
+  }
   return { event, deduplicated: false };
 }
 

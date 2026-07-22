@@ -1,3 +1,8 @@
+import {
+  createRemoteJWKSet,
+  jwtVerify,
+} from "jose";
+
 import type { Database } from "./database.js";
 import type { Env } from "./env.js";
 import { forbidden, notFound, unauthorized } from "./errors.js";
@@ -12,6 +17,76 @@ export interface Principal {
   scopes: Set<Scope>;
   /** When set, the principal is limited to a single project. */
   projectId: string | null;
+  /** Stable server-issued identity used for event attribution. */
+  agentId: string;
+  /** Client/terminal identity attached to a PAT grant, when available. */
+  clientInstanceId: string | null;
+}
+
+const accessJwks = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
+
+function accessTeamDomain(env: Env): string {
+  const value = env.ACCESS_TEAM_DOMAIN?.trim();
+  if (!value) throw unauthorized("Cloudflare Access identity verification is not configured");
+  return value.replace(/\/$/, "");
+}
+
+function accessApplicationAudience(env: Env): string {
+  const value = env.ACCESS_APPLICATION_AUD?.trim();
+  if (!value) throw unauthorized("Cloudflare Access application audience is not configured");
+  return value;
+}
+
+function accessKeySet(teamDomain: string): ReturnType<typeof createRemoteJWKSet> {
+  const cached = accessJwks.get(teamDomain);
+  if (cached) return cached;
+  const keySet = createRemoteJWKSet(new URL(`${teamDomain}/cdn-cgi/access/certs`));
+  accessJwks.set(teamDomain, keySet);
+  return keySet;
+}
+
+/**
+ * Authenticate a human through Cloudflare Access Managed OAuth.
+ *
+ * Access validates the opaque OAuth token at the edge and forwards a signed
+ * application assertion to the Worker. The assertion is verified again here
+ * so a direct Worker invocation cannot spoof the identity header. Service
+ * Auth assertions have an empty `sub`; those fall through to PAT auth below.
+ */
+async function authenticateAccessUser(
+  request: Request,
+  env: Env,
+  db: Database,
+): Promise<Principal | null> {
+  const assertion = request.headers.get("cf-access-jwt-assertion");
+  if (!assertion) return null;
+
+  const teamDomain = accessTeamDomain(env);
+  const audience = accessApplicationAudience(env);
+  let payload: { sub?: string };
+  try {
+    ({ payload } = await jwtVerify(assertion, accessKeySet(teamDomain), {
+      issuer: teamDomain,
+      audience,
+    }));
+  } catch {
+    throw unauthorized("invalid Cloudflare Access identity");
+  }
+
+  // Access service-token assertions do not identify a human. They must still
+  // present the application-level PAT, which is checked by authenticate().
+  const subject = payload.sub?.trim();
+  if (!subject) return null;
+
+  const ownerId = env.ADMIN_OWNER_ID ?? "owner-local";
+  await ensureOwner(db, ownerId);
+  return {
+    ownerId,
+    scopes: new Set<Scope>(["read", "write"]),
+    projectId: null,
+    agentId: `access:${subject}`,
+    clientInstanceId: null,
+  };
 }
 
 function bearerToken(request: Request): string | null {
@@ -46,6 +121,9 @@ export async function authenticate(
   env: Env,
   db: Database,
 ): Promise<Principal> {
+  const accessPrincipal = await authenticateAccessUser(request, env, db);
+  if (accessPrincipal) return accessPrincipal;
+
   const token = bearerToken(request);
   if (!token) throw unauthorized();
 
@@ -61,12 +139,18 @@ export async function authenticate(
         );
       }
       await ensureOwner(db, ownerId);
-      return { ownerId, scopes: new Set<Scope>(["read", "write", "admin"]), projectId: null };
+      return {
+        ownerId,
+        scopes: new Set<Scope>(["read", "write", "admin"]),
+        projectId: null,
+        agentId: "bootstrap-admin",
+        clientInstanceId: null,
+      };
     }
   }
 
   const row = await db.first(
-    "SELECT owner_id, project_id, scopes FROM project_grants WHERE token_hash = ?",
+    "SELECT owner_id, project_id, scopes, agent_id, client_instance_id FROM project_grants WHERE token_hash = ?",
     [presented],
   );
   if (!row) throw unauthorized("invalid token");
@@ -81,6 +165,8 @@ export async function authenticate(
     ownerId: String(row.owner_id),
     projectId: (row.project_id as string | null) ?? null,
     scopes,
+    agentId: String(row.agent_id ?? row.label ?? "unknown-agent"),
+    clientInstanceId: (row.client_instance_id as string | null) ?? null,
   };
 }
 
@@ -160,25 +246,37 @@ export interface MintedToken {
   project_id: string | null;
   scopes: Scope[];
   label: string | null;
+  agent_id: string;
+  client_instance_id: string | null;
 }
 
 /** Create a scoped personal access token; the plaintext is returned once. */
 export async function mintGrant(
   db: Database,
-  input: { owner_id: string; project_id?: string | null; scopes: Scope[]; label?: string | null },
+  input: {
+    owner_id: string;
+    project_id?: string | null;
+    scopes: Scope[];
+    label?: string | null;
+    agent_id: string;
+    client_instance_id?: string | null;
+  },
 ): Promise<MintedToken> {
   const token = mintToken();
   const hash = await sha256Hex(token);
   await ensureOwner(db, input.owner_id);
   await db.run(
-    `INSERT INTO project_grants (token_hash, owner_id, project_id, scopes, label, created_at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO project_grants
+       (token_hash, owner_id, project_id, scopes, label, agent_id, client_instance_id, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       hash,
       input.owner_id,
       input.project_id ?? null,
       input.scopes.join(","),
       input.label ?? null,
+      input.agent_id,
+      input.client_instance_id ?? null,
       nowIso(),
     ],
   );
@@ -188,5 +286,7 @@ export async function mintGrant(
     project_id: input.project_id ?? null,
     scopes: input.scopes,
     label: input.label ?? null,
+    agent_id: input.agent_id,
+    client_instance_id: input.client_instance_id ?? null,
   };
 }

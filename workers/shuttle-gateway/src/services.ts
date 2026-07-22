@@ -1,8 +1,9 @@
 import type { AuthorizedAccount, AuthorizedProject } from "./auth.js";
 import type { Database } from "./database.js";
-import { badRequest, notFound } from "./errors.js";
+import { badRequest, conflict, notFound } from "./errors.js";
 import { newId, normalizeSlug } from "./ids.js";
 import {
+  appendAtomicClaim,
   appendEvent,
   createProject,
   createWorkspace,
@@ -15,6 +16,7 @@ import {
 } from "./repository.js";
 import type {
   AppendResult,
+  ClaimResult,
   ContextEnvelope,
   ContextSnapshot,
   Event,
@@ -40,6 +42,62 @@ function requireNonEmpty(value: string | undefined | null, message: string): str
   const trimmed = (value ?? "").trim();
   if (!trimmed) throw badRequest(message);
   return trimmed;
+}
+
+function validatedCreatedAt(value?: string | null): string {
+  if (value && value.trim()) {
+    const trimmed = value.trim();
+    if (Number.isNaN(Date.parse(trimmed))) {
+      throw badRequest(`invalid created_at ${JSON.stringify(trimmed)}`);
+    }
+    return trimmed;
+  }
+  return new Date().toISOString();
+}
+
+function claimEvent(
+  projectId: string,
+  agent: string,
+  input: {
+    event_id?: string | null;
+    event_type: EventType;
+    session_id?: string | null;
+    title: string;
+    content: string;
+    context?: ContextEnvelope | null;
+    metadata: Record<string, unknown>;
+    tags: string[];
+    created_at?: string | null;
+  },
+) {
+  const repo = input.context?.repo ?? null;
+  const metadata: Record<string, unknown> = { ...input.metadata };
+  if (repo) {
+    metadata.repo = {
+      git_remote: repo.git_remote ?? null,
+      branch: repo.branch ?? null,
+      commit: repo.commit ?? null,
+      dirty: repo.dirty ?? null,
+      dirty_files: repo.dirty_files ?? [],
+    };
+  }
+  return {
+    id: (input.event_id && input.event_id.trim()) || newId(),
+    project_id: projectId,
+    workspace_id: input.context?.workspace_id ?? null,
+    event_type: input.event_type,
+    agent,
+    session_id: (input.session_id ?? "").trim() || newId(),
+    title: input.title,
+    content: input.content,
+    git_remote: repo?.git_remote ?? null,
+    branch: repo?.branch ?? null,
+    commit_hash: repo?.commit ?? null,
+    repo_dirty: repo?.dirty ?? null,
+    metadata_json: metadata,
+    tags: Array.from(new Set(input.tags.map((tag) => tag.trim()).filter(Boolean))),
+    created_at: validatedCreatedAt(input.created_at),
+  };
 }
 
 export async function createProjectService(
@@ -216,7 +274,59 @@ async function findTaskEvents(
   taskId: string,
 ): Promise<Event[]> {
   const events = await listEvents(db, authorized.project.id, { eventType: "task", limit: 500 });
-  return events.filter((event) => (event.metadata_json as { task_id?: string }).task_id === taskId);
+  return events.filter((event) => taskIdForEvent(event) === taskId);
+}
+
+interface TaskMetadata {
+  action?: string;
+  op?: string;
+  task_id?: string;
+}
+
+function taskMetadata(event: Event): TaskMetadata {
+  return event.metadata_json as TaskMetadata;
+}
+
+/**
+ * The first local Shuttle task event used its own event id as the task id and
+ * only the follow-up events carried `metadata.task_id`. Keep that history
+ * addressable after migration while using explicit ids for new events.
+ */
+function taskIdForEvent(event: Event): string | null {
+  const metadata = taskMetadata(event);
+  if (typeof metadata.task_id === "string" && metadata.task_id.trim()) {
+    return metadata.task_id;
+  }
+  const reference = event.tags.find((tag) => tag.startsWith("task_ref:"));
+  if (reference) return reference.slice("task_ref:".length);
+  if (metadata.action === "created" || event.tags.includes("task_open") || event.tags.includes("task:open")) {
+    return event.id;
+  }
+  return null;
+}
+
+function isTaskCreated(event: Event): boolean {
+  const metadata = taskMetadata(event);
+  return (
+    metadata.op === "create" ||
+    metadata.action === "created" ||
+    event.tags.includes("task_open") ||
+    event.tags.includes("task:open")
+  );
+}
+
+function isTaskDone(event: Event): boolean {
+  const metadata = taskMetadata(event);
+  return (
+    metadata.op === "done" ||
+    metadata.action === "completed" ||
+    event.tags.includes("task_done") ||
+    event.tags.includes("task:done")
+  );
+}
+
+function isClaimConflict(error: unknown): error is Error {
+  return error instanceof Error && error.message.startsWith("claim conflict:");
 }
 
 export async function updateTaskService(
@@ -261,6 +371,193 @@ export async function completeTaskService(
   });
 }
 
+export async function claimTaskService(
+  db: Database,
+  authorized: AuthorizedProject<"write">,
+  taskId: string,
+  input: {
+    event_id?: string | null;
+    session_id?: string | null;
+    context?: ContextEnvelope | null;
+    created_at?: string | null;
+    takeover?: boolean;
+    reason?: string | null;
+  },
+): Promise<ClaimResult> {
+  const taskEvents = await findTaskEvents(db, authorized, taskId);
+  if (taskEvents.length === 0) throw notFound(`unknown task ${JSON.stringify(taskId)}`);
+  const ordered = [...taskEvents].sort((left, right) =>
+    left.created_at.localeCompare(right.created_at) || left.id.localeCompare(right.id),
+  );
+  const latest = ordered[ordered.length - 1];
+  if (isTaskDone(latest)) {
+    throw badRequest(`task ${taskId} is already done`);
+  }
+
+  const takeover = input.takeover === true;
+  const reason = input.reason?.trim() || null;
+  if (takeover && !reason) throw badRequest("takeover reason is required");
+  const agent = authorized.principal.agentId;
+  const event = claimEvent(authorized.project.id, agent, {
+    event_id: input.event_id,
+    event_type: "task",
+    session_id: input.session_id,
+    title: "task claim",
+    content: `${takeover ? "took over" : "claimed"} task ${taskId}`,
+    context: input.context,
+    metadata: {
+      action: "claimed",
+      status: "claimed",
+      task_id: taskId,
+      claimed_by: agent,
+      ...(takeover ? { takeover: true, takeover_reason: reason } : {}),
+    },
+    tags: ["task_claimed", `claim:${agent}`, `task_ref:${taskId}`],
+    created_at: input.created_at,
+  });
+  try {
+    return await appendAtomicClaim(db, {
+      table: "task_claims",
+      key: { task_id: taskId },
+      event,
+      claimed_by: agent,
+      takeover,
+      takeover_reason: reason,
+    });
+  } catch (error) {
+    if (isClaimConflict(error)) throw conflict(error.message);
+    throw error;
+  }
+}
+
+interface WorkflowStepState {
+  id: string;
+  kind: string;
+  status: "pending" | "claimed" | "completed" | "failed" | "needs_reconcile";
+  claimed_by: string | null;
+}
+
+async function workflowStepStates(
+  db: Database,
+  projectId: string,
+  runId: string,
+): Promise<{ runStatus: string; steps: WorkflowStepState[] }> {
+  const events = await db.query(
+    "SELECT * FROM events WHERE project_id = ? AND event_type = 'workflow' AND json_extract(metadata_json, '$.run_id') = ? ORDER BY created_at ASC, id ASC",
+    [projectId, runId],
+  );
+  const started = events.find(
+    (event) => JSON.parse(String(event.metadata_json)).action === "started",
+  );
+  if (!started) throw notFound(`workflow run ${JSON.stringify(runId)} not found`);
+  const startedMetadata = JSON.parse(String(started.metadata_json)) as {
+    steps?: Array<{ id?: string; kind?: string }>;
+  };
+  const steps: WorkflowStepState[] = (startedMetadata.steps ?? []).map((step) => ({
+    id: String(step.id ?? ""),
+    kind: String(step.kind ?? "read_only"),
+    status: "pending",
+    claimed_by: null,
+  }));
+  let runStatus = "active";
+  for (const event of events) {
+    const metadata = JSON.parse(String(event.metadata_json)) as {
+      action?: string;
+      step_id?: string;
+      value?: { output?: unknown };
+    };
+    if (metadata.action === "completed") runStatus = "completed";
+    if (metadata.action === "aborted") runStatus = "aborted";
+    const step = steps.find((candidate) => candidate.id === metadata.step_id);
+    if (!step) continue;
+    if (["claimed", "reclaimed", "taken_over"].includes(metadata.action ?? "")) {
+      if (metadata.action === "taken_over" && step.kind === "non_idempotent") {
+        step.status = "needs_reconcile";
+      } else {
+        step.status = "claimed";
+      }
+      step.claimed_by = String(event.agent);
+    } else if (metadata.action === "completed_step" || metadata.action === "reconciled") {
+      step.status = "completed";
+      step.claimed_by = null;
+    } else if (metadata.action === "failed_step") {
+      step.status = "failed";
+      step.claimed_by = String(event.agent);
+      runStatus = "failed";
+    }
+  }
+  return { runStatus, steps };
+}
+
+export async function claimWorkflowStepService(
+  db: Database,
+  authorized: AuthorizedProject<"write">,
+  runId: string,
+  stepId: string,
+  input: {
+    event_id?: string | null;
+    session_id?: string | null;
+    context?: ContextEnvelope | null;
+    created_at?: string | null;
+    takeover?: boolean;
+    reason?: string | null;
+  },
+): Promise<ClaimResult> {
+  const state = await workflowStepStates(db, authorized.project.id, runId);
+  if (["completed", "aborted"].includes(state.runStatus)) {
+    throw badRequest(`workflow run ${runId} is not active`);
+  }
+  const step = state.steps.find((candidate) => candidate.id === stepId);
+  if (!step) throw notFound(`unknown workflow step ${JSON.stringify(stepId)}`);
+  const expected = state.steps.find((candidate) => candidate.status !== "completed");
+  if (!expected || expected.id !== stepId) {
+    throw badRequest(`next workflow step is ${expected?.id ?? "none"}, not ${stepId}`);
+  }
+  const takeover = input.takeover === true;
+  const reason = input.reason?.trim() || null;
+  if (takeover && !reason) throw badRequest("takeover reason is required");
+  if (step.status === "needs_reconcile") {
+    throw conflict(`workflow step ${stepId} needs reconciliation`);
+  }
+  if (takeover && step.status !== "claimed") {
+    throw badRequest(`workflow step ${stepId} is not claimed; claim it without takeover`);
+  }
+  if (takeover && step.kind === "non_idempotent") {
+    throw conflict(`workflow step ${stepId} needs reconciliation before takeover`);
+  }
+  const action = step.status === "failed" ? "reclaimed" : takeover ? "taken_over" : "claimed";
+  const agent = authorized.principal.agentId;
+  const event = claimEvent(authorized.project.id, agent, {
+    event_id: input.event_id,
+    event_type: "workflow",
+    session_id: input.session_id,
+    title: "workflow step claim",
+    content: `workflow ${runId}: ${action}`,
+    context: input.context,
+    metadata: {
+      action,
+      run_id: runId,
+      step_id: stepId,
+      ...(takeover ? { takeover: true, takeover_reason: reason } : {}),
+    },
+    tags: [`workflow_run:${runId}`, `workflow:${action}`],
+    created_at: input.created_at,
+  });
+  try {
+    return await appendAtomicClaim(db, {
+      table: "workflow_step_claims",
+      key: { run_id: runId, step_id: stepId },
+      event,
+      claimed_by: agent,
+      takeover,
+      takeover_reason: reason,
+    });
+  } catch (error) {
+    if (isClaimConflict(error)) throw conflict(error.message);
+    throw error;
+  }
+}
+
 export async function listTasksService(
   db: Database,
   authorized: AuthorizedProject,
@@ -268,7 +565,7 @@ export async function listTasksService(
   const events = await listEvents(db, authorized.project.id, { eventType: "task", limit: 500 });
   const byTask = new Map<string, Event[]>();
   for (const event of events) {
-    const taskId = (event.metadata_json as { task_id?: string }).task_id;
+    const taskId = taskIdForEvent(event);
     if (!taskId) continue;
     const list = byTask.get(taskId) ?? [];
     list.push(event);
@@ -277,14 +574,17 @@ export async function listTasksService(
   const summaries: TaskSummary[] = [];
   for (const [taskId, taskEvents] of byTask) {
     const ordered = [...taskEvents].sort((a, b) => a.created_at.localeCompare(b.created_at));
-    const createEvent =
-      ordered.find((event) => (event.metadata_json as { op?: string }).op === "create") ??
-      ordered[0];
-    const done = ordered.some((event) => (event.metadata_json as { op?: string }).op === "done");
+    const createEvent = ordered.find(isTaskCreated) ?? ordered[0];
+    const done = ordered.some(isTaskDone);
+    const claim = await db.first(
+      "SELECT claimed_by FROM task_claims WHERE project_id = ? AND task_id = ?",
+      [authorized.project.id, taskId],
+    );
     summaries.push({
       task_id: taskId,
-      title: createEvent.title ?? createEvent.content,
-      status: done ? "done" : "open",
+      title: createEvent.title && createEvent.title !== "task" ? createEvent.title : createEvent.content,
+      status: done ? "done" : claim?.claimed_by ? "claimed" : "open",
+      claimed_by: (claim?.claimed_by as string | null) ?? null,
       created_at: createEvent.created_at,
       updated_at: ordered[ordered.length - 1].created_at,
     });

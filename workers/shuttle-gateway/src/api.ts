@@ -10,13 +10,19 @@ import { badRequest, notFound } from "./errors.js";
 import { errorResponse, json, readJson } from "./http.js";
 import {
   appendEventService,
+  claimTaskService,
+  claimWorkflowStepService,
+  completeTaskService,
+  createTaskService,
   createProjectService,
   createWorkspaceService,
   latestSnapshotService,
   listEventsService,
   listProjectsService,
+  listTasksService,
   publishSnapshotService,
   recallService,
+  updateTaskService,
 } from "./services.js";
 import type { ContextEnvelope, EventType } from "./types.js";
 
@@ -47,6 +53,13 @@ function parseBeforeCursor(raw: string | null): { createdAt: string; id: string 
   return { createdAt: raw.slice(0, separator), id: raw.slice(separator + 1) };
 }
 
+function requestContext(body: Record<string, unknown>, principal: Principal): ContextEnvelope | null {
+  const raw = body.context;
+  const context = raw && typeof raw === "object" ? { ...(raw as ContextEnvelope) } : {};
+  context.agent = principal.agentId;
+  return context;
+}
+
 /**
  * Resource-oriented API. MCP tools and these endpoints call the same
  * application services, so neither one is a privileged path. Every project
@@ -74,6 +87,16 @@ export async function handleApi(
       project_id: projectId,
       scopes: scopeList(body.scopes),
       label: typeof body.label === "string" ? body.label : null,
+      agent_id:
+        typeof body.agent_id === "string" && body.agent_id.trim()
+          ? body.agent_id.trim()
+          : typeof body.label === "string" && body.label.trim()
+            ? body.label.trim()
+            : "agent",
+      client_instance_id:
+        typeof body.client_instance_id === "string" && body.client_instance_id.trim()
+          ? body.client_instance_id.trim()
+          : null,
     });
     return json(minted, 201);
   }
@@ -107,10 +130,93 @@ export async function handleApi(
       const authorized = await authorize(db, principal, selector, "write");
       const body = await readJson(request);
       const workspace = await createWorkspaceService(db, authorized, {
-        client_instance_id: String(body.client_instance_id ?? ""),
+        client_instance_id: authorized.principal.clientInstanceId ?? String(body.client_instance_id ?? ""),
         local_path_hint: typeof body.local_path_hint === "string" ? body.local_path_hint : null,
       });
       return json(workspace, 201);
+    }
+
+    if (tail.length === 1 && tail[0] === "tasks") {
+      if (method === "GET") {
+        const authorized = await authorize(db, principal, selector, "read");
+        return json({ tasks: await listTasksService(db, authorized) });
+      }
+      if (method === "POST") {
+        const authorized = await authorize(db, principal, selector, "write");
+        const body = await readJson(request);
+        const context = requestContext(body, principal);
+        const task = await createTaskService(db, authorized, {
+          title: String(body.title ?? ""),
+          body: typeof body.body === "string" ? body.body : null,
+          context,
+        });
+        return json(task, 201);
+      }
+    }
+
+    if (tail.length === 3 && tail[0] === "tasks" && tail[2] === "claim" && method === "POST") {
+      const authorized = await authorize(db, principal, selector, "write");
+      const body = await readJson(request);
+      const result = await claimTaskService(db, authorized, decodeURIComponent(tail[1]), {
+        event_id: typeof body.event_id === "string" ? body.event_id : null,
+        session_id: typeof body.session_id === "string" ? body.session_id : null,
+        context: requestContext(body, principal),
+        created_at: typeof body.created_at === "string" ? body.created_at : null,
+        takeover: body.takeover === true,
+        reason: typeof body.reason === "string" ? body.reason : null,
+      });
+      return json(result, result.deduplicated ? 200 : 201);
+    }
+
+    if (tail.length === 3 && tail[0] === "tasks" && tail[2] === "update" && method === "POST") {
+      const authorized = await authorize(db, principal, selector, "write");
+      const body = await readJson(request);
+      const result = await updateTaskService(
+        db,
+        authorized,
+        decodeURIComponent(tail[1]),
+        String(body.text ?? ""),
+        requestContext(body, principal),
+      );
+      return json(result, 201);
+    }
+
+    if (tail.length === 3 && tail[0] === "tasks" && tail[2] === "done" && method === "POST") {
+      const authorized = await authorize(db, principal, selector, "write");
+      const body = await readJson(request);
+      const result = await completeTaskService(
+        db,
+        authorized,
+        decodeURIComponent(tail[1]),
+        requestContext(body, principal),
+      );
+      return json(result, 201);
+    }
+
+    if (
+      tail.length === 5 &&
+      tail[0] === "workflows" &&
+      tail[2] === "steps" &&
+      tail[4] === "claim" &&
+      method === "POST"
+    ) {
+      const authorized = await authorize(db, principal, selector, "write");
+      const body = await readJson(request);
+      const result = await claimWorkflowStepService(
+        db,
+        authorized,
+        decodeURIComponent(tail[1]),
+        decodeURIComponent(tail[3]),
+        {
+          event_id: typeof body.event_id === "string" ? body.event_id : null,
+          session_id: typeof body.session_id === "string" ? body.session_id : null,
+          context: requestContext(body, principal),
+          created_at: typeof body.created_at === "string" ? body.created_at : null,
+          takeover: body.takeover === true,
+          reason: typeof body.reason === "string" ? body.reason : null,
+        },
+      );
+      return json(result, result.deduplicated ? 200 : 201);
     }
 
     if (tail.length === 1 && tail[0] === "events") {

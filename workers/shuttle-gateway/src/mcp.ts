@@ -3,6 +3,7 @@ import type { Database } from "./database.js";
 import { badRequest } from "./errors.js";
 import {
   completeTaskService,
+  claimTaskService,
   createProjectService,
   createTaskService,
   latestSnapshotService,
@@ -150,6 +151,18 @@ export function gatewayTools() {
       ["project", "task_id", "text"],
     ),
     tool(
+      "shuttle_task_claim",
+      "Atomically claim a task; a competing claim returns a conflict",
+      {
+        project: stringSchema("Project slug or id"),
+        task_id: stringSchema("Task id"),
+        takeover: { type: "boolean", description: "Explicitly take over another agent's claim" },
+        reason: stringSchema("Required reason for takeover"),
+        context: contextSchema,
+      },
+      ["project", "task_id"],
+    ),
+    tool(
       "shuttle_task_done",
       "Mark a task complete",
       {
@@ -224,6 +237,20 @@ async function callTool(
         str(args, "task_id"),
         str(args, "text"),
         envelope(args),
+      );
+    }
+    case "shuttle_task_claim": {
+      return claimTaskService(
+        db,
+        await forProject("write"),
+        str(args, "task_id"),
+        {
+          event_id: optStr(args, "event_id"),
+          session_id: envelope(args)?.session_id,
+          context: envelope(args),
+          takeover: args.takeover === true,
+          reason: optStr(args, "reason"),
+        },
       );
     }
     case "shuttle_task_done": {

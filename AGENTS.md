@@ -21,8 +21,10 @@ stl init
 ```
 
 Shuttle stores local data in `.shuttle/shuttle.db` at the current Git repository
-root. The `.shuttle` directory is local runtime state and should not be
-committed.
+root for repositories that explicitly use local mode. `taskforward` is the
+cloud-first exception: after migration, its `.shuttle` directory is absent and
+`stl` uses the Cloudflare Worker + D1 project configured by
+`SHUTTLE_GATEWAY_URL` / `SHUTTLE_GATEWAY_PROJECT`.
 
 ## Before Starting Work
 
@@ -46,7 +48,7 @@ stl --json task list
 ```
 
 If `SHUTTLE_AGENT` is not set by the shell or agent runtime, set a repo-local
-identity:
+identity in local mode:
 
 ```bash
 stl identity set codex
@@ -163,7 +165,7 @@ events visible in the receiving workspace.
 
 ## Cloud Sync (Cloudflare gateway)
 
-Share the local event log across machines through the cloud shuttle-gateway
+For local-mode repositories, share the local event log across machines through the cloud shuttle-gateway
 (the Cloudflare Worker in `workers/shuttle-gateway/`). To stand up the gateway
 itself, see [docs/deploy-cloudflare.md](./docs/deploy-cloudflare.md). Configure
 once per repository, then push/pull:
@@ -182,3 +184,10 @@ Flags override the saved settings, and `SHUTTLE_GATEWAY_URL` /
 `SHUTTLE_GATEWAY_PROJECT` work as fallbacks. Like mesh sync, cloud sync
 preserves event ids, keeps original timestamps, skips duplicates, and makes
 pulled events visible in the receiving workspace.
+
+For `taskforward`, this push/pull mode is only the one-time migration path.
+Normal commands become cloud-first automatically when `.shuttle/shuttle.db` is
+absent and the gateway environment is present. The cloud-first runtime sends
+Cloudflare Access service-auth headers plus a project-scoped PAT, auto-reuses a
+workspace by `SHUTTLE_CLIENT_INSTANCE_ID`, and fails closed instead of creating
+a local fallback database.

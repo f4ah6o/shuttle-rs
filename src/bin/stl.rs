@@ -151,6 +151,10 @@ enum TaskCommand {
     },
     Claim {
         id: Uuid,
+        #[arg(long)]
+        takeover: bool,
+        #[arg(long)]
+        reason: Option<String>,
     },
     Update {
         id: Uuid,
@@ -241,6 +245,8 @@ enum WorkflowStepCommand {
         step_id: String,
         #[arg(long)]
         takeover: bool,
+        #[arg(long)]
+        reason: Option<String>,
     },
     Complete {
         run_id: Uuid,
@@ -427,6 +433,10 @@ fn main() -> Result<()> {
     match cli.command {
         Command::ShowVersion => unreachable!("version exits before runtime environment loading"),
         Command::Init => {
+            anyhow::ensure!(
+                !env.cloud,
+                "this repository is configured for cloud-first Shuttle; D1 is authoritative and `stl init` must not create .shuttle"
+            );
             fs::create_dir_all(&env.shuttle_dir)
                 .with_context(|| format!("failed to create {}", env.shuttle_dir.display()))?;
             SqliteEventStore::open(&env.database_path)
@@ -488,6 +498,10 @@ fn main() -> Result<()> {
                 })?;
             }
             IdentityCommand::Set { agent } => {
+                anyhow::ensure!(
+                    !env.cloud,
+                    "cloud-first identity comes from the PAT grant; set SHUTTLE_AGENT only for display and mint a PAT for this agent"
+                );
                 set_persisted_agent(&env.shuttle_dir, &agent)?;
                 let identity = IdentityOutput {
                     agent,
@@ -653,13 +667,28 @@ fn main() -> Result<()> {
                     let event = block_on(store.append(event))?;
                     output(cli.json, &event, || format!("created task {}", event.id))?;
                 }
-                TaskCommand::Claim { id } => {
+                TaskCommand::Claim {
+                    id,
+                    takeover,
+                    reason,
+                } => {
+                    anyhow::ensure!(
+                        !takeover
+                            || reason
+                                .as_deref()
+                                .is_some_and(|value| !value.trim().is_empty()),
+                        "--takeover requires a non-empty --reason"
+                    );
+                    anyhow::ensure!(
+                        takeover || reason.is_none(),
+                        "--reason can only be used with --takeover"
+                    );
                     block_on(shuttle_rs::task::ensure_task_exists(
                         &store,
                         &env.workspace_id,
                         id,
                     ))?;
-                    let event = with_repo_metadata(
+                    let mut event = with_repo_metadata(
                         shuttle_rs::task::new_claim(
                             env.workspace_id.clone(),
                             env.agent.clone(),
@@ -668,6 +697,10 @@ fn main() -> Result<()> {
                         ),
                         &env,
                     );
+                    if takeover {
+                        event.metadata_json["takeover"] = json!(true);
+                        event.metadata_json["takeover_reason"] = json!(reason);
+                    }
                     let event = block_on(store.append(event))?;
                     output(cli.json, &event, || format!("claimed task {id}"))?;
                 }
@@ -933,12 +966,28 @@ fn main() -> Result<()> {
                         run_id,
                         step_id,
                         takeover,
+                        reason,
                     } => {
+                        anyhow::ensure!(
+                            !takeover
+                                || reason
+                                    .as_deref()
+                                    .is_some_and(|value| !value.trim().is_empty()),
+                            "--takeover requires a non-empty --reason"
+                        );
+                        anyhow::ensure!(
+                            takeover || reason.is_none(),
+                            "--reason can only be used with --takeover"
+                        );
                         let run =
                             block_on(shuttle_rs::workflow::run(&store, &env.workspace_id, run_id))?;
-                        let action =
-                            shuttle_rs::workflow::validate_claim(&run, &step_id, takeover)?;
-                        let event = shuttle_rs::workflow::action_event(
+                        let action = shuttle_rs::workflow::validate_claim_for_agent(
+                            &run,
+                            &step_id,
+                            takeover,
+                            Some(&env.agent),
+                        )?;
+                        let mut event = shuttle_rs::workflow::action_event(
                             env.workspace_id.clone(),
                             env.agent.clone(),
                             env.session_id.clone(),
@@ -947,6 +996,10 @@ fn main() -> Result<()> {
                             Some(&step_id),
                             Some(json!({ "takeover": takeover })),
                         );
+                        if takeover {
+                            event.metadata_json["takeover"] = json!(true);
+                            event.metadata_json["takeover_reason"] = json!(reason);
+                        }
                         let event = block_on(store.append(with_repo_metadata(event, &env)))?;
                         output(cli.json, &event, || {
                             format!("claimed workflow step {step_id}")
@@ -1071,7 +1124,8 @@ fn main() -> Result<()> {
             }
         }
         Command::Mesh { command } => {
-            let store = open_store(&env)?;
+            require_local_mode(&env, "mesh")?;
+            let store = open_local_store(&env)?;
             match command {
                 MeshCommand::Export { path } => {
                     let archive = block_on(shuttle_rs::mesh::export_archive(&store))?;
@@ -1135,6 +1189,7 @@ fn main() -> Result<()> {
             project,
             token_env,
         } => {
+            require_local_mode(&env, "sync")?;
             let overrides = SyncOverrides {
                 url,
                 project,
@@ -1157,7 +1212,7 @@ fn main() -> Result<()> {
                     })?;
                 }
                 Some(SyncCommand::Push) => {
-                    let store = open_store(&env)?;
+                    let store = open_local_store(&env)?;
                     let (api, _) = remote_api(&env, &overrides)?;
                     let report = block_on(shuttle_rs::remote::push(&store, &api))?;
                     output(cli.json, &report, || {
@@ -1168,7 +1223,7 @@ fn main() -> Result<()> {
                     })?;
                 }
                 Some(SyncCommand::Pull) => {
-                    let store = open_store(&env)?;
+                    let store = open_local_store(&env)?;
                     let (api, settings) = remote_api(&env, &overrides)?;
                     let report = block_on(shuttle_rs::remote::pull(
                         &store,
@@ -1184,7 +1239,7 @@ fn main() -> Result<()> {
                     })?;
                 }
                 None => {
-                    let store = open_store(&env)?;
+                    let store = open_local_store(&env)?;
                     let (api, settings) = remote_api(&env, &overrides)?;
                     let report = block_on(shuttle_rs::remote::sync(
                         &store,
@@ -1225,58 +1280,64 @@ fn main() -> Result<()> {
                 }
             })?;
         }
-        Command::App { command } => match command {
-            AppCommand::Serve { addr, public_url } => {
-                let store = open_store(&env)?;
-                println!("serving shuttle app at http://{addr}");
-                let oauth = app_oauth(&env, public_url)?;
-                let runtime = tokio::runtime::Runtime::new()?;
-                runtime.block_on(shuttle_rs::app::serve(
-                    shuttle_rs::app::AppRuntime {
-                        store,
-                        cwd: env.cwd,
-                        workspace_id: env.workspace_id,
-                        agent: env.agent,
-                        session_id: env.session_id,
-                        oauth,
-                    },
-                    addr,
-                ))?;
-            }
-            AppCommand::Tunnel {
-                addr,
-                public_url,
-                cloudflare_token_env,
-                cloudflared,
-            } => {
-                let store = open_store(&env)?;
-                let public_url = shuttle_rs::oauth::OAuthConfig::normalize_public_url(public_url);
-                let oauth = app_oauth(&env, Some(public_url.clone()))?;
-                let token = env::var(&cloudflare_token_env).with_context(|| {
-                    format!("failed to read Cloudflare tunnel token from {cloudflare_token_env}")
-                })?;
-                if token.trim().is_empty() {
-                    anyhow::bail!("Cloudflare tunnel token environment variable is empty");
+        Command::App { command } => {
+            require_local_mode(&env, "app")?;
+            match command {
+                AppCommand::Serve { addr, public_url } => {
+                    let store = open_local_store(&env)?;
+                    println!("serving shuttle app at http://{addr}");
+                    let oauth = app_oauth(&env, public_url)?;
+                    let runtime = tokio::runtime::Runtime::new()?;
+                    runtime.block_on(shuttle_rs::app::serve(
+                        shuttle_rs::app::AppRuntime {
+                            store,
+                            cwd: env.cwd,
+                            workspace_id: env.workspace_id,
+                            agent: env.agent,
+                            session_id: env.session_id,
+                            oauth,
+                        },
+                        addr,
+                    ))?;
                 }
-                let mut tunnel = start_cloudflared(&cloudflared, &token)?;
-                println!("serving shuttle app at http://{addr} through {public_url}");
-                println!("configure remote MCP clients with {public_url}/mcp");
-                let runtime = tokio::runtime::Runtime::new()?;
-                let result = runtime.block_on(shuttle_rs::app::serve(
-                    shuttle_rs::app::AppRuntime {
-                        store,
-                        cwd: env.cwd,
-                        workspace_id: env.workspace_id,
-                        agent: env.agent,
-                        session_id: env.session_id,
-                        oauth,
-                    },
+                AppCommand::Tunnel {
                     addr,
-                ));
-                stop_child(&mut tunnel);
-                result?;
+                    public_url,
+                    cloudflare_token_env,
+                    cloudflared,
+                } => {
+                    let store = open_local_store(&env)?;
+                    let public_url =
+                        shuttle_rs::oauth::OAuthConfig::normalize_public_url(public_url);
+                    let oauth = app_oauth(&env, Some(public_url.clone()))?;
+                    let token = env::var(&cloudflare_token_env).with_context(|| {
+                        format!(
+                            "failed to read Cloudflare tunnel token from {cloudflare_token_env}"
+                        )
+                    })?;
+                    if token.trim().is_empty() {
+                        anyhow::bail!("Cloudflare tunnel token environment variable is empty");
+                    }
+                    let mut tunnel = start_cloudflared(&cloudflared, &token)?;
+                    println!("serving shuttle app at http://{addr} through {public_url}");
+                    println!("configure remote MCP clients with {public_url}/mcp");
+                    let runtime = tokio::runtime::Runtime::new()?;
+                    let result = runtime.block_on(shuttle_rs::app::serve(
+                        shuttle_rs::app::AppRuntime {
+                            store,
+                            cwd: env.cwd,
+                            workspace_id: env.workspace_id,
+                            agent: env.agent,
+                            session_id: env.session_id,
+                            oauth,
+                        },
+                        addr,
+                    ));
+                    stop_child(&mut tunnel);
+                    result?;
+                }
             }
-        },
+        }
         Command::Skill { command } => match command {
             SkillCommand::Install { target } => {
                 let install = install_skill(target)?;
@@ -1300,7 +1361,8 @@ fn main() -> Result<()> {
             }
         },
         Command::Adapter { command } => {
-            let store = open_store(&env)?;
+            require_local_mode(&env, "adapter")?;
+            let store = open_local_store(&env)?;
             match command {
                 AdapterCommand::Register {
                     name,
@@ -1556,9 +1618,33 @@ struct RuntimeEnv {
     shuttle_dir: PathBuf,
     database_path: PathBuf,
     workspace_id: String,
+    client_instance_id: String,
     agent: String,
     agent_source: String,
     session_id: String,
+    cloud: bool,
+}
+
+enum RuntimeStore {
+    Local(SqliteEventStore),
+    Cloud(shuttle_rs::remote::CloudEventStore),
+}
+
+#[async_trait::async_trait]
+impl EventStore for RuntimeStore {
+    async fn append(&self, event: Event) -> shuttle_rs::core::Result<Event> {
+        match self {
+            Self::Local(store) => store.append(event).await,
+            Self::Cloud(store) => store.append(event).await,
+        }
+    }
+
+    async fn list(&self, filter: EventFilter) -> shuttle_rs::core::Result<Vec<Event>> {
+        match self {
+            Self::Local(store) => store.list(filter).await,
+            Self::Cloud(store) => store.list(filter).await,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1573,18 +1659,33 @@ impl RuntimeEnv {
         let root = repo_root(&cwd).unwrap_or_else(|| cwd.clone());
         let shuttle_dir = root.join(".shuttle");
         let database_path = shuttle_dir.join("shuttle.db");
-        let workspace_id = load_or_create_workspace_id(&shuttle_dir, &root)?;
+        let client_instance_id = env::var("SHUTTLE_CLIENT_INSTANCE_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "default-client".to_owned());
+        let cloud = !database_path.is_file()
+            && (env::var("SHUTTLE_GATEWAY_URL")
+                .ok()
+                .is_some_and(|value| !value.trim().is_empty())
+                || root.file_name().is_some_and(|name| name == "taskforward"));
+        let workspace_id = if database_path.is_file() {
+            load_or_create_workspace_id(&shuttle_dir, &root)?
+        } else {
+            client_instance_id.clone()
+        };
         let (agent, agent_source) = load_agent(&shuttle_dir);
-        let session_id = load_or_create_session_id(&shuttle_dir)?;
+        let session_id = load_or_create_session_id(&shuttle_dir, !cloud)?;
 
         Ok(Self {
             cwd,
             shuttle_dir,
             database_path,
             workspace_id,
+            client_instance_id,
             agent,
             agent_source,
             session_id,
+            cloud,
         })
     }
 }
@@ -1705,7 +1806,7 @@ fn current_identity(env: &RuntimeEnv) -> Result<IdentityOutput> {
     })
 }
 
-fn load_or_create_session_id(shuttle_dir: &Path) -> Result<String> {
+fn load_or_create_session_id(shuttle_dir: &Path, persist: bool) -> Result<String> {
     if let Ok(session_id) = env::var("SHUTTLE_SESSION_ID") {
         return Ok(session_id);
     }
@@ -1718,23 +1819,47 @@ fn load_or_create_session_id(shuttle_dir: &Path) -> Result<String> {
         }
     }
 
-    fs::create_dir_all(shuttle_dir)
-        .with_context(|| format!("failed to create {}", shuttle_dir.display()))?;
     let session_id = Uuid::new_v4().to_string();
-    fs::write(&path, format!("{session_id}\n"))
-        .with_context(|| format!("failed to write {}", path.display()))?;
+    if persist {
+        fs::create_dir_all(shuttle_dir)
+            .with_context(|| format!("failed to create {}", shuttle_dir.display()))?;
+        fs::write(&path, format!("{session_id}\n"))
+            .with_context(|| format!("failed to write {}", path.display()))?;
+    }
     Ok(session_id)
 }
 
-fn open_store(env: &RuntimeEnv) -> Result<SqliteEventStore> {
+fn open_store(env: &RuntimeEnv) -> Result<RuntimeStore> {
+    if env.cloud {
+        let (api, _) = remote_api(env, &SyncOverrides::default())?;
+        return Ok(RuntimeStore::Cloud(
+            shuttle_rs::remote::CloudEventStore::connect(
+                api.config().clone(),
+                &env.client_instance_id,
+                Some(&env.cwd.display().to_string()),
+            )?,
+        ));
+    }
+    Ok(RuntimeStore::Local(open_local_store(env)?))
+}
+
+fn open_local_store(env: &RuntimeEnv) -> Result<SqliteEventStore> {
     fs::create_dir_all(&env.shuttle_dir)
         .with_context(|| format!("failed to create {}", env.shuttle_dir.display()))?;
     SqliteEventStore::open(&env.database_path)
         .with_context(|| format!("failed to open {}", env.database_path.display()))
 }
 
+fn require_local_mode(env: &RuntimeEnv, command: &str) -> Result<()> {
+    anyhow::ensure!(
+        !env.cloud,
+        "cloud-first Shuttle is authoritative; `{command}` is unavailable and must not recreate .shuttle"
+    );
+    Ok(())
+}
+
 fn resolve_content(
-    store: &SqliteEventStore,
+    store: &impl EventStore,
     content: Option<String>,
     from_message: Option<Uuid>,
 ) -> Result<ResolvedContent> {
@@ -1755,7 +1880,7 @@ fn resolve_content(
     }
 }
 
-fn load_message(store: &SqliteEventStore, id: Uuid) -> Result<Event> {
+fn load_message(store: &impl EventStore, id: Uuid) -> Result<Event> {
     let mut events = block_on(store.list(EventFilter {
         id: Some(id),
         event_type: Some(EventType::Message),
@@ -1775,7 +1900,7 @@ fn with_source_message_metadata(mut event: Event, message_id: Option<Uuid>) -> E
     event
 }
 
-fn watch_inbox(json: bool, store: &SqliteEventStore, agent: &str, interval: u64) -> Result<()> {
+fn watch_inbox(json: bool, store: &impl EventStore, agent: &str, interval: u64) -> Result<()> {
     let interval = Duration::from_secs(interval.max(1));
     let mut seen = HashSet::new();
 
@@ -1906,10 +2031,18 @@ fn remote_api(
         .ok()
         .filter(|token| !token.trim().is_empty())
         .with_context(|| format!("gateway token is not set; export {token_env}"))?;
+    let access_client_id = env::var("CLOUDFLARE_ACCESS_CLIENT_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let access_client_secret = env::var("CLOUDFLARE_ACCESS_CLIENT_SECRET")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
     let api = shuttle_rs::remote::HttpRemoteApi::new(shuttle_rs::remote::RemoteConfig {
         url: settings.url.clone(),
         project: settings.project.clone(),
         token,
+        access_client_id,
+        access_client_secret,
     });
     Ok((api, settings))
 }
@@ -2048,7 +2181,7 @@ stl identity current
 "#;
 
 fn append_typed_memory(
-    store: &SqliteEventStore,
+    store: &impl EventStore,
     env: &RuntimeEnv,
     event_type: EventType,
     content: String,
@@ -2386,8 +2519,8 @@ mod tests {
         let shuttle_dir = dir.path().join(".shuttle");
 
         env::remove_var("SHUTTLE_SESSION_ID");
-        let first = load_or_create_session_id(&shuttle_dir).unwrap();
-        let second = load_or_create_session_id(&shuttle_dir).unwrap();
+        let first = load_or_create_session_id(&shuttle_dir, true).unwrap();
+        let second = load_or_create_session_id(&shuttle_dir, true).unwrap();
 
         assert_eq!(first, second);
         assert!(shuttle_dir.join("session").exists());
@@ -2402,7 +2535,7 @@ mod tests {
         fs::write(shuttle_dir.join("session"), "persisted\n").unwrap();
 
         env::set_var("SHUTTLE_SESSION_ID", "override");
-        let session_id = load_or_create_session_id(&shuttle_dir).unwrap();
+        let session_id = load_or_create_session_id(&shuttle_dir, true).unwrap();
         env::remove_var("SHUTTLE_SESSION_ID");
 
         assert_eq!(session_id, "override");
@@ -2751,9 +2884,11 @@ mod tests {
             shuttle_dir: data.join(".shuttle"),
             database_path: data.join(".shuttle/shuttle.db"),
             workspace_id: "workspace".into(),
+            client_instance_id: "test-client".into(),
             agent: "codex".into(),
             agent_source: "test".into(),
             session_id: "session".into(),
+            cloud: false,
         }
     }
 
