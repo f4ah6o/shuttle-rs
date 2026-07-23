@@ -1,0 +1,33 @@
+name = "shuttle-gateway"
+main = "src/index.ts"
+compatibility_date = "2026-07-20"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = false
+
+[[routes]]
+pattern = "shuttle.example.com"
+custom_domain = true
+
+# Authoritative shared event store. D1 owns projects, workspaces, events,
+# event tags, project grants, and context-snapshot metadata.
+[[d1_databases]]
+binding = "DB"
+database_name = "shuttle"
+database_id = "<database-id-from-wrangler-d1-create>"
+migrations_dir = "migrations"
+
+# Public base URL of the deployed Worker; surfaced in MCP/OAuth metadata.
+[vars]
+PUBLIC_URL = "https://shuttle.example.com"
+ACCESS_TEAM_DOMAIN = "https://<team-name>.cloudflareaccess.com"
+ACCESS_APPLICATION_AUD = "<access-application-aud>"
+# Owner id associated with the bootstrap admin token. Used only to mint the
+# first scoped tokens and create the first projects.
+ADMIN_OWNER_ID = "<owner-id>"
+
+[observability]
+enabled = true
+
+# Secrets (set with `wrangler secret put`):
+#   ADMIN_BOOTSTRAP_TOKEN  one-time admin bearer used to create projects and
+#                          mint scoped personal access tokens.

@@ -1,0 +1,6 @@
+node_modules/
+.wrangler/
+wrangler.toml
+dist/
+*.log
+dist-dev/

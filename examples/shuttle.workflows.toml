@@ -1,0 +1,22 @@
+version = 1
+
+[[workflow]]
+id = "daily-triage"
+title = "Daily triage"
+spec = "docs/daily-triage.md"
+
+[[workflow.step]]
+id = "read-spec"
+title = "Read the repository workflow specification"
+kind = "read_only"
+
+[[workflow.step]]
+id = "collect"
+title = "Collect current task data"
+kind = "idempotent"
+
+[[workflow.step]]
+id = "apply"
+title = "Apply the approved external change"
+kind = "non_idempotent"
+approval_required = true

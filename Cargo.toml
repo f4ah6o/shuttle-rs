@@ -1,0 +1,89 @@
+[workspace]
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/shuttle-rs/shuttle-rs"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures-executor = "0.3"
+rusqlite = { version = "0.31", features = ["bundled", "chrono", "uuid"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "process", "signal", "time"] }
+uuid = { version = "1", features = ["serde", "v4", "v5"] }
+
+[package]
+name = "shuttle-rs"
+version = "2026.6.9"
+edition = "2021"
+description = "Local-first event log CLI for agent memory, repository context, task coordination, handoffs, messaging, mesh sync, and MCP access."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/shuttle-rs/shuttle-rs"
+readme = "README.md"
+keywords = ["agents", "cli", "memory", "mcp", "sqlite"]
+categories = ["command-line-utilities", "development-tools"]
+include = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "README.ja.md",
+    "docs/**/*.md",
+    "examples/**/*.toml",
+    "packaging/lxc/**",
+    "packaging/oci/**",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+    "src/**/*.rs",
+]
+
+[lib]
+name = "shuttle_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "stl"
+path = "src/bin/stl.rs"
+
+[[bin]]
+name = "shuttle-gateway"
+path = "src/bin/shuttle-gateway.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures-executor = "0.3"
+opentelemetry = "0.32.0"
+opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic"] }
+opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
+rusqlite = { version = "0.31", features = ["bundled", "chrono", "uuid"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "process", "signal", "time"] }
+toml = "0.8"
+toml_edit = "0.22"
+tower-http = { version = "0.7.0", features = ["trace"] }
+tracing = "0.1.44"
+tracing-opentelemetry = "0.33.0"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+ureq = { version = "2", features = ["json"] }
+uuid = { version = "1", features = ["serde", "v4", "v5"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = "0.5"
