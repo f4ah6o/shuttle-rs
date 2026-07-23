@@ -4,7 +4,7 @@ members = ["crates/*"]
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/shuttle-rs/shuttle-rs"
+repository = "https://github.com/f4ah6o/shuttle-rs"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -23,11 +23,11 @@ uuid = { version = "1", features = ["serde", "v4", "v5"] }
 
 [package]
 name = "shuttle-rs"
-version = "2026.6.9"
+version = "2026.7.0"
 edition = "2021"
 description = "Local-first event log CLI for agent memory, repository context, task coordination, handoffs, messaging, mesh sync, and MCP access."
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/shuttle-rs/shuttle-rs"
+repository = "https://github.com/f4ah6o/shuttle-rs"
 readme = "README.md"
 keywords = ["agents", "cli", "memory", "mcp", "sqlite"]
 categories = ["command-line-utilities", "development-tools"]

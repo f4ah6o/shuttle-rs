@@ -1551,7 +1551,7 @@ dependencies = [
 
 [[package]]
 name = "shuttle-rs"
-version = "2026.6.9"
+version = "2026.7.0"
 dependencies = [
  "anyhow",
  "async-trait",

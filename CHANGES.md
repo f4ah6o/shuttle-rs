@@ -4,6 +4,22 @@
 
 ### Added
 
+### Changed
+
+### Fixed
+
+### Deprecated
+
+### Removed
+
+### Security
+
+### Migration
+
+## 2026.7.0 - 2026-07-23
+
+### Added
+
 - Added repository-defined workflows with agent-independent run, step claim, checkpoint, takeover, reconciliation, and completion state.
 - Added matching `stl workflow` commands and MCP tools so Claude Code and Codex can resume the same work.
 - Added Shuttle skill installation for Claude Code alongside the existing Codex target.
