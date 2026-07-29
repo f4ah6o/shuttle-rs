@@ -120,6 +120,11 @@ enum Command {
         #[arg(long = "token-env", global = true)]
         token_env: Option<String>,
     },
+    /// Inspect and recover the local SQLite event store.
+    Db {
+        #[command(subcommand)]
+        command: DbCommand,
+    },
     Context {
         #[arg(long)]
         repo: bool,
@@ -282,6 +287,16 @@ enum SyncCommand {
 }
 
 #[derive(Debug, Subcommand)]
+enum DbCommand {
+    /// Show schema and connection settings.
+    Status,
+    /// Run non-destructive integrity and projection checks.
+    Check,
+    /// Write a consistent backup without overwriting an existing file.
+    Backup { path: PathBuf },
+}
+
+#[derive(Debug, Subcommand)]
 enum IdentityCommand {
     Current,
     Set { agent: String },
@@ -410,7 +425,14 @@ impl MemoryKindArg {
     }
 }
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("{error:#}");
+        std::process::exit(exit_code(&error));
+    }
+}
+
+fn run() -> Result<()> {
     let _telemetry = shuttle_rs::telemetry::init("stl");
     let cli = Cli::parse();
     let command_name = cli.command.name();
@@ -1213,8 +1235,15 @@ fn main() -> Result<()> {
                 }
                 Some(SyncCommand::Push) => {
                     let store = open_local_store(&env)?;
-                    let (api, _) = remote_api(&env, &overrides)?;
-                    let report = block_on(shuttle_rs::remote::push(&store, &api))?;
+                    let (api, settings) = remote_api(&env, &overrides)?;
+                    let checkpoint =
+                        shuttle_rs::remote::checkpoint_path(&env.shuttle_dir, &settings.project);
+                    let report = block_on(shuttle_rs::remote::push_with_checkpoint(
+                        &store,
+                        &api,
+                        &settings.project,
+                        &checkpoint,
+                    ))?;
                     output(cli.json, &report, || {
                         format!(
                             "pushed {} event(s) ({} already on gateway)",
@@ -1225,11 +1254,14 @@ fn main() -> Result<()> {
                 Some(SyncCommand::Pull) => {
                     let store = open_local_store(&env)?;
                     let (api, settings) = remote_api(&env, &overrides)?;
-                    let report = block_on(shuttle_rs::remote::pull(
+                    let checkpoint =
+                        shuttle_rs::remote::checkpoint_path(&env.shuttle_dir, &settings.project);
+                    let report = block_on(shuttle_rs::remote::pull_with_checkpoint(
                         &store,
                         &api,
                         &env.workspace_id,
                         &settings.project,
+                        &checkpoint,
                     ))?;
                     output(cli.json, &report, || {
                         format!(
@@ -1241,11 +1273,14 @@ fn main() -> Result<()> {
                 None => {
                     let store = open_local_store(&env)?;
                     let (api, settings) = remote_api(&env, &overrides)?;
-                    let report = block_on(shuttle_rs::remote::sync(
+                    let checkpoint =
+                        shuttle_rs::remote::checkpoint_path(&env.shuttle_dir, &settings.project);
+                    let report = block_on(shuttle_rs::remote::sync_with_checkpoint(
                         &store,
                         &api,
                         &env.workspace_id,
                         &settings.project,
+                        &checkpoint,
                     ))?;
                     output(cli.json, &report, || {
                         format!(
@@ -1255,6 +1290,51 @@ fn main() -> Result<()> {
                             report.pull.imported,
                             report.pull.skipped_duplicates
                         )
+                    })?;
+                }
+            }
+        }
+        Command::Db { command } => {
+            require_local_mode(&env, "db")?;
+            let store = open_local_store(&env)?;
+            match command {
+                DbCommand::Status => {
+                    let status = store.status()?;
+                    output(cli.json, &status, || {
+                        format!(
+                            "schema {}/{}; {} event(s); foreign keys {}; journal {}",
+                            status.schema_version,
+                            status.latest_schema_version,
+                            status.event_count,
+                            if status.foreign_keys { "on" } else { "off" },
+                            status.journal_mode
+                        )
+                    })?;
+                }
+                DbCommand::Check => {
+                    let check = store.check()?;
+                    if !check.is_healthy() {
+                        output(cli.json, &check, || {
+                            format!(
+                                "database check failed: integrity={}, orphan tags={}, invalid metadata={}, invalid tags={}",
+                                check.integrity,
+                                check.orphan_event_tags,
+                                check.invalid_metadata,
+                                check.invalid_tags
+                            )
+                        })?;
+                        anyhow::bail!("database integrity check failed");
+                    }
+                    output(cli.json, &check, || "database check passed".to_owned())?;
+                }
+                DbCommand::Backup { path } => {
+                    store.backup(&path)?;
+                    let result = json!({
+                        "path": path.display().to_string(),
+                        "schema_version": store.schema_version()?,
+                    });
+                    output(cli.json, &result, || {
+                        format!("created database backup at {}", path.display())
                     })?;
                 }
             }
@@ -1350,10 +1430,12 @@ fn main() -> Result<()> {
                 if cli.json {
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(&SkillPrintOutput {
-                            target: target.as_str().to_owned(),
-                            content: skill,
-                        })?
+                        serde_json::to_string_pretty(&shuttle_rs::api::versioned(
+                            &SkillPrintOutput {
+                                target: target.as_str().to_owned(),
+                                content: skill,
+                            },
+                        )?)?
                     );
                 } else {
                     print!("{skill}");
@@ -1532,6 +1614,41 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn exit_code(error: &anyhow::Error) -> i32 {
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("conflict") || message.contains("already claimed") {
+        4
+    } else if message.contains("not found") || message.contains("unknown project") {
+        5
+    } else if message.contains("gateway request failed")
+        || message.contains("timed out")
+        || message.contains("returned 429")
+        || message.contains("returned 5")
+    {
+        6
+    } else if message.contains("migration")
+        || message.contains("schema version")
+        || message.contains("integrity")
+        || message.contains("database check failed")
+    {
+        7
+    } else if message.contains("token")
+        || message.contains("unauthorized")
+        || message.contains("forbidden")
+        || message.contains("authorization")
+    {
+        3
+    } else if message.contains("required")
+        || message.contains("invalid")
+        || message.contains("cannot")
+        || message.contains("must ")
+    {
+        2
+    } else {
+        1
+    }
+}
+
 impl Command {
     fn name(&self) -> &'static str {
         match self {
@@ -1555,6 +1672,7 @@ impl Command {
             Self::Workflow { .. } => "workflow",
             Self::Mesh { .. } => "mesh",
             Self::Sync { .. } => "sync",
+            Self::Db { .. } => "db",
             Self::Context { .. } => "context",
             Self::App { .. } => "app",
             Self::Skill { .. } => "skill",
@@ -1936,6 +2054,14 @@ fn app_oauth(
         config: shuttle_rs::oauth::OAuthConfig {
             public_url,
             admin_token: Some(admin_token),
+            allow_dynamic_registration: env::var("SHUTTLE_OAUTH_ALLOW_DYNAMIC_REGISTRATION")
+                .ok()
+                .is_some_and(|value| {
+                    matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                }),
         },
         store: shuttle_rs::oauth::OAuthStore::open(&env.database_path).with_context(|| {
             format!("failed to open OAuth store {}", env.database_path.display())
@@ -2363,7 +2489,10 @@ where
     F: FnOnce() -> String,
 {
     if json {
-        println!("{}", serde_json::to_string_pretty(value)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&shuttle_rs::api::versioned(value)?)?
+        );
     } else {
         println!("{}", text());
     }
@@ -2372,7 +2501,10 @@ where
 
 fn output_events(json: bool, events: &[Event], label: &str) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(events)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&shuttle_rs::api::list(events, None)?)?
+        );
         return Ok(());
     }
 
@@ -2396,7 +2528,10 @@ fn output_events(json: bool, events: &[Event], label: &str) -> Result<()> {
 
 fn output_tasks(json: bool, tasks: &[shuttle_rs::task::TaskSummary]) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(tasks)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&shuttle_rs::api::list(tasks, None)?)?
+        );
         return Ok(());
     }
     if tasks.is_empty() {
@@ -2422,7 +2557,10 @@ fn output_tasks(json: bool, tasks: &[shuttle_rs::task::TaskSummary]) -> Result<(
 
 fn output_event_line(json: bool, event: &Event) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string(event)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&shuttle_rs::api::versioned(event)?)?
+        );
     } else {
         let title = event.title.as_deref().unwrap_or(event.event_type.as_str());
         println!(
@@ -2435,7 +2573,10 @@ fn output_event_line(json: bool, event: &Event) -> Result<()> {
 
 fn output_handoffs(json: bool, handoffs: &[shuttle_rs::task::HandoffSummary]) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(handoffs)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&shuttle_rs::api::list(handoffs, None)?)?
+        );
         return Ok(());
     }
     if handoffs.is_empty() {
@@ -2457,7 +2598,10 @@ fn output_handoffs(json: bool, handoffs: &[shuttle_rs::task::HandoffSummary]) ->
 
 fn output_recall(json: bool, results: &[shuttle_rs::memory::RecallResult]) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(results)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&shuttle_rs::api::list(results, None)?)?
+        );
         return Ok(());
     }
 

@@ -3,6 +3,7 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2021"
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/shuttle-rs/shuttle-rs"
 
@@ -18,13 +19,15 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 thiserror = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "process", "signal", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "process", "signal", "sync", "time"] }
 uuid = { version = "1", features = ["serde", "v4", "v5"] }
+url = "2"
 
 [package]
 name = "shuttle-rs"
 version = "2026.6.9"
 edition = "2021"
+rust-version = "1.85"
 description = "Local-first event log CLI for agent memory, repository context, task coordination, handoffs, messaging, mesh sync, and MCP access."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/shuttle-rs/shuttle-rs"
@@ -43,6 +46,7 @@ include = [
     "LICENSE-MIT",
     "LICENSE-APACHE",
     "src/**/*.rs",
+    "schemas/**/*.json",
 ]
 
 [lib]
@@ -74,7 +78,7 @@ serde_json = "1"
 sha2 = "0.10"
 tempfile = "3"
 thiserror = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "process", "signal", "time"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "process", "signal", "sync", "time"] }
 toml = "0.8"
 toml_edit = "0.22"
 tower-http = { version = "0.7.0", features = ["trace"] }
@@ -83,6 +87,7 @@ tracing-opentelemetry = "0.33.0"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 ureq = { version = "2", features = ["json"] }
 uuid = { version = "1", features = ["serde", "v4", "v5"] }
+url = "2"
 
 [dev-dependencies]
 http-body-util = "0.1"

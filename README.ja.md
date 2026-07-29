@@ -260,6 +260,8 @@ addr = "127.0.0.1:8787"
 auth = "oauth"
 public_url = "https://shuttle.example.com"
 oauth_admin_token_env = "SHUTTLE_OAUTH_ADMIN_TOKEN"
+# dynamic registration は default で無効。必要な場合だけ opt-in する:
+# allow_dynamic_registration = true
 
 [[listeners]]
 name = "private"
@@ -325,8 +327,11 @@ shuttle-gateway serve --config projects.toml
 ```
 
 OAuth client registration、authorization code、access token は gateway-local SQLite database
-に保存されます。backend token と OAuth admin token は secret manager または
-runtime-injected environment variable で渡してください。
+に保存されます。dynamic registration は default で無効で、redirect URI は exact な HTTPS
+match（loopback の HTTP だけ例外）でなければなりません。bearer value の代わりに
+access-token digest を保存し、POST /oauth/revoke で token を revoke できます。backend
+token と OAuth admin token は secret manager または runtime-injected environment variable
+で渡してください。
 
 standard な `v*` release workflow は Rust crate を公開します。gateway container
 artifact は別の `gateway-v*` tag から公開するため、gateway packaging は crates.io
@@ -472,6 +477,14 @@ runner program は `--runner`、次に `SHUTTLE_DOC2LORA_RUNNER` 環境変数、
 上の `doc2lora` の順で解決されます。register された adapter は source document から
 embedding されるため、project embedding と同じ空間に位置し、`stl adapter select` で
 すぐに selection されます。
+
+## Machine-readable contract
+
+JSON CLI output と structured MCP result は schema shuttle.v1 を識別します。
+collection は schema_version、items、pagination を持つ object で返し、error は安定した
+code、message、retryable を持ちます。schema と fixture は schemas/v1 にあります。
+成功レスポンスの field は additive に進化させ、breaking change では schema version を
+更新します。diagnostic と log は stderr に出力し、JSON stdout を汚染しません。
 
 ## Acknowledgements
 
