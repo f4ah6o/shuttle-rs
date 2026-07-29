@@ -1033,11 +1033,25 @@ fn enum_schema(description: &str, values: &[&str]) -> Value {
 }
 
 fn ok(id: Value, result: Value) -> Value {
+    let result = crate::api::versioned_value(result).unwrap_or_else(|_| {
+        json!({
+            "schema_version": crate::api::SCHEMA_VERSION,
+        })
+    });
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
 
 fn error(id: Value, code: i32, message: &str) -> Value {
-    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message,
+            "data": crate::api::error("protocol_error", message, false)
+        },
+        "schema_version": crate::api::SCHEMA_VERSION
+    })
 }
 
 fn git<const N: usize>(cwd: &PathBuf, args: [&str; N]) -> Result<String> {

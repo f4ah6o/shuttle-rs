@@ -8,11 +8,14 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use url::Url;
 use uuid::Uuid;
 
 use crate::core::{Result, ShuttleError};
 
 const MCP_SCOPE: &str = "mcp";
+const CURRENT_OAUTH_SCHEMA_VERSION: u32 = 3;
+const RATE_WINDOW: Duration = Duration::minutes(1);
 
 #[derive(Clone)]
 pub struct OAuthConfig {
@@ -23,6 +26,9 @@ pub struct OAuthConfig {
     /// programmatic or local-only runtimes that intentionally skip owner
     /// approval.
     pub admin_token: Option<String>,
+    /// Dynamic client registration is disabled for public listeners unless
+    /// explicitly opted in by configuration.
+    pub allow_dynamic_registration: bool,
 }
 
 impl OAuthConfig {
@@ -32,6 +38,10 @@ impl OAuthConfig {
 
     pub fn resource_url(&self) -> String {
         format!("{}/mcp", self.public_url)
+    }
+
+    pub fn dynamic_registration_enabled(&self) -> bool {
+        self.allow_dynamic_registration
     }
 }
 
@@ -43,6 +53,10 @@ pub struct OAuthStore {
 impl OAuthStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path).map_err(to_store_error)?;
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL;",
+        )
+        .map_err(to_store_error)?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
         };
@@ -51,42 +65,48 @@ impl OAuthStore {
     }
 
     fn init(&self) -> Result<()> {
-        let conn = self
+        let mut conn = self
             .conn
             .lock()
             .map_err(|err| ShuttleError::Store(err.to_string()))?;
         conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS oauth_clients (
-                client_id TEXT PRIMARY KEY NOT NULL,
-                client_secret TEXT,
-                redirect_uris TEXT NOT NULL,
-                client_name TEXT,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS oauth_codes (
-                code TEXT PRIMARY KEY NOT NULL,
-                client_id TEXT NOT NULL,
-                redirect_uri TEXT NOT NULL,
-                code_challenge TEXT NOT NULL,
-                code_challenge_method TEXT NOT NULL,
-                scope TEXT NOT NULL,
-                expires_at TEXT NOT NULL,
-                used_at TEXT,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS oauth_tokens (
-                token TEXT PRIMARY KEY NOT NULL,
-                client_id TEXT NOT NULL,
-                scope TEXT NOT NULL,
-                expires_at TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-            "#,
+            "CREATE TABLE IF NOT EXISTS oauth_schema_version (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                version INTEGER NOT NULL
+            );",
         )
         .map_err(to_store_error)?;
+        let version: u32 = conn
+            .query_row(
+                "SELECT version FROM oauth_schema_version WHERE id = 1",
+                [],
+                |row| row.get::<_, u32>(0),
+            )
+            .optional()
+            .map_err(to_store_error)?
+            .unwrap_or(0);
+        if version > CURRENT_OAUTH_SCHEMA_VERSION {
+            return Err(ShuttleError::Store(format!(
+                "OAuth schema version {version} is newer than this binary supports"
+            )));
+        }
+        if version == 0 {
+            conn.execute(
+                "INSERT OR IGNORE INTO oauth_schema_version (id, version) VALUES (1, 0)",
+                [],
+            )
+            .map_err(to_store_error)?;
+        }
+        for target in (version + 1)..=CURRENT_OAUTH_SCHEMA_VERSION {
+            let tx = conn.transaction().map_err(to_store_error)?;
+            apply_oauth_migration(&tx, target)?;
+            tx.execute(
+                "UPDATE oauth_schema_version SET version = ?1 WHERE id = 1",
+                [target],
+            )
+            .map_err(to_store_error)?;
+            tx.commit().map_err(to_store_error)?;
+        }
         purge_expired(&conn)?;
         Ok(())
     }
@@ -97,16 +117,24 @@ impl OAuthStore {
                 "redirect_uris must contain at least one URI".to_owned(),
             ));
         }
-        let client = RegisteredClient {
-            client_id: token(),
-            client_secret: None,
-            redirect_uris: request.redirect_uris,
-            client_name: request.client_name,
-        };
+        let mut redirect_uris = request.redirect_uris;
+        redirect_uris.sort();
+        redirect_uris.dedup();
+        for uri in &redirect_uris {
+            validate_redirect_uri(uri)?;
+        }
         let conn = self
             .conn
             .lock()
             .map_err(|err| ShuttleError::Store(err.to_string()))?;
+        purge_expired(&conn)?;
+        enforce_rate_limit(&conn, "registration", 30)?;
+        let client = RegisteredClient {
+            client_id: token(),
+            client_secret: None,
+            redirect_uris,
+            client_name: request.client_name,
+        };
         conn.execute(
             "INSERT INTO oauth_clients (client_id, client_secret, redirect_uris, client_name, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -124,6 +152,7 @@ impl OAuthStore {
     }
 
     pub fn client_allows_redirect(&self, client_id: &str, redirect_uri: &str) -> Result<bool> {
+        validate_redirect_uri(redirect_uri)?;
         let conn = self
             .conn
             .lock()
@@ -161,6 +190,7 @@ impl OAuthStore {
         let Some(code_challenge) = request.code_challenge else {
             return Err(ShuttleError::Store("missing code_challenge".to_owned()));
         };
+        validate_redirect_uri(&request.redirect_uri)?;
         let scope = normalize_scope(request.scope);
         let code = token();
         let now = Utc::now();
@@ -168,6 +198,8 @@ impl OAuthStore {
             .conn
             .lock()
             .map_err(|err| ShuttleError::Store(err.to_string()))?;
+        purge_expired(&conn)?;
+        enforce_rate_limit(&conn, &format!("authorize:{}", request.client_id), 30)?;
         conn.execute(
             "INSERT INTO oauth_codes (
                 code, client_id, redirect_uri, code_challenge, code_challenge_method,
@@ -203,6 +235,8 @@ impl OAuthStore {
             .conn
             .lock()
             .map_err(|err| ShuttleError::Store(err.to_string()))?;
+        purge_expired(&conn)?;
+        enforce_rate_limit(&conn, &format!("token:{}", request.client_id), 20)?;
         let tx = conn.transaction().map_err(to_store_error)?;
         let stored = tx
             .query_row(
@@ -266,20 +300,211 @@ impl OAuthStore {
             .conn
             .lock()
             .map_err(|err| ShuttleError::Store(err.to_string()))?;
+        purge_expired(&conn)?;
+        let token_hash = hash_token(bearer_token);
         let row = conn
             .query_row(
-                "SELECT scope, expires_at FROM oauth_tokens WHERE token = ?1",
-                params![bearer_token],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                "SELECT scope, expires_at, revoked_at FROM oauth_tokens WHERE token = ?1",
+                params![token_hash],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
             )
             .optional()
             .map_err(to_store_error)?;
-        let Some((scope, expires_at)) = row else {
+        let Some((scope, expires_at, revoked_at)) = row else {
             return Ok(false);
         };
-        Ok(scope.split_whitespace().any(|scope| scope == MCP_SCOPE)
+        Ok(revoked_at.is_none()
+            && scope.split_whitespace().any(|scope| scope == MCP_SCOPE)
             && parse_time(&expires_at)? > Utc::now())
     }
+
+    pub fn revoke_access_token(&self, bearer_token: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|err| ShuttleError::Store(err.to_string()))?;
+        let changed = conn
+            .execute(
+                "UPDATE oauth_tokens SET revoked_at = ?1
+                 WHERE token = ?2 AND revoked_at IS NULL",
+                params![Utc::now().to_rfc3339(), hash_token(bearer_token)],
+            )
+            .map_err(to_store_error)?;
+        Ok(changed != 0)
+    }
+
+    pub fn cleanup_expired(&self) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|err| ShuttleError::Store(err.to_string()))?;
+        purge_expired(&conn)
+    }
+}
+
+fn apply_oauth_migration(conn: &Connection, version: u32) -> Result<()> {
+    match version {
+        1 => conn
+            .execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS oauth_clients (
+                    client_id TEXT PRIMARY KEY NOT NULL,
+                    client_secret TEXT,
+                    redirect_uris TEXT NOT NULL,
+                    client_name TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS oauth_codes (
+                    code TEXT PRIMARY KEY NOT NULL,
+                    client_id TEXT NOT NULL,
+                    redirect_uri TEXT NOT NULL,
+                    code_challenge TEXT NOT NULL,
+                    code_challenge_method TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    used_at TEXT,
+                    created_at TEXT NOT NULL
+                );
+
+                -- The token column contains a SHA-256 digest, never a bearer
+                -- token. The column name is retained for old DB compatibility.
+                CREATE TABLE IF NOT EXISTS oauth_tokens (
+                    token TEXT PRIMARY KEY NOT NULL,
+                    client_id TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                "#,
+            )
+            .map_err(to_store_error),
+        2 => {
+            ensure_oauth_column(conn, "oauth_tokens", "revoked_at", "TEXT")?;
+            conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS oauth_rate_limits (
+                    key TEXT PRIMARY KEY NOT NULL,
+                    window_started TEXT NOT NULL,
+                    request_count INTEGER NOT NULL
+                );
+                "#,
+            )
+            .map_err(to_store_error)
+        }
+        3 => {
+            // Hashing is idempotent because all newly written values have a
+            // fixed URL-safe digest length, while legacy values are stl_... .
+            let mut stmt = conn
+                .prepare("SELECT token FROM oauth_tokens")
+                .map_err(to_store_error)?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(to_store_error)?;
+            let legacy_tokens = rows
+                .filter_map(|row| row.ok())
+                .filter(|value| value.starts_with("stl_"))
+                .collect::<Vec<_>>();
+            drop(stmt);
+            for raw in legacy_tokens {
+                conn.execute(
+                    "UPDATE oauth_tokens SET token = ?1 WHERE token = ?2",
+                    params![hash_token(&raw), raw],
+                )
+                .map_err(to_store_error)?;
+            }
+            Ok(())
+        }
+        _ => Err(ShuttleError::Store(format!(
+            "unknown OAuth migration {version}"
+        ))),
+    }
+}
+
+fn ensure_oauth_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    column_type: &str,
+) -> Result<()> {
+    let exists = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(to_store_error)?
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(to_store_error)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(to_store_error)?
+        .iter()
+        .any(|name| name == column);
+    if !exists {
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {column_type}"),
+            [],
+        )
+        .map_err(to_store_error)?;
+    }
+    Ok(())
+}
+
+fn enforce_rate_limit(conn: &Connection, key: &str, max_requests: i64) -> Result<()> {
+    let now = Utc::now();
+    let existing = conn
+        .query_row(
+            "SELECT window_started, request_count FROM oauth_rate_limits WHERE key = ?1",
+            params![key],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(to_store_error)?;
+    let (window_started, request_count) = match existing {
+        Some((started, count)) if parse_time(&started)? + RATE_WINDOW > now => (started, count),
+        _ => (now.to_rfc3339(), 0),
+    };
+    if request_count >= max_requests {
+        return Err(ShuttleError::Store("rate limit exceeded".to_owned()));
+    }
+    conn.execute(
+        "INSERT INTO oauth_rate_limits (key, window_started, request_count)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET window_started = excluded.window_started,
+             request_count = excluded.request_count",
+        params![key, window_started, request_count + 1],
+    )
+    .map_err(to_store_error)?;
+    Ok(())
+}
+
+fn validate_redirect_uri(value: &str) -> Result<()> {
+    if value.contains('*') {
+        return Err(ShuttleError::Store(
+            "redirect URI wildcards are not allowed".to_owned(),
+        ));
+    }
+    let parsed = Url::parse(value)
+        .map_err(|_| ShuttleError::Store("redirect URI is malformed".to_owned()))?;
+    if parsed.fragment().is_some() || !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(ShuttleError::Store(
+            "redirect URI must not contain a fragment or userinfo".to_owned(),
+        ));
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| ShuttleError::Store("redirect URI must include a host".to_owned()))?;
+    let loopback = matches!(parsed.host(), Some(url::Host::Ipv4(ip)) if ip.is_loopback())
+        || matches!(parsed.host(), Some(url::Host::Ipv6(ip)) if ip.is_loopback())
+        || host.eq_ignore_ascii_case("localhost");
+    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback) {
+        return Err(ShuttleError::Store(
+            "redirect URI must use HTTPS except for loopback URIs".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -343,6 +568,13 @@ pub struct TokenRequest {
     pub code_verifier: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RevokeRequest {
+    pub token: String,
+    #[serde(default)]
+    pub token_type_hint: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct TokenResponse {
     pub access_token: String,
@@ -353,10 +585,12 @@ pub struct TokenResponse {
 
 pub fn authorization_server_metadata(config: &OAuthConfig) -> Value {
     json!({
+        "schema_version": crate::api::SCHEMA_VERSION,
         "issuer": config.public_url,
         "authorization_endpoint": format!("{}/oauth/authorize", config.public_url),
         "token_endpoint": format!("{}/oauth/token", config.public_url),
         "registration_endpoint": format!("{}/oauth/register", config.public_url),
+        "revocation_endpoint": format!("{}/oauth/revoke", config.public_url),
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code"],
         "code_challenge_methods_supported": ["S256"],
@@ -367,6 +601,7 @@ pub fn authorization_server_metadata(config: &OAuthConfig) -> Value {
 
 pub fn protected_resource_metadata(config: &OAuthConfig) -> Value {
     json!({
+        "schema_version": crate::api::SCHEMA_VERSION,
         "resource": config.resource_url(),
         "authorization_servers": [config.public_url],
         "scopes_supported": [MCP_SCOPE],
@@ -408,13 +643,14 @@ fn query_component(value: &str) -> String {
 
 fn create_token(conn: &Connection, client_id: &str, scope: &str) -> Result<TokenResponse> {
     let access_token = token();
+    let token_hash = hash_token(&access_token);
     let now = Utc::now();
     let expires_in = 3600;
     conn.execute(
         "INSERT INTO oauth_tokens (token, client_id, scope, expires_at, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
-            access_token,
+            token_hash,
             client_id,
             scope,
             (now + Duration::seconds(expires_in)).to_rfc3339(),
@@ -443,6 +679,10 @@ fn token() -> String {
     format!("stl_{}", Uuid::new_v4().simple())
 }
 
+fn hash_token(value: &str) -> String {
+    URL_SAFE_NO_PAD.encode(Sha256::digest(value.as_bytes()))
+}
+
 fn pkce_s256(verifier: &str) -> String {
     let digest = Sha256::digest(verifier.as_bytes());
     URL_SAFE_NO_PAD.encode(digest)
@@ -461,12 +701,12 @@ fn to_store_error(err: rusqlite::Error) -> ShuttleError {
 fn purge_expired(conn: &Connection) -> Result<()> {
     let now = Utc::now().to_rfc3339();
     conn.execute(
-        "DELETE FROM oauth_codes WHERE expires_at < ?1 OR used_at IS NOT NULL",
+        "DELETE FROM oauth_codes WHERE expires_at < ?1",
         params![now],
     )
     .map_err(to_store_error)?;
     conn.execute(
-        "DELETE FROM oauth_tokens WHERE expires_at < ?1",
+        "DELETE FROM oauth_tokens WHERE expires_at < ?1 OR revoked_at IS NOT NULL",
         params![now],
     )
     .map_err(to_store_error)?;
@@ -490,6 +730,7 @@ mod tests {
         let config = OAuthConfig {
             public_url: "https://shuttle.example.test".to_owned(),
             admin_token: None,
+            allow_dynamic_registration: false,
         };
 
         assert_eq!(
@@ -601,6 +842,75 @@ mod tests {
         let err = store.exchange_code(request).unwrap_err();
 
         assert!(err.to_string().contains("code already used"));
+    }
+
+    #[test]
+    fn redirect_uri_policy_rejects_unsafe_forms_and_allows_loopback_http() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = OAuthStore::open(dir.path().join("oauth.db")).unwrap();
+        for redirect_uri in [
+            "http://client.example.test/callback",
+            "https://client.example.test/callback#fragment",
+            "https://user:password@client.example.test/callback",
+            "https://client.example.test/*",
+            "not a url",
+        ] {
+            assert!(store
+                .register_client(RegisterRequest {
+                    redirect_uris: vec![redirect_uri.to_owned()],
+                    client_name: None,
+                })
+                .is_err());
+        }
+        assert!(store
+            .register_client(RegisterRequest {
+                redirect_uris: vec!["http://127.0.0.1:3456/callback".to_owned()],
+                client_name: None,
+            })
+            .is_ok());
+    }
+
+    #[test]
+    fn tokens_are_hashed_and_revocable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oauth.db");
+        let store = OAuthStore::open(&path).unwrap();
+        let client = store
+            .register_client(RegisterRequest {
+                redirect_uris: vec!["https://client.example.test/callback".to_owned()],
+                client_name: None,
+            })
+            .unwrap();
+        let verifier = "abc123abc123abc123abc123abc123abc123abc123abc123";
+        let code = store
+            .create_code(AuthorizeRequest {
+                response_type: "code".to_owned(),
+                client_id: client.client_id.clone(),
+                redirect_uri: "https://client.example.test/callback".to_owned(),
+                state: None,
+                scope: Some("mcp".to_owned()),
+                code_challenge: Some(pkce_s256(verifier)),
+                code_challenge_method: Some("S256".to_owned()),
+            })
+            .unwrap();
+        let response = store
+            .exchange_code(TokenRequest {
+                grant_type: "authorization_code".to_owned(),
+                client_id: client.client_id,
+                redirect_uri: "https://client.example.test/callback".to_owned(),
+                code: Some(code),
+                code_verifier: Some(verifier.to_owned()),
+            })
+            .unwrap();
+        assert!(store.validate_access_token(&response.access_token).unwrap());
+        let conn = Connection::open(path).unwrap();
+        let stored: String = conn
+            .query_row("SELECT token FROM oauth_tokens", [], |row| row.get(0))
+            .unwrap();
+        assert_ne!(stored, response.access_token);
+        assert!(!stored.starts_with("stl_"));
+        assert!(store.revoke_access_token(&response.access_token).unwrap());
+        assert!(!store.validate_access_token(&response.access_token).unwrap());
     }
 
     #[test]

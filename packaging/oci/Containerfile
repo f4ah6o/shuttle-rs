@@ -3,13 +3,14 @@ FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY crates ./crates
 
 RUN cargo build --release --bin shuttle-gateway --bin stl
 
 FROM debian:bookworm-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system shuttle-gateway \
     && useradd --system \
@@ -29,6 +30,9 @@ USER shuttle-gateway:shuttle-gateway
 WORKDIR /var/lib/shuttle-gateway
 VOLUME ["/etc/shuttle-gateway", "/var/lib/shuttle-gateway"]
 EXPOSE 8787 8788
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD curl --fail --silent http://127.0.0.1:8787/healthz || exit 1
 
 ENTRYPOINT ["/usr/local/bin/shuttle-gateway"]
 CMD ["serve", "--config", "/etc/shuttle-gateway/projects.toml", "--stl", "/usr/local/bin/stl", "--timeout", "10"]

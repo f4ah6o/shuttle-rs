@@ -206,6 +206,13 @@ export function listEventsService(
   authorized: AuthorizedProject,
   options: {
     eventType?: EventType;
+    id?: string;
+    workspaceId?: string;
+    agent?: string;
+    recipient?: string;
+    tag?: string;
+    query?: string;
+    after?: { createdAt: string; id: string };
     limit?: number;
     before?: { createdAt: string; id: string };
   } = {},

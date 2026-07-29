@@ -29,6 +29,13 @@ use crate::oauth::{self, OAuthConfig, OAuthStore};
 use crate::store::SqliteEventStore;
 use crate::task;
 
+mod architecture;
+mod auth;
+mod lifecycle;
+use auth::{GatewayAuth, OAuthRuntime};
+
+pub use lifecycle::serve_listeners;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayConfig {
     #[serde(skip)]
@@ -82,6 +89,8 @@ pub struct OAuthGatewayConfig {
     pub db_path: Option<PathBuf>,
     #[serde(default = "default_oauth_admin_token_env")]
     pub admin_token_env: String,
+    #[serde(default)]
+    pub allow_dynamic_registration: bool,
 }
 
 impl Default for OAuthGatewayConfig {
@@ -90,6 +99,7 @@ impl Default for OAuthGatewayConfig {
             public_url: String::new(),
             db_path: None,
             admin_token_env: default_oauth_admin_token_env(),
+            allow_dynamic_registration: false,
         }
     }
 }
@@ -135,6 +145,8 @@ pub struct ListenerConfig {
     pub oauth_db_path: Option<PathBuf>,
     #[serde(default = "default_oauth_admin_token_env")]
     pub oauth_admin_token_env: String,
+    #[serde(default)]
+    pub allow_dynamic_registration: bool,
     #[serde(default = "default_gateway_token_env")]
     pub bearer_token_env: String,
 }
@@ -313,57 +325,20 @@ impl GatewayRuntime {
     }
 }
 
-#[derive(Clone)]
-enum GatewayAuth {
-    Bearer { token_env: String },
-    OAuth(Arc<OAuthRuntime>),
-    None,
-}
-
-#[derive(Clone)]
-struct OAuthRuntime {
-    config: OAuthConfig,
-    store: OAuthStore,
-}
-
 pub async fn serve(runtime: GatewayRuntime, addr: SocketAddr) -> Result<()> {
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|err| ShuttleError::Store(err.to_string()))?;
-    axum::serve(listener, router(runtime))
-        .await
-        .map_err(|err| ShuttleError::Store(err.to_string()))
-}
-
-pub async fn serve_listeners(listeners: Vec<GatewayListener>) -> Result<()> {
-    if listeners.is_empty() {
-        return Err(ShuttleError::Store(
-            "at least one listener is required".to_owned(),
-        ));
-    }
-    let mut tasks = Vec::new();
-    for listener in listeners {
-        let addr = listener.addr;
-        let runtime = listener.runtime;
-        let name = listener.name;
-        tasks.push(tokio::spawn(async move {
-            let tcp = tokio::net::TcpListener::bind(addr)
-                .await
-                .map_err(|err| ShuttleError::Store(format!("listener {name}: {err}")))?;
-            axum::serve(tcp, router(runtime))
-                .await
-                .map_err(|err| ShuttleError::Store(format!("listener {name}: {err}")))
-        }));
-    }
-    for task in tasks {
-        task.await
-            .map_err(|err| ShuttleError::Store(err.to_string()))??;
-    }
-    Ok(())
+    serve_listeners(vec![GatewayListener {
+        name: "default".to_owned(),
+        addr,
+        runtime,
+    }])
+    .await
 }
 
 pub fn router(runtime: GatewayRuntime) -> Router {
     Router::new()
+        .route("/healthz", get(liveness))
+        .route("/readyz", get(readiness))
+        .route("/metrics", get(metrics))
         .route("/api/projects", get(api_projects).post(api_add_project))
         .route("/api/projects/current", get(api_current_project))
         .route("/api/projects/use", post(api_use_project))
@@ -393,13 +368,70 @@ pub fn router(runtime: GatewayRuntime) -> Router {
             get(oauth_authorization_server),
         )
         .route("/oauth/register", post(oauth_register))
+        .route("/oauth/revoke", post(oauth_revoke))
         .route(
             "/oauth/authorize",
             get(oauth_authorize_page).post(oauth_authorize_submit),
         )
         .route("/oauth/token", post(oauth_token))
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .on_request(crate::telemetry::record_http_request_on_request::<_>),
+        )
         .with_state(runtime)
+}
+
+async fn liveness() -> Response {
+    Json(json!({
+        "schema_version": crate::api::SCHEMA_VERSION,
+        "status": "ok",
+        "service": "shuttle-gateway",
+        "request_flow": architecture::REQUEST_FLOW
+    }))
+    .into_response()
+}
+
+async fn metrics() -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        crate::telemetry::render_metrics("shuttle-gateway"),
+    )
+        .into_response()
+}
+
+async fn readiness(State(runtime): State<GatewayRuntime>) -> Response {
+    let projects_ready = runtime.service.list_projects().is_ok();
+    let auth_ready = match &runtime.auth {
+        GatewayAuth::Bearer { token_env } => env::var(token_env)
+            .ok()
+            .is_some_and(|token| !token.trim().is_empty()),
+        GatewayAuth::OAuth(oauth) => oauth.store.cleanup_expired().is_ok(),
+        GatewayAuth::None => true,
+    };
+    if projects_ready && auth_ready {
+        (
+            StatusCode::OK,
+            Json(json!({
+                "schema_version": crate::api::SCHEMA_VERSION,
+                "status": "ready",
+                "projects": "ok",
+                "auth": "ok"
+            })),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "schema_version": crate::api::SCHEMA_VERSION,
+                "status": "not_ready",
+                "projects": if projects_ready { "ok" } else { "degraded" },
+                "auth": if auth_ready { "ok" } else { "degraded" }
+            })),
+        )
+            .into_response()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -851,8 +883,28 @@ impl Runner for SubprocessRunner {
                 stderr
             });
         }
-        serde_json::from_slice(&output.stdout).map_err(|err| err.to_string())
+        let value: Value = serde_json::from_slice(&output.stdout).map_err(|err| err.to_string())?;
+        Ok(unwrap_cli_payload(value))
     }
+}
+
+fn unwrap_cli_payload(value: Value) -> Value {
+    if value
+        .get("schema_version")
+        .and_then(Value::as_str)
+        .is_some_and(|version| version == crate::api::SCHEMA_VERSION)
+    {
+        if let Some(items) = value.get("items") {
+            return items.clone();
+        }
+        if let Some(value) = value.get("value") {
+            return value.clone();
+        }
+        let mut object = value.as_object().cloned().unwrap_or_default();
+        object.remove("schema_version");
+        return Value::Object(object);
+    }
+    value
 }
 
 /// In-process runner that executes local projects against their Shuttle SQLite
@@ -1278,7 +1330,11 @@ async fn api_current_project(
         Ok(project) => Json(project).into_response(),
         Err(err) if err.to_string().contains("no current or default project") => (
             StatusCode::NOT_FOUND,
-            Json(json!({"error": err.to_string()})),
+            Json(crate::api::error(
+                "not_found",
+                "no current project is configured",
+                false,
+            )),
         )
             .into_response(),
         Err(err) => error_response(err),
@@ -1865,12 +1921,23 @@ fn authorize(
             if ok {
                 Ok(())
             } else if cors {
-                Err(Box::new(with_cors(StatusCode::UNAUTHORIZED)))
+                Err(Box::new(with_cors((
+                    StatusCode::UNAUTHORIZED,
+                    Json(crate::api::error(
+                        "unauthorized",
+                        "authentication required",
+                        true,
+                    )),
+                ))))
             } else {
                 Err(Box::new(
                     (
                         StatusCode::UNAUTHORIZED,
-                        Json(json!({"error": "unauthorized"})),
+                        Json(crate::api::error(
+                            "unauthorized",
+                            "authentication required",
+                            true,
+                        )),
                     )
                         .into_response(),
                 ))
@@ -1901,6 +1968,7 @@ fn is_oauth_public_route(path: &str) -> bool {
             | "/.well-known/oauth-protected-resource/mcp"
             | "/.well-known/oauth-authorization-server"
             | "/oauth/register"
+            | "/oauth/revoke"
             | "/oauth/token"
             | "/oauth/authorize"
     )
@@ -1908,22 +1976,14 @@ fn is_oauth_public_route(path: &str) -> bool {
 
 async fn oauth_protected_resource(State(runtime): State<GatewayRuntime>) -> Response {
     let GatewayAuth::OAuth(oauth) = &runtime.auth else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "oauth is not configured"})),
-        )
-            .into_response();
+        return oauth_not_configured();
     };
     Json(oauth::protected_resource_metadata(&oauth.config)).into_response()
 }
 
 async fn oauth_authorization_server(State(runtime): State<GatewayRuntime>) -> Response {
     let GatewayAuth::OAuth(oauth) = &runtime.auth else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "oauth is not configured"})),
-        )
-            .into_response();
+        return oauth_not_configured();
     };
     Json(oauth::authorization_server_metadata(&oauth.config)).into_response()
 }
@@ -1933,12 +1993,15 @@ async fn oauth_register(
     Json(request): Json<oauth::RegisterRequest>,
 ) -> Response {
     let GatewayAuth::OAuth(oauth) = &runtime.auth else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "oauth is not configured"})),
-        )
-            .into_response();
+        return oauth_not_configured();
     };
+    if !oauth.config.dynamic_registration_enabled() {
+        return oauth_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "registration_not_supported",
+            "dynamic client registration is disabled",
+        );
+    }
     match oauth.store.register_client(request) {
         Ok(client) => {
             let mut body = json!({
@@ -1952,7 +2015,11 @@ async fn oauth_register(
             }
             (StatusCode::CREATED, Json(body)).into_response()
         }
-        Err(err) => oauth_error(StatusCode::BAD_REQUEST, "invalid_request", &err.to_string()),
+        Err(_) => oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "client registration request is invalid",
+        ),
     }
 }
 
@@ -1961,11 +2028,7 @@ async fn oauth_authorize_page(
     Query(request): Query<oauth::AuthorizeRequest>,
 ) -> Response {
     let GatewayAuth::OAuth(oauth) = &runtime.auth else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "oauth is not configured"})),
-        )
-            .into_response();
+        return oauth_not_configured();
     };
     if request.response_type != "code" {
         return oauth_error(
@@ -1987,9 +2050,9 @@ async fn oauth_authorize_page(
             "unknown client_id or redirect_uri",
         ),
         Err(_) => oauth_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            "failed to validate OAuth client",
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "unknown client_id or redirect_uri",
         ),
     }
 }
@@ -1999,11 +2062,7 @@ async fn oauth_authorize_submit(
     Form(form): Form<oauth::AuthorizeForm>,
 ) -> Response {
     let GatewayAuth::OAuth(oauth) = &runtime.auth else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "oauth is not configured"})),
-        )
-            .into_response();
+        return oauth_not_configured();
     };
     if let Some(expected) = oauth.config.admin_token.as_deref() {
         if !constant_time_eq(form.admin_token.as_bytes(), expected.as_bytes()) {
@@ -2029,7 +2088,11 @@ async fn oauth_authorize_submit(
             request.state.as_deref(),
         ))
         .into_response(),
-        Err(err) => oauth_error(StatusCode::BAD_REQUEST, "invalid_request", &err.to_string()),
+        Err(_) => oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "authorization request is invalid",
+        ),
     }
 }
 
@@ -2038,11 +2101,7 @@ async fn oauth_token(
     Form(request): Form<oauth::TokenRequest>,
 ) -> Response {
     let GatewayAuth::OAuth(oauth) = &runtime.auth else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "oauth is not configured"})),
-        )
-            .into_response();
+        return oauth_not_configured();
     };
     if request.grant_type != "authorization_code" {
         return oauth_error(
@@ -2053,14 +2112,78 @@ async fn oauth_token(
     }
     match oauth.store.exchange_code(request) {
         Ok(token) => Json(token).into_response(),
-        Err(err) => oauth_error(StatusCode::BAD_REQUEST, "invalid_grant", &err.to_string()),
+        Err(_) => oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "authorization code is invalid, expired, or already used",
+        ),
+    }
+}
+
+async fn oauth_revoke(
+    State(runtime): State<GatewayRuntime>,
+    Form(request): Form<oauth::RevokeRequest>,
+) -> Response {
+    let GatewayAuth::OAuth(oauth) = &runtime.auth else {
+        return oauth_not_configured();
+    };
+    if request.token.trim().is_empty() {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "token is required",
+        );
+    }
+    match oauth.store.revoke_access_token(&request.token) {
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(_) => oauth_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "revocation failed",
+        ),
     }
 }
 
 fn error_response(err: ShuttleError) -> Response {
+    let details = err.to_string();
+    let (status, code, message, retryable) =
+        if details.contains("not found") || details.contains("not configured") {
+            (
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "requested resource was not found",
+                false,
+            )
+        } else if details.contains("required")
+            || details.contains("invalid")
+            || details.contains("must ")
+            || details.contains("cannot ")
+        {
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "request is invalid",
+                false,
+            )
+        } else {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "request could not be completed",
+                true,
+            )
+        };
+    (status, Json(crate::api::error(code, message, retryable))).into_response()
+}
+
+fn oauth_not_configured() -> Response {
     (
-        StatusCode::BAD_REQUEST,
-        Json(json!({"error": err.to_string()})),
+        StatusCode::NOT_FOUND,
+        Json(crate::api::error(
+            "not_found",
+            "OAuth is not configured",
+            false,
+        )),
     )
         .into_response()
 }
@@ -2108,7 +2231,14 @@ fn with_cors(response: impl IntoResponse) -> Response {
 }
 
 fn unauthorized_oauth(config: &OAuthConfig) -> Response {
-    let mut response = with_cors(StatusCode::UNAUTHORIZED);
+    let mut response = with_cors((
+        StatusCode::UNAUTHORIZED,
+        Json(crate::api::error(
+            "unauthorized",
+            "authentication required",
+            true,
+        )),
+    ));
     let header_value = format!(
         r#"Bearer resource_metadata="{}/.well-known/oauth-protected-resource/mcp", scope="mcp""#,
         quoted_header_value(&config.public_url)
@@ -2124,7 +2254,12 @@ fn unauthorized_oauth(config: &OAuthConfig) -> Response {
 fn oauth_error(status: StatusCode, code: &str, description: &str) -> Response {
     (
         status,
-        Json(json!({ "error": code, "error_description": description })),
+        Json(json!({
+            "schema_version": crate::api::SCHEMA_VERSION,
+            "error": code,
+            "error_description": description,
+            "retryable": status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+        })),
     )
         .into_response()
 }
@@ -2201,6 +2336,7 @@ fn legacy_listener_config(config: &GatewayConfig) -> ListenerConfig {
             public_url: String::new(),
             oauth_db_path: None,
             oauth_admin_token_env: config.oauth.admin_token_env.clone(),
+            allow_dynamic_registration: config.oauth.allow_dynamic_registration,
             bearer_token_env: config.auth.bearer_token_env.clone(),
         }
     } else {
@@ -2211,6 +2347,7 @@ fn legacy_listener_config(config: &GatewayConfig) -> ListenerConfig {
             public_url: config.oauth.public_url.clone(),
             oauth_db_path: config.oauth.db_path.clone(),
             oauth_admin_token_env: config.oauth.admin_token_env.clone(),
+            allow_dynamic_registration: config.oauth.allow_dynamic_registration,
             bearer_token_env: config.auth.bearer_token_env.clone(),
         }
     }
@@ -2245,6 +2382,7 @@ fn auth_from_listener(listener: &ListenerConfig) -> Result<GatewayAuth> {
                 config: OAuthConfig {
                     public_url: listener.public_url.clone(),
                     admin_token: Some(admin_token),
+                    allow_dynamic_registration: listener.allow_dynamic_registration,
                 },
                 store: OAuthStore::open(db_path)?,
             })))
@@ -2579,6 +2717,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_and_metrics_are_public_and_versioned() {
+        env::remove_var("TEST_EMPTY_GATEWAY_TOKEN");
+        let health = router(test_runtime(registry(), Arc::new(FakeRunner::default())))
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        let body = health.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["schema_version"], crate::api::SCHEMA_VERSION);
+        assert_eq!(value["status"], "ok");
+
+        let metrics = router(test_runtime(registry(), Arc::new(FakeRunner::default())))
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(metrics.status(), StatusCode::OK);
+        let body = metrics.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8(body.to_vec())
+            .unwrap()
+            .contains("shuttle_http_requests_total"));
+    }
+
+    #[tokio::test]
     async fn mcp_tools_list_includes_gateway_tools() {
         let runtime = test_runtime(registry(), Arc::new(FakeRunner::default()));
         env::remove_var("TEST_EMPTY_GATEWAY_TOKEN");
@@ -2844,6 +3018,7 @@ mod tests {
             config: OAuthConfig {
                 public_url: "https://shuttle.example.test".to_owned(),
                 admin_token: Some("admin-token".to_owned()),
+                allow_dynamic_registration: true,
             },
             store: OAuthStore::open(oauth_dir.path().join("oauth.db")).unwrap(),
         });

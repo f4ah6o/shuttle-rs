@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::adapter::{AdapterRecord, ProjectCacheEntry};
@@ -7,101 +8,191 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+const SQLITE_BUSY_TIMEOUT_MS: u32 = 5_000;
+const REQUIRED_INDEXES: &[&str] = &[
+    "idx_events_type_created",
+    "idx_events_workspace_created",
+    "idx_events_agent_created",
+    "idx_events_created_id",
+    "idx_event_tags_tag",
+    "idx_workflow_initial_claim",
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DatabaseStatus {
+    pub schema_version: u32,
+    pub latest_schema_version: u32,
+    pub foreign_keys: bool,
+    pub journal_mode: String,
+    pub busy_timeout_ms: u32,
+    pub event_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DatabaseCheck {
+    pub schema_version: u32,
+    pub latest_schema_version: u32,
+    pub foreign_keys: bool,
+    pub integrity: String,
+    pub orphan_event_tags: u64,
+    pub invalid_metadata: u64,
+    pub invalid_tags: u64,
+    pub missing_indexes: Vec<String>,
+}
+
+impl DatabaseCheck {
+    pub fn is_healthy(&self) -> bool {
+        self.schema_version == self.latest_schema_version
+            && self.foreign_keys
+            && self.integrity.eq_ignore_ascii_case("ok")
+            && self.orphan_event_tags == 0
+            && self.invalid_metadata == 0
+            && self.invalid_tags == 0
+            && self.missing_indexes.is_empty()
+    }
+}
 
 #[derive(Clone)]
 pub struct SqliteEventStore {
     conn: Arc<Mutex<Connection>>,
+    path: Arc<PathBuf>,
 }
 
 impl SqliteEventStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let conn = Connection::open(path).map_err(to_store_error)?;
+        let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|err| ShuttleError::Store(err.to_string()))?;
+        }
+        let mut conn = Connection::open(&path).map_err(to_store_error)?;
+        configure_connection(&mut conn)?;
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
+            path: Arc::new(path),
         };
         store.init()?;
         Ok(store)
     }
 
     pub fn init(&self) -> Result<()> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|err| ShuttleError::Store(err.to_string()))?;
+        migrate(&mut conn)?;
+        Ok(())
+    }
+
+    pub fn database_path(&self) -> &Path {
+        self.path.as_path()
+    }
+
+    pub fn schema_version(&self) -> Result<u32> {
         let conn = self
             .conn
             .lock()
             .map_err(|err| ShuttleError::Store(err.to_string()))?;
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS events (
-                id TEXT PRIMARY KEY NOT NULL,
-                event_type TEXT NOT NULL,
-                workspace_id TEXT NOT NULL,
-                repo_id TEXT,
-                repo_path TEXT,
-                git_remote TEXT,
-                bit_repo_id TEXT,
-                branch TEXT,
-                commit_hash TEXT,
-                repo_dirty INTEGER,
-                agent TEXT NOT NULL,
-                session_id TEXT NOT NULL,
-                title TEXT,
-                content TEXT NOT NULL,
-                tags TEXT NOT NULL,
-                metadata_json TEXT NOT NULL DEFAULT '{}',
-                created_at TEXT NOT NULL
-            );
+        current_schema_version(&conn)
+    }
 
-            CREATE TABLE IF NOT EXISTS event_tags (
-                event_id TEXT NOT NULL,
-                tag TEXT NOT NULL,
-                PRIMARY KEY (event_id, tag),
-                FOREIGN KEY (event_id) REFERENCES events(id)
-            );
+    pub fn status(&self) -> Result<DatabaseStatus> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|err| ShuttleError::Store(err.to_string()))?;
+        let foreign_keys = pragma_bool(&conn, "foreign_keys")?;
+        let journal_mode = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+            .map_err(to_store_error)?;
+        let busy_timeout_ms = conn
+            .query_row("PRAGMA busy_timeout", [], |row| row.get::<_, u32>(0))
+            .map_err(to_store_error)?;
+        let event_count = conn
+            .query_row("SELECT count(*) FROM events", [], |row| {
+                row.get::<_, u64>(0)
+            })
+            .map_err(to_store_error)?;
+        Ok(DatabaseStatus {
+            schema_version: current_schema_version(&conn)?,
+            latest_schema_version: CURRENT_SCHEMA_VERSION,
+            foreign_keys,
+            journal_mode,
+            busy_timeout_ms,
+            event_count,
+        })
+    }
 
-            CREATE INDEX IF NOT EXISTS idx_events_type_created ON events(event_type, created_at);
-            CREATE INDEX IF NOT EXISTS idx_events_workspace_created ON events(workspace_id, created_at);
-            CREATE INDEX IF NOT EXISTS idx_events_agent_created ON events(agent, created_at);
-            CREATE INDEX IF NOT EXISTS idx_event_tags_tag ON event_tags(tag);
-            CREATE TABLE IF NOT EXISTS adapter_registry (
-                id TEXT PRIMARY KEY NOT NULL,
-                name TEXT NOT NULL,
-                base_model TEXT NOT NULL,
-                path TEXT NOT NULL,
-                embedding_json TEXT NOT NULL,
-                metadata_json TEXT NOT NULL DEFAULT '{}'
-            );
+    pub fn check(&self) -> Result<DatabaseCheck> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|err| ShuttleError::Store(err.to_string()))?;
+        let integrity = conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+            .map_err(to_store_error)?;
+        let orphan_event_tags = conn
+            .query_row(
+                "SELECT count(*) FROM event_tags AS tags
+                 LEFT JOIN events ON events.id = tags.event_id
+                 WHERE events.id IS NULL",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .map_err(to_store_error)?;
+        let invalid_metadata = conn
+            .query_row(
+                "SELECT count(*) FROM events WHERE json_valid(metadata_json) = 0",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .map_err(to_store_error)?;
+        let invalid_tags = conn
+            .query_row(
+                "SELECT count(*) FROM events WHERE json_valid(tags) = 0",
+                [],
+                |row| row.get::<_, u64>(0),
+            )
+            .map_err(to_store_error)?;
+        let indexes = index_names(&conn)?;
+        let missing_indexes = REQUIRED_INDEXES
+            .iter()
+            .filter(|name| !indexes.contains(**name))
+            .map(|name| (*name).to_owned())
+            .collect();
+        Ok(DatabaseCheck {
+            schema_version: current_schema_version(&conn)?,
+            latest_schema_version: CURRENT_SCHEMA_VERSION,
+            foreign_keys: pragma_bool(&conn, "foreign_keys")?,
+            integrity,
+            orphan_event_tags,
+            invalid_metadata,
+            invalid_tags,
+            missing_indexes,
+        })
+    }
 
-            CREATE TABLE IF NOT EXISTS project_adapter_cache (
-                repo_hash TEXT NOT NULL,
-                branch TEXT NOT NULL,
-                commit_hash TEXT NOT NULL,
-                project_embedding_json TEXT NOT NULL,
-                selected_adapters_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY (repo_hash, branch, commit_hash)
-            );
-            "#,
-        )
-        .map_err(to_store_error)?;
-        ensure_column(&conn, "repo_path", "TEXT")?;
-        ensure_column(&conn, "git_remote", "TEXT")?;
-        ensure_column(&conn, "bit_repo_id", "TEXT")?;
-        ensure_column(&conn, "repo_dirty", "INTEGER")?;
-        ensure_column(&conn, "metadata_json", "TEXT NOT NULL DEFAULT '{}'")?;
-        conn.execute_batch(
-            r#"
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_initial_claim
-                ON events(
-                    workspace_id,
-                    json_extract(metadata_json, '$.run_id'),
-                    json_extract(metadata_json, '$.step_id')
-                )
-                WHERE event_type = 'workflow'
-                  AND json_extract(metadata_json, '$.action') = 'claimed';
-            "#,
-        )
-        .map_err(to_store_error)?;
-        backfill_event_tags(&conn)?;
+    /// Create a consistent SQLite backup without overwriting an existing file.
+    pub fn backup(&self, destination: impl AsRef<Path>) -> Result<()> {
+        let destination = destination.as_ref();
+        if destination.exists() {
+            return Err(ShuttleError::Store(format!(
+                "backup destination already exists: {}",
+                destination.display()
+            )));
+        }
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|err| ShuttleError::Store(err.to_string()))?;
+        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|err| ShuttleError::Store(err.to_string()))?;
+        conn.execute("VACUUM INTO ?1", [destination.to_string_lossy().as_ref()])
+            .map_err(to_store_error)?;
         Ok(())
     }
 
@@ -316,7 +407,9 @@ impl EventStore for SqliteEventStore {
             values.push(Value::Text(tag));
         }
         let limit_index = values.len() + 1;
-        sql.push_str(&format!(" ORDER BY created_at DESC LIMIT ?{limit_index}"));
+        sql.push_str(&format!(
+            " ORDER BY created_at DESC, id DESC LIMIT ?{limit_index}"
+        ));
         values.push(Value::Integer(i64::from(limit)));
 
         let mut stmt = conn.prepare(&sql).map_err(to_store_error)?;
@@ -443,6 +536,182 @@ fn filter_tags(filter: &EventFilter) -> Vec<String> {
     tags
 }
 
+fn configure_connection(conn: &mut Connection) -> Result<()> {
+    conn.execute_batch(&format!(
+        "PRAGMA foreign_keys = ON; PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}; PRAGMA journal_mode = WAL;"
+    ))
+    .map_err(to_store_error)
+}
+
+fn migrate(conn: &mut Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_version (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            version INTEGER NOT NULL
+        );",
+    )
+    .map_err(to_store_error)?;
+
+    let version = current_schema_version(conn)?;
+    if version > CURRENT_SCHEMA_VERSION {
+        return Err(ShuttleError::Store(format!(
+            "database schema version {version} is newer than this binary supports (latest {})",
+            CURRENT_SCHEMA_VERSION
+        )));
+    }
+    if version == 0 {
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_version (id, version) VALUES (1, 0)",
+            [],
+        )
+        .map_err(to_store_error)?;
+    }
+
+    for target in (version + 1)..=CURRENT_SCHEMA_VERSION {
+        let tx = conn.transaction().map_err(to_store_error)?;
+        apply_migration(&tx, target)?;
+        tx.execute(
+            "UPDATE schema_version SET version = ?1 WHERE id = 1",
+            [i64::from(target)],
+        )
+        .map_err(to_store_error)?;
+        tx.commit().map_err(to_store_error)?;
+    }
+    Ok(())
+}
+
+fn current_schema_version(conn: &Connection) -> Result<u32> {
+    let version = conn
+        .query_row(
+            "SELECT version FROM schema_version WHERE id = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(to_store_error)?
+        .unwrap_or(0);
+    u32::try_from(version).map_err(|_| {
+        ShuttleError::Store(format!(
+            "invalid negative database schema version {version}"
+        ))
+    })
+}
+
+fn apply_migration(conn: &Connection, version: u32) -> Result<()> {
+    match version {
+        1 => conn
+            .execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS events (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    event_type TEXT NOT NULL,
+                    workspace_id TEXT NOT NULL,
+                    repo_id TEXT,
+                    repo_path TEXT,
+                    git_remote TEXT,
+                    bit_repo_id TEXT,
+                    branch TEXT,
+                    commit_hash TEXT,
+                    repo_dirty INTEGER,
+                    agent TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    title TEXT,
+                    content TEXT NOT NULL,
+                    tags TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS event_tags (
+                    event_id TEXT NOT NULL,
+                    tag TEXT NOT NULL,
+                    PRIMARY KEY (event_id, tag),
+                    FOREIGN KEY (event_id) REFERENCES events(id)
+                );
+                "#,
+            )
+            .map_err(to_store_error),
+        2 => {
+            ensure_column(conn, "repo_id", "TEXT")?;
+            ensure_column(conn, "repo_path", "TEXT")?;
+            ensure_column(conn, "git_remote", "TEXT")?;
+            ensure_column(conn, "bit_repo_id", "TEXT")?;
+            ensure_column(conn, "branch", "TEXT")?;
+            ensure_column(conn, "commit_hash", "TEXT")?;
+            ensure_column(conn, "repo_dirty", "INTEGER")?;
+            ensure_column(conn, "metadata_json", "TEXT NOT NULL DEFAULT '{}'")?;
+            Ok(())
+        }
+        3 => conn
+            .execute_batch(
+                r#"
+                CREATE INDEX IF NOT EXISTS idx_events_type_created ON events(event_type, created_at);
+                CREATE INDEX IF NOT EXISTS idx_events_workspace_created ON events(workspace_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_events_agent_created ON events(agent, created_at);
+                CREATE INDEX IF NOT EXISTS idx_events_created_id ON events(created_at DESC, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_event_tags_tag ON event_tags(tag);
+
+                CREATE TABLE IF NOT EXISTS adapter_registry (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    name TEXT NOT NULL,
+                    base_model TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    embedding_json TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL DEFAULT '{}'
+                );
+
+                CREATE TABLE IF NOT EXISTS project_adapter_cache (
+                    repo_hash TEXT NOT NULL,
+                    branch TEXT NOT NULL,
+                    commit_hash TEXT NOT NULL,
+                    project_embedding_json TEXT NOT NULL,
+                    selected_adapters_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (repo_hash, branch, commit_hash)
+                );
+                "#,
+            )
+            .map_err(to_store_error),
+        4 => {
+            conn.execute_batch(
+                r#"
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_initial_claim
+                    ON events(
+                        workspace_id,
+                        json_extract(metadata_json, '$.run_id'),
+                        json_extract(metadata_json, '$.step_id')
+                    )
+                    WHERE event_type = 'workflow'
+                      AND json_extract(metadata_json, '$.action') = 'claimed';
+                "#,
+            )
+            .map_err(to_store_error)?;
+            backfill_event_tags(conn)
+        }
+        _ => Err(ShuttleError::Store(format!(
+            "unknown database migration {version}"
+        ))),
+    }
+}
+
+fn pragma_bool(conn: &Connection, pragma: &str) -> Result<bool> {
+    let value = conn
+        .query_row(&format!("PRAGMA {pragma}"), [], |row| row.get::<_, i64>(0))
+        .map_err(to_store_error)?;
+    Ok(value != 0)
+}
+
+fn index_names(conn: &Connection) -> Result<std::collections::HashSet<String>> {
+    let mut stmt = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
+        .map_err(to_store_error)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(to_store_error)?;
+    rows.map(|row| row.map_err(to_store_error))
+        .collect::<Result<std::collections::HashSet<_>>>()
+}
+
 fn ensure_column(conn: &Connection, column: &str, column_type: &str) -> Result<()> {
     let exists = conn
         .prepare("PRAGMA table_info(events)")
@@ -476,8 +745,11 @@ fn backfill_event_tags(conn: &Connection) -> Result<()> {
 
     for row in rows {
         let (event_id, tags_json) = row.map_err(to_store_error)?;
-        let tags: Vec<String> = serde_json::from_str(&tags_json)
-            .map_err(|err| ShuttleError::Serialization(err.to_string()))?;
+        let Ok(tags) = serde_json::from_str::<Vec<String>>(&tags_json) else {
+            // Keep malformed legacy rows intact. `db check` reports them and
+            // an operator can decide how to repair them explicitly.
+            continue;
+        };
         for tag in tags {
             conn.execute(
                 "INSERT OR IGNORE INTO event_tags (event_id, tag) VALUES (?1, ?2)",
@@ -879,5 +1151,103 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, wanted);
         assert_eq!(events[0].content, "second");
+    }
+
+    #[test]
+    fn migrations_are_versioned_and_connection_pragmas_are_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(dir.path().join("shuttle.db")).unwrap();
+        let status = store.status().unwrap();
+
+        assert_eq!(status.schema_version, CURRENT_SCHEMA_VERSION);
+        assert!(status.foreign_keys);
+        assert_eq!(status.busy_timeout_ms, SQLITE_BUSY_TIMEOUT_MS);
+        assert!(store.check().unwrap().is_healthy());
+    }
+
+    #[test]
+    fn legacy_schema_migrates_without_changing_event_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE events (
+                id TEXT PRIMARY KEY NOT NULL,
+                event_type TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                repo_id TEXT,
+                repo_path TEXT,
+                git_remote TEXT,
+                bit_repo_id TEXT,
+                branch TEXT,
+                commit_hash TEXT,
+                agent TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                title TEXT,
+                content TEXT NOT NULL,
+                tags TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            "#,
+        )
+        .unwrap();
+        let id = Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO events (id,event_type,workspace_id,agent,session_id,content,tags,created_at)
+             VALUES (?1,'memory','workspace','codex','session','legacy','[]','2024-01-01T00:00:00Z')",
+            [id.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let store = SqliteEventStore::open(&path).unwrap();
+        let events = futures_executor::block_on(store.list(EventFilter::default())).unwrap();
+        assert_eq!(events[0].id, id);
+        assert_eq!(store.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn newer_schema_is_rejected_without_mutating_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("newer.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (id INTEGER PRIMARY KEY CHECK(id = 1), version INTEGER NOT NULL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO schema_version VALUES (1, ?1)",
+            [i64::from(CURRENT_SCHEMA_VERSION + 1)],
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = match SqliteEventStore::open(&path) {
+            Ok(_) => panic!("newer schema unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("newer than this binary supports"));
+        let conn = Connection::open(path).unwrap();
+        let version: u32 = conn
+            .query_row(
+                "SELECT version FROM schema_version WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION + 1);
+    }
+
+    #[test]
+    fn backup_does_not_overwrite_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteEventStore::open(dir.path().join("shuttle.db")).unwrap();
+        let backup = dir.path().join("backup.db");
+        store.backup(&backup).unwrap();
+        assert!(database_exists(&backup).unwrap());
+        assert!(store.backup(&backup).is_err());
     }
 }

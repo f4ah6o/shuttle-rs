@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://shuttle.rs/schemas/v1/error.schema.json",
+  "title": "Shuttle v1 error envelope",
+  "type": "object",
+  "required": ["schema_version", "error"],
+  "properties": {
+    "schema_version": { "const": "shuttle.v1" },
+    "error": {
+      "type": "object",
+      "required": ["code", "message", "retryable"],
+      "properties": {
+        "code": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+        "message": { "type": "string" },
+        "retryable": { "type": "boolean" },
+        "details": { "type": "object" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

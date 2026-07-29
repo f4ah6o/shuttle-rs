@@ -9,6 +9,7 @@
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::thread;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -45,6 +46,92 @@ pub struct RemoteSettings {
     pub project: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_env: Option<String>,
+}
+
+const CHECKPOINT_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncCheckpoint {
+    pub version: u32,
+    pub project: String,
+    #[serde(default)]
+    pub push_after: Option<String>,
+    #[serde(default)]
+    pub pull_phase: PullPhase,
+    #[serde(default)]
+    pub pull_before: Option<String>,
+    #[serde(default)]
+    pub pull_after: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PullPhase {
+    #[default]
+    Backfill,
+    Incremental,
+}
+
+impl SyncCheckpoint {
+    pub fn new(project: &str) -> Self {
+        Self {
+            version: CHECKPOINT_VERSION,
+            project: project.to_owned(),
+            push_after: None,
+            pull_phase: PullPhase::Backfill,
+            pull_before: None,
+            pull_after: None,
+            updated_at: Utc::now(),
+        }
+    }
+
+    pub fn load(path: impl AsRef<Path>, project: &str) -> Result<Self> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(Self::new(project));
+        }
+        let contents =
+            fs::read_to_string(path).map_err(|err| ShuttleError::Store(err.to_string()))?;
+        let checkpoint: Self = serde_json::from_str(&contents)
+            .map_err(|err| ShuttleError::Serialization(err.to_string()))?;
+        if checkpoint.version != CHECKPOINT_VERSION || checkpoint.project != project {
+            return Err(ShuttleError::Store(
+                "sync checkpoint version or project does not match".to_owned(),
+            ));
+        }
+        Ok(checkpoint)
+    }
+
+    pub fn save(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|err| ShuttleError::Store(err.to_string()))?;
+        }
+        self.updated_at = Utc::now();
+        let contents = serde_json::to_string_pretty(self)
+            .map_err(|err| ShuttleError::Serialization(err.to_string()))?;
+        let temporary = path.with_extension("tmp");
+        fs::write(&temporary, contents).map_err(|err| ShuttleError::Store(err.to_string()))?;
+        fs::rename(&temporary, path).map_err(|err| ShuttleError::Store(err.to_string()))
+    }
+}
+
+pub fn checkpoint_path(shuttle_dir: impl AsRef<Path>, project: &str) -> std::path::PathBuf {
+    let safe_project = project
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    shuttle_dir
+        .as_ref()
+        .join("sync")
+        .join(format!("{safe_project}.json"))
 }
 
 impl RemoteSettings {
@@ -90,6 +177,7 @@ pub struct EventsPage {
     pub events: Vec<Value>,
     pub has_more: bool,
     pub next_before: Option<String>,
+    pub next_after: Option<String>,
 }
 
 /// Gateway operations the sync loops need. Faked in tests; implemented over
@@ -97,6 +185,10 @@ pub struct EventsPage {
 pub trait RemoteApi {
     fn append_event(&self, body: &Value) -> Result<AppendOutcome>;
     fn list_events(&self, limit: u32, before: Option<&str>) -> Result<EventsPage>;
+    fn list_events_after(&self, limit: u32, after: &str) -> Result<EventsPage> {
+        let _ = after;
+        self.list_events(limit, None)
+    }
 }
 
 pub struct HttpRemoteApi {
@@ -311,6 +403,27 @@ impl EventStore for CloudEventStore {
             let mut request = self
                 .auth(self.agent.get(&self.project_path("events")))
                 .query("limit", "500");
+            if let Some(event_type) = filter.event_type {
+                request = request.query("event_type", event_type.as_str());
+            }
+            if let Some(workspace_id) = filter.workspace_id.as_deref() {
+                request = request.query("workspace_id", workspace_id);
+            }
+            if let Some(agent) = filter.agent.as_deref() {
+                request = request.query("agent", agent);
+            }
+            if let Some(recipient) = filter.recipient.as_deref() {
+                request = request.query("recipient", recipient);
+            }
+            if let Some(id) = filter.id {
+                request = request.query("id", &id.to_string());
+            }
+            if let Some(tag) = filter.tag.as_deref() {
+                request = request.query("tag", tag);
+            }
+            if let Some(query) = filter.query.as_deref() {
+                request = request.query("query", query);
+            }
             if let Some(before) = before.as_deref() {
                 request = request.query("before", before);
             }
@@ -374,10 +487,11 @@ impl EventStore for CloudEventStore {
 
 impl RemoteApi for HttpRemoteApi {
     fn append_event(&self, body: &Value) -> Result<AppendOutcome> {
-        let response = self
-            .auth(self.agent.post(&self.events_url()))
-            .send_json(body.clone())
-            .map_err(Self::handle_error)?;
+        let response = retry_request(|| {
+            self.auth(self.agent.post(&self.events_url()))
+                .send_json(body.clone())
+                .map_err(Box::new)
+        })?;
         let value: Value = response
             .into_json()
             .map_err(|err| ShuttleError::Serialization(err.to_string()))?;
@@ -387,13 +501,15 @@ impl RemoteApi for HttpRemoteApi {
     }
 
     fn list_events(&self, limit: u32, before: Option<&str>) -> Result<EventsPage> {
-        let mut request = self
-            .auth(self.agent.get(&self.events_url()))
-            .query("limit", &limit.to_string());
-        if let Some(before) = before {
-            request = request.query("before", before);
-        }
-        let response = request.call().map_err(Self::handle_error)?;
+        let response = retry_request(|| {
+            let mut request = self
+                .auth(self.agent.get(&self.events_url()))
+                .query("limit", &limit.to_string());
+            if let Some(before) = before {
+                request = request.query("before", before);
+            }
+            request.call().map_err(Box::new)
+        })?;
         let value: Value = response
             .into_json()
             .map_err(|err| ShuttleError::Serialization(err.to_string()))?;
@@ -401,8 +517,65 @@ impl RemoteApi for HttpRemoteApi {
         Ok(EventsPage {
             has_more: value["has_more"].as_bool().unwrap_or(false),
             next_before: value["next_before"].as_str().map(str::to_owned),
+            next_after: value["next_after"].as_str().map(str::to_owned),
             events,
         })
+    }
+
+    fn list_events_after(&self, limit: u32, after: &str) -> Result<EventsPage> {
+        let response = retry_request(|| {
+            self.auth(self.agent.get(&self.events_url()))
+                .query("limit", &limit.to_string())
+                .query("after", after)
+                .call()
+                .map_err(Box::new)
+        })?;
+        let value: Value = response
+            .into_json()
+            .map_err(|err| ShuttleError::Serialization(err.to_string()))?;
+        let events = value["events"].as_array().cloned().unwrap_or_default();
+        Ok(EventsPage {
+            has_more: value["has_more"].as_bool().unwrap_or(false),
+            next_before: value["next_before"].as_str().map(str::to_owned),
+            next_after: value["next_after"].as_str().map(str::to_owned),
+            events,
+        })
+    }
+}
+
+fn retry_request<F>(mut request: F) -> Result<ureq::Response>
+where
+    F: FnMut() -> std::result::Result<ureq::Response, Box<ureq::Error>>,
+{
+    const MAX_ATTEMPTS: usize = 4;
+    for attempt in 0..MAX_ATTEMPTS {
+        match request() {
+            Ok(response) => return Ok(response),
+            Err(error) if attempt + 1 < MAX_ATTEMPTS && retryable(error.as_ref()) => {
+                let retry_after = match error.as_ref() {
+                    ureq::Error::Status(_, response) => response
+                        .header("retry-after")
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .map(std::time::Duration::from_secs),
+                    ureq::Error::Transport(_) => None,
+                };
+                let exponential = 100_u64.saturating_mul(2_u64.saturating_pow(attempt as u32));
+                let jitter = (Utc::now().timestamp_subsec_millis() as u64) % 100;
+                thread::sleep(
+                    retry_after
+                        .unwrap_or_else(|| std::time::Duration::from_millis(exponential + jitter)),
+                );
+            }
+            Err(error) => return Err(HttpRemoteApi::handle_error(*error)),
+        }
+    }
+    unreachable!("retry loop returns on every attempt")
+}
+
+fn retryable(error: &ureq::Error) -> bool {
+    match error {
+        ureq::Error::Status(status, _) => *status == 429 || (500..=599).contains(status),
+        ureq::Error::Transport(_) => true,
     }
 }
 
@@ -529,6 +702,14 @@ pub fn remote_to_event(remote: &Value, local_workspace_id: &str, project: &str) 
 /// Push every local event to the gateway, oldest first so server insertion
 /// order roughly follows history. Idempotent: replays report as deduplicated.
 pub async fn push(store: &SqliteEventStore, api: &dyn RemoteApi) -> Result<PushReport> {
+    push_impl(store, api, None).await
+}
+
+async fn push_impl(
+    store: &SqliteEventStore,
+    api: &dyn RemoteApi,
+    checkpoint: Option<(&std::path::Path, &str)>,
+) -> Result<PushReport> {
     let mut events = store
         .list(EventFilter {
             limit: Some(u32::MAX),
@@ -541,6 +722,16 @@ pub async fn push(store: &SqliteEventStore, api: &dyn RemoteApi) -> Result<PushR
             .then(left.id.cmp(&right.id))
     });
 
+    let mut state = if let Some((path, project)) = checkpoint {
+        Some(SyncCheckpoint::load(path, project)?)
+    } else {
+        None
+    };
+    if let Some(state) = &state {
+        if let Some(after) = state.push_after.as_deref() {
+            events.retain(|event| event_cursor(event).as_str() > after);
+        }
+    }
     let mut report = PushReport::default();
     for event in &events {
         let outcome = api.append_event(&event_to_push_body(event))?;
@@ -549,8 +740,21 @@ pub async fn push(store: &SqliteEventStore, api: &dyn RemoteApi) -> Result<PushR
         } else {
             report.pushed += 1;
         }
+        if let (Some((path, _)), Some(state)) = (checkpoint, state.as_mut()) {
+            state.push_after = Some(event_cursor(event));
+            state.save(path)?;
+        }
     }
     Ok(report)
+}
+
+pub async fn push_with_checkpoint(
+    store: &SqliteEventStore,
+    api: &dyn RemoteApi,
+    project: &str,
+    checkpoint_path: &std::path::Path,
+) -> Result<PushReport> {
+    push_impl(store, api, Some((checkpoint_path, project))).await
 }
 
 /// Pull every gateway event into the local store, following the keyset cursor
@@ -561,10 +765,118 @@ pub async fn pull(
     local_workspace_id: &str,
     project: &str,
 ) -> Result<PullReport> {
+    pull_impl(store, api, local_workspace_id, project, None).await
+}
+
+async fn pull_impl(
+    store: &SqliteEventStore,
+    api: &dyn RemoteApi,
+    local_workspace_id: &str,
+    project: &str,
+    checkpoint: Option<&std::path::Path>,
+) -> Result<PullReport> {
+    let mut state = checkpoint
+        .map(|path| SyncCheckpoint::load(path, project))
+        .transpose()?;
+    if let Some(state) = &state {
+        if state.pull_phase == PullPhase::Incremental {
+            if let Some(after) = state.pull_after.as_deref() {
+                return pull_incremental(
+                    store,
+                    api,
+                    local_workspace_id,
+                    project,
+                    after,
+                    state,
+                    checkpoint,
+                )
+                .await;
+            }
+        }
+    }
+
     let mut report = PullReport::default();
-    let mut before: Option<String> = None;
+    let mut before = state.as_ref().and_then(|state| state.pull_before.clone());
+    let mut latest = state.as_ref().and_then(|state| state.pull_after.clone());
     loop {
         let page = api.list_events(PULL_PAGE_LIMIT, before.as_deref())?;
+        if page.events.is_empty() {
+            break;
+        }
+        report.pages += 1;
+        if latest.is_none() {
+            latest = page.events.first().and_then(remote_cursor);
+        }
+        for remote in &page.events {
+            let event = remote_to_event(remote, local_workspace_id, project)?;
+            if store.append_if_absent(event)? {
+                report.imported += 1;
+            } else {
+                report.skipped_duplicates += 1;
+            }
+        }
+        if !page.has_more {
+            if let (Some(path), Some(state)) = (checkpoint, state.as_mut()) {
+                state.pull_phase = PullPhase::Incremental;
+                state.pull_before = None;
+                state.pull_after = latest;
+                state.save(path)?;
+            }
+            break;
+        }
+        match page.next_before.clone() {
+            Some(next) => {
+                before = Some(next);
+                if let (Some(path), Some(state)) = (checkpoint, state.as_mut()) {
+                    state.pull_before = before.clone();
+                    state.pull_after = latest.clone();
+                    state.save(path)?;
+                }
+            }
+            None => {
+                if let (Some(path), Some(state)) = (checkpoint, state.as_mut()) {
+                    state.pull_phase = PullPhase::Incremental;
+                    state.pull_before = None;
+                    state.pull_after = latest;
+                    state.save(path)?;
+                }
+                break;
+            }
+        }
+    }
+    Ok(report)
+}
+
+pub async fn pull_with_checkpoint(
+    store: &SqliteEventStore,
+    api: &dyn RemoteApi,
+    local_workspace_id: &str,
+    project: &str,
+    checkpoint_path: &std::path::Path,
+) -> Result<PullReport> {
+    pull_impl(
+        store,
+        api,
+        local_workspace_id,
+        project,
+        Some(checkpoint_path),
+    )
+    .await
+}
+
+async fn pull_incremental(
+    store: &SqliteEventStore,
+    api: &dyn RemoteApi,
+    local_workspace_id: &str,
+    project: &str,
+    after: &str,
+    state: &SyncCheckpoint,
+    checkpoint: Option<&std::path::Path>,
+) -> Result<PullReport> {
+    let mut report = PullReport::default();
+    let mut cursor = after.to_owned();
+    loop {
+        let page = api.list_events_after(PULL_PAGE_LIMIT, &cursor)?;
         if page.events.is_empty() {
             break;
         }
@@ -577,12 +889,21 @@ pub async fn pull(
                 report.skipped_duplicates += 1;
             }
         }
+        let Some(next) = page
+            .next_after
+            .clone()
+            .or_else(|| page.events.last().and_then(remote_cursor))
+        else {
+            break;
+        };
+        cursor = next;
+        if let Some(path) = checkpoint {
+            let mut next_state = state.clone();
+            next_state.pull_after = Some(cursor.clone());
+            next_state.save(path)?;
+        }
         if !page.has_more {
             break;
-        }
-        match page.next_before {
-            Some(next) => before = Some(next),
-            None => break,
         }
     }
     Ok(report)
@@ -598,6 +919,37 @@ pub async fn sync(
     let push = push(store, api).await?;
     let pull = pull(store, api, local_workspace_id, project).await?;
     Ok(SyncReport { push, pull })
+}
+
+pub async fn sync_with_checkpoint(
+    store: &SqliteEventStore,
+    api: &dyn RemoteApi,
+    local_workspace_id: &str,
+    project: &str,
+    checkpoint_path: &std::path::Path,
+) -> Result<SyncReport> {
+    let push = push_impl(store, api, Some((checkpoint_path, project))).await?;
+    let pull = pull_impl(
+        store,
+        api,
+        local_workspace_id,
+        project,
+        Some(checkpoint_path),
+    )
+    .await?;
+    Ok(SyncReport { push, pull })
+}
+
+fn event_cursor(event: &Event) -> String {
+    format!("{}|{}", event.created_at.to_rfc3339(), event.id)
+}
+
+fn remote_cursor(value: &Value) -> Option<String> {
+    Some(format!(
+        "{}|{}",
+        value["created_at"].as_str()?,
+        value["id"].as_str()?
+    ))
 }
 
 #[cfg(test)]
@@ -682,6 +1034,43 @@ mod tests {
             Ok(EventsPage {
                 has_more: page.len() == limit as usize,
                 next_before,
+                next_after: page.last().map(|event| {
+                    format!(
+                        "{}|{}",
+                        event["created_at"].as_str().unwrap(),
+                        event["id"].as_str().unwrap()
+                    )
+                }),
+                events: page,
+            })
+        }
+
+        fn list_events_after(&self, limit: u32, after: &str) -> Result<EventsPage> {
+            let (created_at, id) = after.split_once('|').unwrap();
+            let mut ordered = self.events.borrow().clone();
+            ordered.sort_by(|left, right| {
+                left["created_at"]
+                    .as_str()
+                    .cmp(&right["created_at"].as_str())
+                    .then(left["id"].as_str().cmp(&right["id"].as_str()))
+            });
+            ordered.retain(|event| {
+                let event_created = event["created_at"].as_str().unwrap();
+                event_created > created_at
+                    || (event_created == created_at && event["id"].as_str().unwrap() > id)
+            });
+            let page: Vec<Value> = ordered.into_iter().take(limit as usize).collect();
+            let next_after = page.last().map(|event| {
+                format!(
+                    "{}|{}",
+                    event["created_at"].as_str().unwrap(),
+                    event["id"].as_str().unwrap()
+                )
+            });
+            Ok(EventsPage {
+                has_more: page.len() == limit as usize,
+                next_before: None,
+                next_after,
                 events: page,
             })
         }
@@ -834,5 +1223,56 @@ mod tests {
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(!contents.to_lowercase().contains("stl_"));
         assert_eq!(RemoteSettings::load(&path).unwrap(), settings);
+    }
+
+    #[test]
+    fn checkpointed_pull_switches_from_backfill_to_incremental_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir);
+        let api = FakeRemoteApi::new();
+        for i in 0..3 {
+            let mut event = local_event(&format!("checkpoint event {i}"));
+            event.created_at = DateTime::parse_from_rfc3339("2024-06-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc)
+                + chrono::Duration::seconds(i);
+            api.append_event(&event_to_push_body(&event)).unwrap();
+        }
+        let checkpoint = checkpoint_path(dir.path(), "demo");
+
+        let first = block_on(pull_with_checkpoint(
+            &store,
+            &api,
+            "workspace",
+            "demo",
+            &checkpoint,
+        ))
+        .unwrap();
+        assert_eq!(first.imported, 3);
+        let saved = SyncCheckpoint::load(&checkpoint, "demo").unwrap();
+        assert_eq!(saved.pull_phase, PullPhase::Incremental);
+
+        let second = block_on(pull_with_checkpoint(
+            &store,
+            &api,
+            "workspace",
+            "demo",
+            &checkpoint,
+        ))
+        .unwrap();
+        assert_eq!(second.imported, 0);
+        assert_eq!(second.skipped_duplicates, 0);
+
+        let new_event = local_event("checkpoint event new");
+        api.append_event(&event_to_push_body(&new_event)).unwrap();
+        let third = block_on(pull_with_checkpoint(
+            &store,
+            &api,
+            "workspace",
+            "demo",
+            &checkpoint,
+        ))
+        .unwrap();
+        assert_eq!(third.imported, 1);
     }
 }

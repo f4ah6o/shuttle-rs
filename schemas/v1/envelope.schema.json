@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://shuttle.rs/schemas/v1/envelope.schema.json",
+  "title": "Shuttle v1 machine-readable envelope",
+  "type": "object",
+  "required": ["schema_version"],
+  "properties": {
+    "schema_version": { "const": "shuttle.v1" },
+    "items": { "type": "array" },
+    "pagination": {
+      "type": "object",
+      "required": ["returned", "has_more"],
+      "properties": {
+        "limit": { "type": ["integer", "null"], "minimum": 0 },
+        "returned": { "type": "integer", "minimum": 0 },
+        "has_more": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": true
+}
