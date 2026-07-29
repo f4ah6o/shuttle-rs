@@ -100,7 +100,7 @@ fn build_tracer_provider(service_name: &'static str) -> Result<SdkTracerProvider
 
     Ok(SdkTracerProvider::builder()
         .with_resource(resource)
-        .with_simple_exporter(exporter)
+        .with_batch_exporter(exporter)
         .build())
 }
 
