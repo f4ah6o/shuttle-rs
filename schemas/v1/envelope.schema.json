@@ -6,6 +6,7 @@
   "required": ["schema_version"],
   "properties": {
     "schema_version": { "const": "shuttle.v1" },
+    "value": {},
     "items": { "type": "array" },
     "pagination": {
       "type": "object",
