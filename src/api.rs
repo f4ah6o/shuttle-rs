@@ -20,6 +20,10 @@ pub fn versioned<T: Serialize>(value: &T) -> serde_json::Result<Box<RawValue>> {
 
 pub fn versioned_value(value: Value) -> serde_json::Result<Value> {
     match value {
+        Value::Object(mut object) if !object.contains_key("schema_version") => {
+            object.insert("schema_version".to_owned(), json!(SCHEMA_VERSION));
+            Ok(Value::Object(object))
+        }
         Value::Object(object) => Ok(json!({
             "schema_version": SCHEMA_VERSION,
             "value": object
@@ -96,7 +100,7 @@ mod tests {
             serde_json::from_str::<Value>(&serialized).unwrap(),
             json!({
                 "schema_version": SCHEMA_VERSION,
-                "value": {"id": "event-1"}
+                "id": "event-1"
             })
         );
     }
