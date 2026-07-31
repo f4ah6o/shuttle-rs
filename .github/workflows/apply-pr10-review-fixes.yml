@@ -1,15 +1,15 @@
 name: Apply PR 10 review fixes
 
 on:
-  issue_comment:
-    types: [created]
+  push:
+    branches: [main]
 
 permissions:
   contents: write
 
 jobs:
   apply:
-    if: github.event.issue.pull_request && github.event.issue.number == 10 && github.event.comment.body == '/apply-pr10-review-fixes'
+    if: github.event.head_commit.message == 'chore: trigger PR review fix workflow'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -29,105 +29,10 @@ jobs:
               content = file.read_text()
               if new in content:
                   return
-              if content.count(old) != 1:
-                  raise SystemExit(f"expected exactly one match in {path}, found {content.count(old)}")
+              count = content.count(old)
+              if count != 1:
+                  raise SystemExit(f"expected exactly one match in {path}, found {count}")
               file.write_text(content.replace(old, new, 1))
-
-          replace_once(
-              "src/remote.rs",
-              '''        let page = api.list_events(PULL_PAGE_LIMIT, before.as_deref())?;
-                  if page.events.is_empty() {
-                      break;
-                  }
-          ''',
-              '''        let page = api.list_events(PULL_PAGE_LIMIT, before.as_deref())?;
-                  if page.events.is_empty() {
-                      if let (Some(path), Some(state)) = (checkpoint, state.as_mut()) {
-                          state.pull_phase = PullPhase::Incremental;
-                          state.pull_before = None;
-                          state.pull_after = latest.clone();
-                          state.save(path)?;
-                      }
-                      break;
-                  }
-          ''',
-          )
-
-          remote = Path("src/remote.rs")
-          remote_content = remote.read_text()
-          remote_test = '''
-
-              #[test]
-              fn checkpointed_pull_completes_backfill_after_an_exact_full_page() {
-                  let dir = tempfile::tempdir().unwrap();
-                  let store = open_store(&dir);
-                  let api = FakeRemoteApi::new();
-                  for i in 0..3 {
-                      let mut event = local_event(&format!("exact page event {i}"));
-                      event.created_at = DateTime::parse_from_rfc3339("2024-06-01T00:00:00Z")
-                          .unwrap()
-                          .with_timezone(&Utc)
-                          + chrono::Duration::seconds(i);
-                      api.append_event(&event_to_push_body(&event)).unwrap();
-                  }
-
-                  struct ExactPages<'a>(&'a FakeRemoteApi);
-                  impl RemoteApi for ExactPages<'_> {
-                      fn append_event(&self, body: &Value) -> Result<AppendOutcome> {
-                          self.0.append_event(body)
-                      }
-
-                      fn list_events(
-                          &self,
-                          _limit: u32,
-                          before: Option<&str>,
-                      ) -> Result<EventsPage> {
-                          self.0.list_events(3, before)
-                      }
-
-                      fn list_events_after(&self, limit: u32, after: &str) -> Result<EventsPage> {
-                          self.0.list_events_after(limit, after)
-                      }
-                  }
-
-                  let checkpoint = checkpoint_path(dir.path(), "demo");
-                  let first = block_on(pull_with_checkpoint(
-                      &store,
-                      &ExactPages(&api),
-                      "workspace",
-                      "demo",
-                      &checkpoint,
-                  ))
-                  .unwrap();
-                  assert_eq!(first.imported, 3);
-                  assert_eq!(first.pages, 1);
-
-                  let saved = SyncCheckpoint::load(&checkpoint, "demo").unwrap();
-                  assert_eq!(saved.pull_phase, PullPhase::Incremental);
-                  assert!(saved.pull_before.is_none());
-
-                  let mut new_event = local_event("new incremental event");
-                  new_event.created_at = DateTime::parse_from_rfc3339("2024-06-01T00:00:04Z")
-                      .unwrap()
-                      .with_timezone(&Utc);
-                  api.append_event(&event_to_push_body(&new_event)).unwrap();
-
-                  let second = block_on(pull_with_checkpoint(
-                      &store,
-                      &ExactPages(&api),
-                      "workspace",
-                      "demo",
-                      &checkpoint,
-                  ))
-                  .unwrap();
-                  assert_eq!(second.imported, 1);
-              }
-          '''
-          if "fn checkpointed_pull_completes_backfill_after_an_exact_full_page" not in remote_content:
-              closing = remote_content.rfind("\n}")
-              if closing < 0:
-                  raise SystemExit("could not locate remote test module closing brace")
-              remote.write_text(remote_content[:closing] + remote_test + remote_content[closing:])
 
           replace_once(
               "src/bin/stl.rs",
@@ -140,6 +45,40 @@ jobs:
                       "{}",
                       serde_json::to_string(&shuttle_rs::api::versioned(event)?)?
                   );
+          ''',
+          )
+
+          replace_once(
+              "workers/shuttle-gateway/src/api.ts",
+              '''  const events = await listEventsService(db, authorized, {
+                    eventType: url.searchParams.get("type") ?? undefined,
+                    sessionId: url.searchParams.get("session_id") ?? undefined,
+                    agent: url.searchParams.get("agent") ?? undefined,
+                    targetAgent: url.searchParams.get("target_agent") ?? undefined,
+                    after,
+                    limit,
+                    before: parseBeforeCursor(url.searchParams.get("before")),
+                  });
+                  const last = events[events.length - 1];
+                  return json({
+                    events,
+                    has_more: events.length === limit,
+          ''',
+              '''  const page = await listEventsService(db, authorized, {
+                    eventType: url.searchParams.get("type") ?? undefined,
+                    sessionId: url.searchParams.get("session_id") ?? undefined,
+                    agent: url.searchParams.get("agent") ?? undefined,
+                    targetAgent: url.searchParams.get("target_agent") ?? undefined,
+                    after,
+                    limit: limit + 1,
+                    before: parseBeforeCursor(url.searchParams.get("before")),
+                  });
+                  const hasMore = page.length > limit;
+                  const events = page.slice(0, limit);
+                  const last = events[events.length - 1];
+                  return json({
+                    events,
+                    has_more: hasMore,
           ''',
           )
 
