@@ -1,6 +1,7 @@
 //! Runtime tracing and OpenTelemetry setup.
 
 use std::env;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig;
@@ -8,6 +9,24 @@ use opentelemetry_sdk::{trace::SdkTracerProvider, Resource};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter};
+
+static HTTP_REQUESTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+pub fn record_http_request() {
+    HTTP_REQUESTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_http_request_on_request<B>(_request: &axum::http::Request<B>, _span: &tracing::Span) {
+    record_http_request();
+}
+
+pub fn render_metrics(service_name: &str) -> String {
+    format!(
+        "# HELP shuttle_http_requests_total Total HTTP requests received.\n# TYPE shuttle_http_requests_total counter\nshuttle_http_requests_total{{service=\"{}\"}} {}\n",
+        service_name,
+        HTTP_REQUESTS_TOTAL.load(Ordering::Relaxed)
+    )
+}
 
 /// Keeps the OpenTelemetry tracer provider alive until process shutdown.
 ///
@@ -81,7 +100,7 @@ fn build_tracer_provider(service_name: &'static str) -> Result<SdkTracerProvider
 
     Ok(SdkTracerProvider::builder()
         .with_resource(resource)
-        .with_simple_exporter(exporter)
+        .with_batch_exporter(exporter)
         .build())
 }
 

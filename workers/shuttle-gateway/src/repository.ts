@@ -458,6 +458,12 @@ export interface ListEventsOptions {
   eventType?: EventType;
   eventTypes?: EventType[];
   workspaceId?: string;
+  id?: string;
+  agent?: string;
+  recipient?: string;
+  tag?: string;
+  query?: string;
+  after?: { createdAt: string; id: string };
   limit?: number;
   /** Keyset cursor: return only events strictly older than this position. */
   before?: { createdAt: string; id: string };
@@ -479,13 +485,43 @@ export async function listEvents(
     clauses.push("workspace_id = ?");
     params.push(options.workspaceId);
   }
+  if (options.id) {
+    clauses.push("id = ?");
+    params.push(options.id);
+  }
+  if (options.agent) {
+    clauses.push("agent = ?");
+    params.push(options.agent);
+  }
+  if (options.recipient) {
+    clauses.push("json_extract(metadata_json, '$.to') = ?");
+    params.push(options.recipient);
+  }
+  if (options.tag) {
+    clauses.push(
+      "EXISTS (SELECT 1 FROM event_tags WHERE event_tags.project_id = events.project_id AND event_tags.event_id = events.id AND event_tags.tag = ?)",
+    );
+    params.push(options.tag);
+  }
+  if (options.query) {
+    clauses.push(
+      "(lower(coalesce(title, '')) LIKE ? OR lower(content) LIKE ? OR lower(metadata_json) LIKE ?)",
+    );
+    const query = "%" + options.query.toLowerCase() + "%";
+    params.push(query, query, query);
+  }
+  if (options.after) {
+    clauses.push("(created_at > ? OR (created_at = ? AND id > ?))");
+    params.push(options.after.createdAt, options.after.createdAt, options.after.id);
+  }
   if (options.before) {
     clauses.push("(created_at < ? OR (created_at = ? AND id < ?))");
     params.push(options.before.createdAt, options.before.createdAt, options.before.id);
   }
   const limit = Math.max(1, Math.min(options.limit ?? 50, 500));
+  const order = options.after ? "created_at ASC, id ASC" : "created_at DESC, id DESC";
   const rows = await db.query(
-    `SELECT * FROM events WHERE ${clauses.join(" AND ")} ORDER BY created_at DESC, id DESC LIMIT ?`,
+    `SELECT * FROM events WHERE ${clauses.join(" AND ")} ORDER BY ${order} LIMIT ?`,
     [...params, limit],
   );
   const events: Event[] = [];

@@ -7,6 +7,9 @@ addr = "127.0.0.1:8787"
 auth = "oauth"
 public_url = "https://shuttle.example.com"
 oauth_admin_token_env = "SHUTTLE_OAUTH_ADMIN_TOKEN"
+# Dynamic registration is disabled by default. Opt in only for a trusted
+# deployment that needs it:
+# allow_dynamic_registration = true
 # oauth_db_path = "/var/lib/shuttle/public-oauth.db"
 
 [[listeners]]

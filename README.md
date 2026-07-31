@@ -249,6 +249,15 @@ See [`examples/projects.example.toml`](./examples/projects.example.toml) for a c
 project = "main"
 
 [[listeners]]
+name = "public"
+addr = "127.0.0.1:8787"
+auth = "oauth"
+public_url = "https://shuttle.example.com"
+oauth_admin_token_env = "SHUTTLE_OAUTH_ADMIN_TOKEN"
+# Dynamic registration is disabled by default. Opt in only when required:
+# allow_dynamic_registration = true
+
+[[listeners]]
 name = "private"
 addr = "127.0.0.1:8788"
 auth = "bearer"
@@ -290,6 +299,15 @@ curl -X POST http://127.0.0.1:8788/api/projects \
 ```
 
 Gateway OCI images and LXC archives are published through GitHub Releases.
+
+OAuth client registrations, authorization codes, and access tokens are stored in
+gateway-local SQLite databases. Dynamic registration is disabled by default;
+redirect URIs must be exact HTTPS matches (loopback HTTP is the only exception).
+Access-token digests are stored instead of bearer values, and
+POST /oauth/revoke supports token revocation. Backend tokens and OAuth admin
+tokens should be provided by a secret manager or runtime-injected environment
+variables.
+
 Pull the OCI image from GHCR.
 
 ```bash
@@ -426,6 +444,15 @@ cargo test --workspace --all-targets
 ```
 
 Use `just release-check` for the release validation sequence.
+
+## Machine-readable contracts
+
+JSON CLI output and structured MCP results identify schema `shuttle.v1`.
+Collection output uses an object with `schema_version`, `items`, and
+`pagination`; errors use stable `code`, `message`, and `retryable` fields. The
+checked-in schemas and fixtures live under `schemas/v1`. Successful fields
+evolve additively; a breaking change requires a new schema version. Diagnostics
+and logs stay on stderr so they cannot corrupt JSON stdout.
 
 ## Acknowledgements
 

@@ -1,4 +1,5 @@
 pub mod adapter;
+pub mod api;
 pub mod app;
 pub mod collab;
 pub mod context;

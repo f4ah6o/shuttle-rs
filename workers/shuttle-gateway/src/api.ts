@@ -53,6 +53,15 @@ function parseBeforeCursor(raw: string | null): { createdAt: string; id: string 
   return { createdAt: raw.slice(0, separator), id: raw.slice(separator + 1) };
 }
 
+function parseAfterCursor(raw: string | null): { createdAt: string; id: string } | undefined {
+  if (!raw) return undefined;
+  const separator = raw.indexOf("|");
+  if (separator <= 0 || separator === raw.length - 1) {
+    throw badRequest("invalid after cursor; expected <created_at>|<id>");
+  }
+  return { createdAt: raw.slice(0, separator), id: raw.slice(separator + 1) };
+}
+
 function requestContext(body: Record<string, unknown>, principal: Principal): ContextEnvelope | null {
   const raw = body.context;
   const context = raw && typeof raw === "object" ? { ...(raw as ContextEnvelope) } : {};
@@ -241,18 +250,35 @@ export async function handleApi(
         const authorized = await authorize(db, principal, selector, "read");
         const url = new URL(request.url);
         const typeParam = url.searchParams.get("event_type");
+        const agent = url.searchParams.get("agent") || undefined;
+        const recipient = url.searchParams.get("recipient") || undefined;
+        const tag = url.searchParams.get("tag") || undefined;
+        const query = url.searchParams.get("query") || undefined;
+        const id = url.searchParams.get("id") || undefined;
+        const workspaceId = url.searchParams.get("workspace_id") || undefined;
+        const after = parseAfterCursor(url.searchParams.get("after"));
         const rawLimit = Number(url.searchParams.get("limit") ?? "50");
         const limit = Math.max(1, Math.min(Number.isFinite(rawLimit) ? rawLimit : 50, 500));
-        const events = await listEventsService(db, authorized, {
+        const page = await listEventsService(db, authorized, {
           eventType: (typeParam as EventType) ?? undefined,
-          limit,
+          agent,
+          recipient,
+          tag,
+          query,
+          id,
+          workspaceId,
+          after,
+          limit: limit + 1,
           before: parseBeforeCursor(url.searchParams.get("before")),
         });
+        const hasMore = page.length > limit;
+        const events = page.slice(0, limit);
         const last = events[events.length - 1];
         return json({
           events,
-          has_more: events.length === limit,
+          has_more: hasMore,
           next_before: last ? `${last.created_at}|${last.id}` : null,
+          next_after: last ? `${last.created_at}|${last.id}` : null,
         });
       }
     }

@@ -249,6 +249,15 @@ stl app tunnel --public-url https://shuttle.example.com
 project = "main"
 
 [[listeners]]
+name = "public"
+addr = "127.0.0.1:8787"
+auth = "oauth"
+public_url = "https://shuttle.example.com"
+oauth_admin_token_env = "SHUTTLE_OAUTH_ADMIN_TOKEN"
+# dynamic registration は default で無効。必要な場合だけ opt-in する:
+# allow_dynamic_registration = true
+
+[[listeners]]
 name = "private"
 addr = "127.0.0.1:8788"
 auth = "bearer"
@@ -290,6 +299,14 @@ curl -X POST http://127.0.0.1:8788/api/projects \
 ```
 
 Gateway の OCI image と LXC archive は GitHub Releases から配布されます。
+
+OAuth client registration、authorization code、access token は gateway-local SQLite database
+に保存されます。dynamic registration は default で無効で、redirect URI は exact な HTTPS
+match（loopback の HTTP だけ例外）でなければなりません。bearer value の代わりに
+access-token digest を保存し、POST /oauth/revoke で token を revoke できます。backend
+token と OAuth admin token は secret manager または runtime-injected environment variable
+で渡してください。
+
 OCI image は GHCR から取得できます。
 
 ```bash
@@ -426,6 +443,14 @@ cargo test --workspace --all-targets
 ```
 
 release 前の確認には `just release-check` を使えます。
+
+## Machine-readable contract
+
+JSON CLI output と structured MCP result は schema `shuttle.v1` を識別します。
+collection は `schema_version`、`items`、`pagination` を持つ object で返し、error は安定した
+`code`、`message`、`retryable` を持ちます。schema と fixture は `schemas/v1` にあります。
+成功レスポンスの field は additive に進化させ、breaking change では schema version を更新します。
+diagnostic と log は stderr に出力し、JSON stdout を汚染しません。
 
 ## Acknowledgements
 
