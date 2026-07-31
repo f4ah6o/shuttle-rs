@@ -1,0 +1,205 @@
+name: Apply PR 10 review fixes
+
+on:
+  push:
+    branches:
+      - agent/issues-2-3-4-5-6-8-9-public
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: rustfmt
+      - name: Apply review fixes
+        shell: python
+        run: |
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              file = Path(path)
+              content = file.read_text()
+              if content.count(old) != 1:
+                  raise SystemExit(f"expected exactly one match in {path}, found {content.count(old)}")
+              file.write_text(content.replace(old, new, 1))
+
+          replace_once(
+              "src/api.rs",
+              '''        Value::Object(mut object) => {
+                      object.insert("schema_version".to_owned(), json!(SCHEMA_VERSION));
+                      Ok(Value::Object(object))
+                  }
+          ''',
+              '''        Value::Object(object) => Ok(json!({
+                      "schema_version": SCHEMA_VERSION,
+                      "value": object
+                  })),
+          ''',
+          )
+
+          api = Path("src/api.rs")
+          api_content = api.read_text()
+          api_test = '''
+          #[cfg(test)]
+          mod tests {
+              use super::*;
+
+              #[test]
+              fn versioned_object_preserves_domain_schema_version() {
+                  let domain = json!({
+                      "schema_version": 7,
+                      "healthy": true
+                  });
+                  let envelope = versioned_value(domain.clone()).unwrap();
+
+                  assert_eq!(envelope["schema_version"], SCHEMA_VERSION);
+                  assert_eq!(envelope["value"], domain);
+              }
+          }
+          '''
+          if "fn versioned_object_preserves_domain_schema_version" not in api_content:
+              api.write_text(api_content + api_test)
+
+          replace_once(
+              "schemas/v1/envelope.schema.json",
+              '''    "schema_version": { "const": "shuttle.v1" },
+                  "items": { "type": "array" },
+          ''',
+              '''    "schema_version": { "const": "shuttle.v1" },
+                  "value": {},
+                  "items": { "type": "array" },
+          ''',
+          )
+
+          replace_once(
+              "src/remote.rs",
+              '''        let page = api.list_events(PULL_PAGE_LIMIT, before.as_deref())?;
+                  if page.events.is_empty() {
+                      break;
+                  }
+          ''',
+              '''        let page = api.list_events(PULL_PAGE_LIMIT, before.as_deref())?;
+                  if page.events.is_empty() {
+                      if let (Some(path), Some(state)) = (checkpoint, state.as_mut()) {
+                          state.pull_phase = PullPhase::Incremental;
+                          state.pull_before = None;
+                          state.pull_after = latest.clone();
+                          state.save(path)?;
+                      }
+                      break;
+                  }
+          ''',
+          )
+
+          remote = Path("src/remote.rs")
+          remote_content = remote.read_text()
+          remote_test = '''
+
+              #[test]
+              fn checkpointed_pull_completes_backfill_after_an_exact_full_page() {
+                  let dir = tempfile::tempdir().unwrap();
+                  let store = open_store(&dir);
+                  let api = FakeRemoteApi::new();
+                  for i in 0..3 {
+                      let mut event = local_event(&format!("exact page event {i}"));
+                      event.created_at = DateTime::parse_from_rfc3339("2024-06-01T00:00:00Z")
+                          .unwrap()
+                          .with_timezone(&Utc)
+                          + chrono::Duration::seconds(i);
+                      api.append_event(&event_to_push_body(&event)).unwrap();
+                  }
+
+                  struct ExactPages<'a>(&'a FakeRemoteApi);
+                  impl RemoteApi for ExactPages<'_> {
+                      fn append_event(&self, body: &Value) -> Result<AppendOutcome> {
+                          self.0.append_event(body)
+                      }
+
+                      fn list_events(
+                          &self,
+                          _limit: u32,
+                          before: Option<&str>,
+                      ) -> Result<EventsPage> {
+                          self.0.list_events(3, before)
+                      }
+
+                      fn list_events_after(&self, limit: u32, after: &str) -> Result<EventsPage> {
+                          self.0.list_events_after(limit, after)
+                      }
+                  }
+
+                  let checkpoint = checkpoint_path(dir.path(), "demo");
+                  let first = block_on(pull_with_checkpoint(
+                      &store,
+                      &ExactPages(&api),
+                      "workspace",
+                      "demo",
+                      &checkpoint,
+                  ))
+                  .unwrap();
+                  assert_eq!(first.imported, 3);
+                  assert_eq!(first.pages, 1);
+
+                  let saved = SyncCheckpoint::load(&checkpoint, "demo").unwrap();
+                  assert_eq!(saved.pull_phase, PullPhase::Incremental);
+                  assert!(saved.pull_before.is_none());
+
+                  let mut new_event = local_event("new incremental event");
+                  new_event.created_at = DateTime::parse_from_rfc3339("2024-06-01T00:00:04Z")
+                      .unwrap()
+                      .with_timezone(&Utc);
+                  api.append_event(&event_to_push_body(&new_event)).unwrap();
+
+                  let second = block_on(pull_with_checkpoint(
+                      &store,
+                      &ExactPages(&api),
+                      "workspace",
+                      "demo",
+                      &checkpoint,
+                  ))
+                  .unwrap();
+                  assert_eq!(second.imported, 1);
+              }
+          '''
+          if "fn checkpointed_pull_completes_backfill_after_an_exact_full_page" not in remote_content:
+              closing = remote_content.rfind("\n}")
+              if closing < 0:
+                  raise SystemExit("could not locate remote test module closing brace")
+              remote.write_text(remote_content[:closing] + remote_test + remote_content[closing:])
+
+          replace_once(
+              "src/bin/stl.rs",
+              '''        println!(
+                      "{}",
+                      serde_json::to_string_pretty(&shuttle_rs::api::versioned(event)?)?
+                  );
+          ''',
+              '''        println!(
+                      "{}",
+                      serde_json::to_string(&shuttle_rs::api::versioned(event)?)?
+                  );
+          ''',
+          )
+
+          Path(".github/workflows/apply-pr10-review-fixes.yml").unlink()
+      - name: Format and test
+        run: |
+          cargo fmt --all
+          cargo fmt --all --check
+          cargo test --workspace --all-targets
+          git diff --check
+      - name: Commit fixes
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m "fix: address PR review feedback"
+          git push origin HEAD:${{ github.ref_name }}
