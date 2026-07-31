@@ -5,12 +5,17 @@
 //! silently become protocol changes.
 
 use serde::Serialize;
-use serde_json::{json, Map, Value};
+use serde_json::{json, value::RawValue, Map, Value};
 
 pub const SCHEMA_VERSION: &str = "shuttle.v1";
 
-pub fn versioned<T: Serialize>(value: &T) -> serde_json::Result<Value> {
-    versioned_value(serde_json::to_value(value)?)
+/// Serialize a versioned machine-facing envelope as compact raw JSON.
+///
+/// Returning `RawValue` preserves single-line JSON even when a caller uses a
+/// pretty serializer. This is required by streaming commands that emit NDJSON.
+pub fn versioned<T: Serialize>(value: &T) -> serde_json::Result<Box<RawValue>> {
+    let envelope = versioned_value(serde_json::to_value(value)?)?;
+    RawValue::from_string(serde_json::to_string(&envelope)?)
 }
 
 pub fn versioned_value(value: Value) -> serde_json::Result<Value> {
@@ -79,5 +84,20 @@ mod tests {
 
         assert_eq!(envelope["schema_version"], SCHEMA_VERSION);
         assert_eq!(envelope["value"], domain);
+    }
+
+    #[test]
+    fn versioned_json_remains_single_line_with_pretty_serializer() {
+        let envelope = versioned(&json!({"id": "event-1"})).unwrap();
+        let serialized = serde_json::to_string_pretty(&envelope).unwrap();
+
+        assert!(!serialized.contains('\n'));
+        assert_eq!(
+            serde_json::from_str::<Value>(&serialized).unwrap(),
+            json!({
+                "schema_version": SCHEMA_VERSION,
+                "value": {"id": "event-1"}
+            })
+        );
     }
 }
