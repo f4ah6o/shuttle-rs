@@ -15,10 +15,10 @@ pub fn versioned<T: Serialize>(value: &T) -> serde_json::Result<Value> {
 
 pub fn versioned_value(value: Value) -> serde_json::Result<Value> {
     match value {
-        Value::Object(mut object) => {
-            object.insert("schema_version".to_owned(), json!(SCHEMA_VERSION));
-            Ok(Value::Object(object))
-        }
+        Value::Object(object) => Ok(json!({
+            "schema_version": SCHEMA_VERSION,
+            "value": object
+        })),
         Value::Array(items) => Ok(json!({
             "schema_version": SCHEMA_VERSION,
             "items": items,
@@ -63,4 +63,21 @@ pub fn error(code: &str, message: &str, retryable: bool) -> Value {
         }),
     );
     Value::Object(details)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn versioned_object_preserves_domain_schema_version() {
+        let domain = json!({
+            "schema_version": 7,
+            "healthy": true
+        });
+        let envelope = versioned_value(domain.clone()).unwrap();
+
+        assert_eq!(envelope["schema_version"], SCHEMA_VERSION);
+        assert_eq!(envelope["value"], domain);
+    }
 }
