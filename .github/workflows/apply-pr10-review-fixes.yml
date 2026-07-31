@@ -1,20 +1,19 @@
 name: Apply PR 10 review fixes
 
 on:
-  push:
-    branches:
-      - agent/issues-2-3-4-5-6-8-9-public
+  pull_request:
+    types: [reopened]
 
 permissions:
   contents: write
 
 jobs:
   apply:
-    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
+          ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
@@ -27,57 +26,11 @@ jobs:
           def replace_once(path: str, old: str, new: str) -> None:
               file = Path(path)
               content = file.read_text()
+              if new in content:
+                  return
               if content.count(old) != 1:
                   raise SystemExit(f"expected exactly one match in {path}, found {content.count(old)}")
               file.write_text(content.replace(old, new, 1))
-
-          replace_once(
-              "src/api.rs",
-              '''        Value::Object(mut object) => {
-                      object.insert("schema_version".to_owned(), json!(SCHEMA_VERSION));
-                      Ok(Value::Object(object))
-                  }
-          ''',
-              '''        Value::Object(object) => Ok(json!({
-                      "schema_version": SCHEMA_VERSION,
-                      "value": object
-                  })),
-          ''',
-          )
-
-          api = Path("src/api.rs")
-          api_content = api.read_text()
-          api_test = '''
-          #[cfg(test)]
-          mod tests {
-              use super::*;
-
-              #[test]
-              fn versioned_object_preserves_domain_schema_version() {
-                  let domain = json!({
-                      "schema_version": 7,
-                      "healthy": true
-                  });
-                  let envelope = versioned_value(domain.clone()).unwrap();
-
-                  assert_eq!(envelope["schema_version"], SCHEMA_VERSION);
-                  assert_eq!(envelope["value"], domain);
-              }
-          }
-          '''
-          if "fn versioned_object_preserves_domain_schema_version" not in api_content:
-              api.write_text(api_content + api_test)
-
-          replace_once(
-              "schemas/v1/envelope.schema.json",
-              '''    "schema_version": { "const": "shuttle.v1" },
-                  "items": { "type": "array" },
-          ''',
-              '''    "schema_version": { "const": "shuttle.v1" },
-                  "value": {},
-                  "items": { "type": "array" },
-          ''',
-          )
 
           replace_once(
               "src/remote.rs",
@@ -202,4 +155,4 @@ jobs:
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add -A
           git commit -m "fix: address PR review feedback"
-          git push origin HEAD:${{ github.ref_name }}
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
