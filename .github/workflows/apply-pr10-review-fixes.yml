@@ -1,98 +1,53 @@
 name: Apply PR 10 review fixes
 
 on:
-  push:
-    branches: [main]
+  pull_request_target:
+    types: [reopened]
 
 permissions:
   contents: write
 
 jobs:
   apply:
-    if: github.event.head_commit.message == 'chore: trigger PR review fix workflow'
+    if: github.event.pull_request.number == 10 && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
-          ref: agent/issues-2-3-4-5-6-8-9-public
+          ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: rustfmt
-      - name: Apply review fixes
+      - name: Restore NDJSON streaming output
         shell: python
         run: |
           from pathlib import Path
 
-          def replace_once(path: str, old: str, new: str) -> None:
-              file = Path(path)
-              content = file.read_text()
-              if new in content:
-                  return
-              count = content.count(old)
-              if count != 1:
-                  raise SystemExit(f"expected exactly one match in {path}, found {count}")
-              file.write_text(content.replace(old, new, 1))
-
-          replace_once(
-              "src/bin/stl.rs",
-              '''        println!(
-                      "{}",
-                      serde_json::to_string_pretty(&shuttle_rs::api::versioned(event)?)?
-                  );
-          ''',
-              '''        println!(
-                      "{}",
-                      serde_json::to_string(&shuttle_rs::api::versioned(event)?)?
-                  );
-          ''',
-          )
-
-          replace_once(
-              "workers/shuttle-gateway/src/api.ts",
-              '''  const events = await listEventsService(db, authorized, {
-                    eventType: url.searchParams.get("type") ?? undefined,
-                    sessionId: url.searchParams.get("session_id") ?? undefined,
-                    agent: url.searchParams.get("agent") ?? undefined,
-                    targetAgent: url.searchParams.get("target_agent") ?? undefined,
-                    after,
-                    limit,
-                    before: parseBeforeCursor(url.searchParams.get("before")),
-                  });
-                  const last = events[events.length - 1];
-                  return json({
-                    events,
-                    has_more: events.length === limit,
-          ''',
-              '''  const page = await listEventsService(db, authorized, {
-                    eventType: url.searchParams.get("type") ?? undefined,
-                    sessionId: url.searchParams.get("session_id") ?? undefined,
-                    agent: url.searchParams.get("agent") ?? undefined,
-                    targetAgent: url.searchParams.get("target_agent") ?? undefined,
-                    after,
-                    limit: limit + 1,
-                    before: parseBeforeCursor(url.searchParams.get("before")),
-                  });
-                  const hasMore = page.length > limit;
-                  const events = page.slice(0, limit);
-                  const last = events[events.length - 1];
-                  return json({
-                    events,
-                    has_more: hasMore,
-          ''',
-          )
-
+          path = Path("src/bin/stl.rs")
+          content = path.read_text()
+          old = "serde_json::to_string_pretty(&shuttle_rs::api::versioned(event)?)?"
+          new = "serde_json::to_string(&shuttle_rs::api::versioned(event)?)?"
+          if content.count(old) != 1:
+              raise SystemExit(f"expected one streaming serializer match, found {content.count(old)}")
+          path.write_text(content.replace(old, new, 1))
           Path(".github/workflows/apply-pr10-review-fixes.yml").unlink(missing_ok=True)
-      - name: Format and test
+      - name: Validate Rust changes
         run: |
           cargo fmt --all
           cargo fmt --all --check
           cargo test --workspace --all-targets
           git diff --check
+      - name: Validate Worker changes
+        working-directory: workers/shuttle-gateway
+        run: |
+          npm ci
+          npm run typecheck
+          npm test
       - name: Commit fixes
         run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add -A
-          git commit -m "fix: address PR review feedback"
-          git push origin HEAD:agent/issues-2-3-4-5-6-8-9-public
+          git commit -m "fix: preserve NDJSON watch output"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
