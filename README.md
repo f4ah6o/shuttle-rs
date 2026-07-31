@@ -463,4 +463,3 @@ Its task-coordination design also draws from [rally-rs](https://github.com/f4ah6
 ## License
 
 Shuttle is available under the MIT License or the Apache License 2.0.
-
