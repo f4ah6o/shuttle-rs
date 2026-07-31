@@ -259,7 +259,7 @@ export async function handleApi(
         const after = parseAfterCursor(url.searchParams.get("after"));
         const rawLimit = Number(url.searchParams.get("limit") ?? "50");
         const limit = Math.max(1, Math.min(Number.isFinite(rawLimit) ? rawLimit : 50, 500));
-        const events = await listEventsService(db, authorized, {
+        const page = await listEventsService(db, authorized, {
           eventType: (typeParam as EventType) ?? undefined,
           agent,
           recipient,
@@ -268,13 +268,15 @@ export async function handleApi(
           id,
           workspaceId,
           after,
-          limit,
+          limit: limit + 1,
           before: parseBeforeCursor(url.searchParams.get("before")),
         });
+        const hasMore = page.length > limit;
+        const events = page.slice(0, limit);
         const last = events[events.length - 1];
         return json({
           events,
-          has_more: events.length === limit,
+          has_more: hasMore,
           next_before: last ? `${last.created_at}|${last.id}` : null,
           next_after: last ? `${last.created_at}|${last.id}` : null,
         });
