@@ -35,26 +35,42 @@ stl bug "known issue or failing behavior"
 stl task update <task-id> "Progress update"
 ```
 
-Check messages at session start and stop. For monitor-style workflows, keep a
-terminal running:
+Check messages at session start and stop. A human-visible terminal or Claude's
+background Monitor can keep the non-terminating watcher running:
 
 ```bash
 stl inbox --watch
 ```
 
-When wrapping a watch command with Claude Code's `Monitor` tool, load its
-schema first with `ToolSearch` (`select:Monitor`). The required parameters are
-`description`, `timeout_ms`, and `persistent`; there is no `wait` parameter.
-Example:
+Do not run `stl inbox --watch` directly inside a recurring prompt because it
+does not return control. If Claude chooses Monitor, let the background monitor
+own the watcher and do not schedule a second inbox poll.
 
-```json
-{
-  "description": "stl inbox watch",
-  "command": "stl inbox --watch",
-  "persistent": true,
-  "timeout_ms": 300000
-}
+## Recurring Collaboration
+
+For explicitly requested unattended local collaboration, use Claude Code's
+[`/loop`](https://code.claude.com/docs/en/scheduled-tasks) without a fixed
+interval by default. Self-paced mode can lengthen quiet waits, use Monitor
+instead of polling, and stop itself when work is complete. For example:
+
+```text
+/loop Use the shuttle skill to continue active collaboration work. Wait longer when the inbox is quiet, and stop the loop after completion, a blocker, an explicit stop, or three consecutive idle checks.
 ```
+
+When no Monitor is active, start each loop run with the plain
+`stl inbox --agent claude` output. If it has no actionable change and there is
+no known active assignment, end the run without loading repository context,
+running tests, spawning agents, or sending a no-op message. Request JSON only
+when an actionable event ID is needed.
+
+When work is available, load `stl context` and `stl task list`, tell the peer
+which task and paths Claude intends to touch, complete and verify one bounded
+unit, then send a concise result. Use `SHUTTLE_AGENT=claude` for CLI writes when
+another client shares the checkout. Use a fixed interval only when the task
+explicitly requires it because fixed loops cannot stop themselves before
+expiry. In self-paced mode, call `ScheduleWakeup` with `stop: true` after a
+terminal condition or three consecutive idle checks unless the task specifies
+another budget.
 
 Request or accept handoffs:
 

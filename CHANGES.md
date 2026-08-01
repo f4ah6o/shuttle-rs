@@ -6,6 +6,8 @@
 
 ### Changed
 
+- `stl skill install codex` and `stl skill install claude` now add client-specific, token-bounded recurring collaboration guidance for Codex scheduled tasks and Claude Code `/loop`.
+
 ### Fixed
 
 ### Deprecated

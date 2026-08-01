@@ -67,6 +67,33 @@ These tools write normal Shuttle task, message, and handoff events. Existing
 commands such as `stl task list`, `stl inbox`, `stl history`, and
 `stl handoff list` continue to work.
 
+## Run Recurring Collaboration
+
+Use client-native recurrence instead of a non-terminating agent-side inbox
+watcher:
+
+- In Codex Desktop, create a thread scheduled task that returns to the existing
+  chat.
+- In Claude Code on Desktop, use a self-paced `/loop <prompt>` without a fixed
+  interval by default. It can lengthen quiet waits, use Monitor instead of
+  polling, and stop itself.
+
+Start recurrence only for explicitly requested unattended work with an active
+task or handoff. Use the slowest cadence that satisfies the coordination
+latency. Without a client-native background monitor, each run should check the
+plain inbox first and stop immediately when there is no actionable change. It
+should load repository context, run tests, or invoke other agents only after
+finding work.
+
+Stop recurrence when the shared work completes, progress is blocked, a peer
+sends an explicit stop, or the idle-run budget is exhausted. Unless a task
+specifies another budget, stop after three consecutive idle runs. This keeps
+both model usage and repeated repository reads bounded.
+
+When both clients use the same checkout, set `SHUTTLE_AGENT=codex` for Codex
+CLI writes and `SHUTTLE_AGENT=claude` for Claude CLI writes. A shared
+repo-local identity cannot distinguish simultaneous clients.
+
 ## Recommended Roles
 
 Use one shared task when both agents need the same context. Let the active

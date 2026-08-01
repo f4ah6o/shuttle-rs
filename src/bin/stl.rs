@@ -1836,7 +1836,7 @@ struct SkillInstallOutput {
 #[derive(Debug, Serialize)]
 struct SkillPrintOutput {
     target: String,
-    content: &'static str,
+    content: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -2226,10 +2226,12 @@ fn home_dir() -> Result<PathBuf> {
         .context("HOME is not set")
 }
 
-fn skill_content(target: SkillTarget) -> &'static str {
-    match target {
-        SkillTarget::Codex | SkillTarget::Claude => SHUTTLE_SKILL,
-    }
+fn skill_content(target: SkillTarget) -> String {
+    let recurring_collaboration = match target {
+        SkillTarget::Codex => CODEX_RECURRING_COLLABORATION,
+        SkillTarget::Claude => CLAUDE_RECURRING_COLLABORATION,
+    };
+    format!("{SHUTTLE_SKILL}{recurring_collaboration}")
 }
 
 const SHUTTLE_SKILL: &str = r#"---
@@ -2283,7 +2285,10 @@ stl identity current
 - At session start, run `stl context`, `stl inbox`, and `stl task list`.
 - During work, use `stl send <agent> "<message>"` for transient coordination.
 - At session end, run `stl inbox` again and update tasks or handoffs.
-- For polling delivery, run `stl inbox --watch` in a separate terminal.
+- Use `stl inbox --watch` only in a human-visible terminal or through a client-native background monitor that does not hold an agent turn open. Do not run this non-terminating command directly inside a recurring prompt.
+- Start recurring monitoring only for explicitly requested unattended work with an active task or handoff.
+- On an idle recurrence, do not inspect the repository, run tests, spawn agents, or send a no-op message.
+- Stop recurring monitoring when shared work completes, progress is blocked, an explicit stop arrives, or the idle budget is exhausted. Unless the task says otherwise, use three consecutive idle runs as the budget.
 - Promote important message outcomes with `stl decide --from-message <message-id>`, `stl task create --from-message <message-id>`, or `stl handoff request <agent> --from-message <message-id>`.
 
 ## MCP
@@ -2304,6 +2309,36 @@ stl identity current
 - Check local services with `launchctl list | rg 'shuttle-gateway'` when using LaunchAgents.
 - Check tunnel status with `cloudflared tunnel info <tunnel-name>`.
 - Do not print local admin token files or token environment values.
+"#;
+
+const CODEX_RECURRING_COLLABORATION: &str = r#"
+
+## Codex Desktop recurring collaboration
+
+- Prefer a thread scheduled task over a shell sleep loop so each check returns to the same chat with its existing context.
+- Choose the slowest cadence that meets the active handoff's latency requirement. Use a five-minute interval only while fast coordination is useful.
+- At the start of each scheduled run, read only the compact `stl inbox --agent codex` output and compare it with the last inbox snapshot handled in the chat. Request JSON only when an actionable event ID is needed.
+- If there is no actionable message or known active assignment, end the run immediately without loading broader context.
+- When work is actionable, run `stl context` and `stl task list`, announce the intended task and paths, complete one bounded unit, verify it, and send the peer a concise result.
+- Attribute CLI writes with `SHUTTLE_AGENT=codex`; do not rely on a shared repo-local identity when another client uses the same checkout.
+- Do not use an unbounded `sleep` or `while` loop. A short sleep of at most 60 seconds is only for bounded waiting inside an active turn.
+- Pause or stop the scheduled task after completion, a blocker, an explicit stop message, or three consecutive idle runs unless the task specifies a different budget.
+- Invoke `$shuttle` explicitly in the scheduled-task prompt when automatic skill selection would be ambiguous.
+"#;
+
+const CLAUDE_RECURRING_COLLABORATION: &str = r#"
+
+## Claude Code recurring collaboration
+
+- Prefer a self-paced `/loop <prompt>` with no fixed interval for explicitly requested local recurring collaboration. It can lengthen quiet waits, use Monitor instead of polling, and stop itself when work is complete.
+- For example: `/loop Use the shuttle skill to continue active collaboration work. Wait longer when the inbox is quiet, and stop the loop after completion, a blocker, an explicit stop, or three consecutive idle checks.`
+- If the loop chooses the Monitor tool, let Monitor own `stl inbox --agent claude --watch` as a background stream and do not schedule a second inbox poll.
+- When no Monitor is active, start each loop run by reading only the plain `stl inbox --agent claude` output and comparing it with the last inbox snapshot handled in the session. Request JSON only when an actionable event ID is needed.
+- If there is no actionable message or known active assignment, end the run immediately without loading broader context.
+- When work is actionable, run `stl context` and `stl task list`, announce the intended task and paths, complete one bounded unit, verify it, and send the peer a concise result.
+- Attribute CLI writes with `SHUTTLE_AGENT=claude`; do not rely on a shared repo-local identity when another client uses the same checkout.
+- Use a fixed interval only when the task explicitly requires it; fixed loops cannot stop themselves before expiry.
+- In self-paced mode, call `ScheduleWakeup` with `stop: true` after completion, a blocker, an explicit stop message, or three consecutive idle checks unless the task specifies another budget.
 "#;
 
 fn append_typed_memory(
@@ -2784,10 +2819,15 @@ mod tests {
         assert!(content.contains("name: shuttle"));
         assert!(content.contains("stl context"));
         assert!(content.contains("SHUTTLE_OAUTH_ADMIN_TOKEN"));
+        assert!(content.contains("thread scheduled task"));
+        assert!(content.contains("$shuttle"));
+        assert!(!content.contains("Claude Code recurring collaboration"));
+        assert!(!content.contains("ScheduleWakeup"));
+        assert!(!content.contains("/loop 5m"));
     }
 
     #[test]
-    fn claude_skill_install_uses_shared_workflow_instructions() {
+    fn claude_skill_install_adds_bounded_loop_instructions() {
         let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         env::set_var("HOME", dir.path());
@@ -2806,6 +2846,14 @@ mod tests {
         assert_eq!(install.path, path.display().to_string());
         assert!(content.contains("stl workflow status"));
         assert!(content.contains("needs_reconcile"));
+        assert!(content.contains("/loop Use the shuttle skill"));
+        assert!(content.contains("SHUTTLE_AGENT=claude"));
+        assert!(content.contains("ScheduleWakeup"));
+        assert!(content.contains("Monitor"));
+        assert!(!content.contains("Codex Desktop recurring collaboration"));
+        assert!(!content.contains("thread scheduled task"));
+        assert!(!content.contains("/loop 5m"));
+        assert!(!content.contains("$shuttle"));
     }
 
     #[test]

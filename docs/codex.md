@@ -44,9 +44,39 @@ Use messages for transient agent-to-agent communication:
 
 ```bash
 stl send claude "Please review the latest diff"
+stl inbox
 stl inbox --watch
 stl history
 ```
+
+`stl inbox --watch` is useful when a person is watching a terminal. Do not put
+the non-terminating command inside a recurring agent run.
+
+## Recurring Collaboration
+
+For explicitly requested unattended collaboration in Codex Desktop, prefer a
+[scheduled task inside the existing
+chat](https://learn.chatgpt.com/docs/automations#schedule-a-task-inside-a-chat)
+over an unbounded shell `sleep` loop. Returning to the same chat preserves the
+handled inbox snapshot and active task context.
+
+Use the slowest cadence that meets the handoff latency requirement. A
+five-minute interval is appropriate only while fast coordination is useful.
+Start each run with the compact `stl inbox --agent codex` output. If it has no
+actionable change and there is no known active assignment, end the run without
+loading repository context, running tests, spawning agents, or sending a no-op
+message. Request JSON only when an actionable event ID is needed.
+
+When work is available, load `stl context` and `stl task list`, tell the peer
+which task and paths Codex intends to touch, complete and verify one bounded
+unit, then send a concise result. Use `SHUTTLE_AGENT=codex` for CLI writes when
+another client shares the checkout. Pause or stop the scheduled task after
+completion, a blocker, an explicit stop, or three consecutive idle runs unless
+the task specifies another budget. Invoke `$shuttle` explicitly in the
+scheduled-task prompt when needed.
+
+Use a shell `sleep` only for a bounded wait of at most 60 seconds inside an
+active turn.
 
 Use handoffs when another agent should continue:
 
