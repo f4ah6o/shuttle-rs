@@ -2103,19 +2103,27 @@ async fn oauth_token(
     let GatewayAuth::OAuth(oauth) = &runtime.auth else {
         return oauth_not_configured();
     };
-    if request.grant_type != "authorization_code" {
-        return oauth_error(
+    match request.grant_type.as_str() {
+        "authorization_code" => match oauth.store.exchange_code(request) {
+            Ok(token) => Json(token).into_response(),
+            Err(_) => oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                "authorization code is invalid, expired, or already used",
+            ),
+        },
+        "refresh_token" => match oauth.store.refresh_token(request) {
+            Ok(token) => Json(token).into_response(),
+            Err(_) => oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                "refresh token is invalid, expired, already used, or revoked",
+            ),
+        },
+        _ => oauth_error(
             StatusCode::BAD_REQUEST,
             "unsupported_grant_type",
-            "grant_type must be authorization_code",
-        );
-    }
-    match oauth.store.exchange_code(request) {
-        Ok(token) => Json(token).into_response(),
-        Err(_) => oauth_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_grant",
-            "authorization code is invalid, expired, or already used",
+            "grant_type must be authorization_code or refresh_token",
         ),
     }
 }
@@ -2134,7 +2142,10 @@ async fn oauth_revoke(
             "token is required",
         );
     }
-    match oauth.store.revoke_access_token(&request.token) {
+    match oauth
+        .store
+        .revoke_token(&request.token, request.token_type_hint.as_deref())
+    {
         Ok(_) => StatusCode::OK.into_response(),
         Err(_) => oauth_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3099,7 +3110,29 @@ mod tests {
         assert_eq!(token.status(), StatusCode::OK);
         let body = token.into_body().collect().await.unwrap().to_bytes();
         let token: Value = serde_json::from_slice(&body).unwrap();
-        let access_token = token["access_token"].as_str().unwrap();
+        let refresh_token = token["refresh_token"].as_str().unwrap().to_owned();
+
+        // A refresh request carries no redirect_uri, so this also covers form
+        // extraction for the grant that omits it.
+        let refresh_form =
+            format!("grant_type=refresh_token&client_id={client_id}&refresh_token={refresh_token}");
+        let refreshed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/oauth/token")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(refresh_form))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refreshed.status(), StatusCode::OK);
+        let body = refreshed.into_body().collect().await.unwrap().to_bytes();
+        let refreshed: Value = serde_json::from_slice(&body).unwrap();
+        assert_ne!(refreshed["refresh_token"], token["refresh_token"]);
+        let access_token = refreshed["access_token"].as_str().unwrap();
 
         let unauthorized = app
             .clone()
