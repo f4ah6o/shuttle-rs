@@ -3,7 +3,7 @@ name: Publish
 on:
   push:
     tags:
-      - 'v*'
+      - latest
 
 env:
   CARGO_TERM_COLOR: always
@@ -11,7 +11,18 @@ env:
   GH_REPO: ${{ github.repository }}
 
 jobs:
+  release:
+    permissions:
+      contents: write
+      id-token: write
+    uses: f4ah6o/calver-action/.github/workflows/rust-crate.yaml@ed77f35391c8a334e420974bb7983b0a13fc5deb
+    with:
+      format: YYYY.MM.PATCH
+      timezone: Asia/Tokyo
+      legacy_prefixes: v
+
   create-release:
+    needs: release
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -19,62 +30,20 @@ jobs:
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+          SOURCE_SHA: ${{ needs.release.outputs.source_sha }}
         run: |
-          if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release create "${GITHUB_REF_NAME}" \
-              --title "${GITHUB_REF_NAME}" \
-              --notes "Shuttle release artifacts for ${GITHUB_REF_NAME}." || \
-              gh release view "${GITHUB_REF_NAME}" >/dev/null
+          if ! gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release create "${RELEASE_TAG}" \
+              --title "${RELEASE_TAG}" \
+              --notes "Shuttle release artifacts for ${RELEASE_TAG} (source ${SOURCE_SHA})." || \
+              gh release view "${RELEASE_TAG}" >/dev/null
           fi
-
-  publish:
-    needs: create-release
-    runs-on: ubuntu-latest
-    environment: publish
-    permissions:
-      id-token: write
-      contents: read
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-
-      - uses: swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
-
-      - uses: rust-lang/crates-io-auth-action@bbd81622f20ce9e2dd9622e3218b975523e45bbe # v1.0.4
-        id: auth
-
-      - name: Check version with cargo search
-        id: check
-        shell: bash
-        run: |
-          NAME=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "shuttle-rs") | .name')
-          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "shuttle-rs") | .version')
-
-          echo "Checking logic for: $NAME = \"$VERSION\""
-          SEARCH_RESULT=$(CARGO_TERM_COLOR=never cargo search "$NAME" --limit 1)
-
-          if echo "$SEARCH_RESULT" | grep -E -q "^$NAME\s*=\s*\"$VERSION\""; then
-            echo "::notice::Version $VERSION is already published on crates.io. Skipping all subsequent steps."
-            echo "should_publish=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::Version $VERSION not found on crates.io. Proceeding."
-            echo "should_publish=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Run tests
-        if: steps.check.outputs.should_publish == 'true'
-        run: cargo test --package shuttle-rs --all-targets --verbose
-
-      - name: Publish
-        if: steps.check.outputs.should_publish == 'true'
-        run: cargo publish --package shuttle-rs
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
   gateway-lxc-archives:
-    needs: create-release
+    needs:
+      - release
+      - create-release
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -86,6 +55,8 @@ jobs:
           - aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ needs.release.outputs.tag }}
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -124,4 +95,5 @@ jobs:
       - name: Upload LXC archive
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${GITHUB_REF_NAME}" "dist/shuttle-gateway-lxc-${{ matrix.target }}.tar.gz" --clobber
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+        run: gh release upload "${RELEASE_TAG}" "dist/shuttle-gateway-lxc-${{ matrix.target }}.tar.gz" --clobber
