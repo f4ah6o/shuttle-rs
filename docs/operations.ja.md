@@ -12,7 +12,13 @@ optional backend の外部 probe で startup を無期限に待つことはあ�
 request を drain します。drain の上限は SHUTTLE_SHUTDOWN_TIMEOUT_SECS で設定でき、
 default は 30 秒です。request と backend operation の trace metadata は bounded にし、
 bearer token、authorization header、event content、repository path、OAuth code、
-verifier value は span field に記録しません。
+refresh token、verifier value は span field に記録しません。
+
+消費済みの OAuth refresh token が grace window を過ぎて再提示されると、その authorization
+から派生した token をまとめて revoke し、warn level の log を 1 行出力します。
+この log の field は client_id と family_id だけで、token 値も digest も含みません。
+同じ client の再認可が繰り返し記録される場合は、client 側に古い refresh token が残っている
+か、token が漏洩している可能性があります。
 
 local database には stl db status、stl db check、stl db backup <path> を使います。
 backup は既存の destination を上書きしません。

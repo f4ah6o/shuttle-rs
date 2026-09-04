@@ -4,9 +4,13 @@
 
 ### Added
 
+- Added the OAuth `refresh_token` grant to `stl serve --public-url` and to gateway listeners with `auth = "oauth"`, so an MCP client renews its access token without a second owner approval. Exchanging an authorization code now also returns a refresh token, and the authorization-server metadata advertises `refresh_token` in `grant_types_supported`.
+
 ### Changed
 
 - `stl skill install codex` and `stl skill install claude` now add client-specific, token-bounded recurring collaboration guidance for Codex scheduled tasks and Claude Code `/loop`.
+- `POST /oauth/token` accepts a request without `redirect_uri`, which the refresh grant does not send. A missing `redirect_uri` in an authorization-code request is now reported as an OAuth `invalid_grant` response instead of a form-extraction failure.
+- `POST /oauth/revoke` revokes every access token that belongs to the same authorization when it is given a refresh token. An access token still revokes only itself.
 
 ### Fixed
 
@@ -16,7 +20,11 @@
 
 ### Security
 
+- Refresh tokens rotate on every use and are stored as digests. A consumed refresh token presented more than 30 seconds after its consumption is treated as theft and revokes every refresh token and access token derived from that authorization, with one warn-level log line carrying only `client_id` and `family_id`.
+
 ### Migration
+
+- The OAuth database schema moves from version 3 to version 4 on first open, adding `oauth_refresh_tokens` and a `family_id` column on `oauth_tokens`. The upgrade runs automatically for `stl serve` and for each gateway listener database. Access tokens issued before the upgrade keep working until they expire, but they belong to no authorization family, so revoking a refresh token does not reach them.
 
 ## 2026.7.0 - 2026-07-23
 

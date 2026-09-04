@@ -750,19 +750,27 @@ async fn oauth_token(
     let Some(oauth) = runtime.oauth else {
         return oauth_not_configured();
     };
-    if request.grant_type != "authorization_code" {
-        return oauth_error(
+    match request.grant_type.as_str() {
+        "authorization_code" => match oauth.store.exchange_code(request) {
+            Ok(token) => Json(token).into_response(),
+            Err(_) => oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                "authorization code is invalid, expired, or already used",
+            ),
+        },
+        "refresh_token" => match oauth.store.refresh_token(request) {
+            Ok(token) => Json(token).into_response(),
+            Err(_) => oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                "refresh token is invalid, expired, already used, or revoked",
+            ),
+        },
+        _ => oauth_error(
             StatusCode::BAD_REQUEST,
             "unsupported_grant_type",
-            "grant_type must be authorization_code",
-        );
-    }
-    match oauth.store.exchange_code(request) {
-        Ok(token) => Json(token).into_response(),
-        Err(_) => oauth_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_grant",
-            "authorization code is invalid, expired, or already used",
+            "grant_type must be authorization_code or refresh_token",
         ),
     }
 }
@@ -783,7 +791,10 @@ async fn oauth_revoke(
     }
     // RFC 7009 deliberately returns success for unknown tokens so this
     // endpoint cannot be used to enumerate credentials.
-    match oauth.store.revoke_access_token(&request.token) {
+    match oauth
+        .store
+        .revoke_token(&request.token, request.token_type_hint.as_deref())
+    {
         Ok(_) => StatusCode::OK.into_response(),
         Err(_) => oauth_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1019,6 +1030,10 @@ mod tests {
     }
 
     fn issue_access_token(oauth: &OAuthRuntime) -> String {
+        issue_grant(oauth).1.access_token
+    }
+
+    fn issue_grant(oauth: &OAuthRuntime) -> (String, oauth::TokenResponse) {
         let verifier = "abc123abc123abc123abc123abc123abc123abc123abc123";
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         let client = oauth
@@ -1040,17 +1055,19 @@ mod tests {
                 code_challenge_method: Some("S256".to_owned()),
             })
             .unwrap();
-        oauth
+        let response = oauth
             .store
             .exchange_code(oauth::TokenRequest {
                 grant_type: "authorization_code".to_owned(),
-                client_id: client.client_id,
-                redirect_uri: "https://client.example.test/callback".to_owned(),
+                client_id: client.client_id.clone(),
+                redirect_uri: Some("https://client.example.test/callback".to_owned()),
                 code: Some(code),
                 code_verifier: Some(verifier.to_owned()),
+                refresh_token: None,
+                scope: None,
             })
-            .unwrap()
-            .access_token
+            .unwrap();
+        (client.client_id, response)
     }
 
     async fn request(
@@ -1168,6 +1185,65 @@ mod tests {
         assert!(location.contains("&state=state-123"));
         assert!(!location.contains("&iss="));
         assert!(!location.contains("?iss="));
+    }
+
+    #[tokio::test]
+    async fn oauth_token_endpoint_refreshes_without_a_redirect_uri() {
+        let oauth = oauth_runtime();
+        let (client_id, granted) = issue_grant(&oauth);
+        let body = format!(
+            "grant_type=refresh_token&client_id={client_id}&refresh_token={}",
+            granted.refresh_token
+        );
+
+        let response = router(runtime(Some(oauth)))
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/oauth/token")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let refreshed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_ne!(
+            refreshed["refresh_token"].as_str().unwrap(),
+            granted.refresh_token
+        );
+        assert!(refreshed["access_token"]
+            .as_str()
+            .unwrap()
+            .starts_with("stl_"));
+    }
+
+    #[tokio::test]
+    async fn oauth_token_endpoint_rejects_an_unsupported_grant() {
+        let oauth = oauth_runtime();
+        let (client_id, _) = issue_grant(&oauth);
+
+        let response = router(runtime(Some(oauth)))
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/oauth/token")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(format!(
+                        "grant_type=client_credentials&client_id={client_id}"
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["error"], "unsupported_grant_type");
     }
 
     #[tokio::test]

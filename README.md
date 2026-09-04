@@ -300,13 +300,28 @@ curl -X POST http://127.0.0.1:8788/api/projects \
 
 Gateway OCI images and LXC archives are published through GitHub Releases.
 
-OAuth client registrations, authorization codes, and access tokens are stored in
-gateway-local SQLite databases. Dynamic registration is disabled by default;
-redirect URIs must be exact HTTPS matches (loopback HTTP is the only exception).
-Access-token digests are stored instead of bearer values, and
-POST /oauth/revoke supports token revocation. Backend tokens and OAuth admin
-tokens should be provided by a secret manager or runtime-injected environment
-variables.
+OAuth client registrations, authorization codes, access tokens, and refresh
+tokens are stored in gateway-local SQLite databases. Dynamic registration is
+disabled by default; redirect URIs must be exact HTTPS matches (loopback HTTP is
+the only exception). Digests are stored instead of the bearer values of access
+tokens and refresh tokens. Backend tokens and OAuth admin tokens should be
+provided by a secret manager or runtime-injected environment variables.
+
+Exchanging an authorization code issues an access token that expires in 3600
+seconds together with a refresh token. POST /oauth/token with
+`grant_type=refresh_token`, `client_id`, and `refresh_token` returns a new access
+token and a new refresh token. Every use rotates the refresh token and moves its
+expiry 30 days ahead of the rotation. The access token issued before a rotation
+stays usable until its own expiry.
+
+Presenting a consumed refresh token within 30 seconds of its consumption returns
+`invalid_grant` and nothing else, so concurrent requests and client retries do
+not break the connection. A later presentation is treated as theft and revokes
+every refresh token and access token derived from that authorization.
+
+POST /oauth/revoke revokes a token. A refresh token revokes everything that
+belongs to the same authorization, including its access tokens; an access token
+revokes only itself.
 
 Pull the OCI image from GHCR.
 
