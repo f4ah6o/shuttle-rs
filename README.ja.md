@@ -300,12 +300,28 @@ curl -X POST http://127.0.0.1:8788/api/projects \
 
 Gateway の OCI image と LXC archive は GitHub Releases から配布されます。
 
-OAuth client registration、authorization code、access token は gateway-local SQLite database
-に保存されます。dynamic registration は default で無効で、redirect URI は exact な HTTPS
-match（loopback の HTTP だけ例外）でなければなりません。bearer value の代わりに
-access-token digest を保存し、POST /oauth/revoke で token を revoke できます。backend
-token と OAuth admin token は secret manager または runtime-injected environment variable
-で渡してください。
+OAuth client registration、authorization code、access token、refresh token は gateway-local
+SQLite database に保存されます。
+dynamic registration は default で無効で、redirect URI は exact な HTTPS match（loopback の
+HTTP だけ例外）でなければなりません。
+bearer value ではなく access token と refresh token の digest を保存します。
+backend token と OAuth admin token は secret manager または runtime-injected environment
+variable で渡してください。
+
+authorization code を交換すると、有効期限 3600 秒の access token と refresh token を発行します。
+`grant_type=refresh_token` に client_id と refresh_token を付けて POST /oauth/token を呼ぶと、
+新しい access token と新しい refresh token を取得できます。
+refresh token は使用のたびに rotate し、有効期限は rotate 時点から 30 日先へ更新されます。
+rotate 前の access token は自身の有効期限まで使えます。
+
+消費済みの refresh token を再提示した場合、消費から 30 秒以内であれば `invalid_grant` を返す
+だけで、同時実行や client の再送で接続が切れることはありません。
+30 秒を過ぎてからの再提示は盗用とみなし、その authorization から派生した refresh token と
+access token をすべて revoke します。
+
+POST /oauth/revoke は token を revoke します。
+refresh token を渡すと同じ authorization に属する access token も含めて revoke し、access
+token を渡すとその access token だけを revoke します。
 
 OCI image は GHCR から取得できます。
 
