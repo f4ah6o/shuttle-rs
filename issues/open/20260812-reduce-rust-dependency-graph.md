@@ -102,3 +102,7 @@ workspaceに存在する `crates/stl` と各機能crateを基準に、root packa
 4. default featureと重複versionを整理する。
 5. workspace全体のテストを実行する。
 6. before/afterを記録する。
+
+## 再確認メモ
+
+- 2026-10-09: main @ 1219bb9 で再確認。root package の `opentelemetry*` / `tracing-opentelemetry` は依然 non-optional で `[features]` も未導入、`stl` / `shuttle-gateway` 両binの依存をrootが再集約したまま。引き続き open。
