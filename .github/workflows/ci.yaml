@@ -74,7 +74,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - uses: taiki-e/install-action@56c23531d03535d1d1a6d4e6bfa2b2a773f69fac # v2
+      - uses: taiki-e/install-action@899b013517f9e7774591216672bf75a46bb9a481 # v2.9.4
         with:
           tool: cargo-binstall
       - run: cargo binstall -y --locked cargo-deny@0.19.4
