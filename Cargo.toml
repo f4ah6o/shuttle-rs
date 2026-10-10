@@ -3,7 +3,7 @@ members = ["crates/*"]
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.99"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/f4ah6o/shuttle-rs"
 
@@ -27,7 +27,7 @@ url = "=2.5.4"
 name = "shuttle-rs"
 version = "2026.7.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.99"
 description = "Local-first event log CLI for agent memory, repository context, task coordination, handoffs, messaging, mesh sync, and MCP access."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/f4ah6o/shuttle-rs"
