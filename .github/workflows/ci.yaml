@@ -76,6 +76,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: taiki-e/install-action@899b013517f9e7774591216672bf75a46bb9a481 # v2.9.4
         with:
-          tool: cargo-binstall
+          tool: cargo-binstall@1.25.2  # install-action resolves latest tag to stale 0.23.1
       - run: cargo binstall -y --locked cargo-deny@0.19.4
       - run: cargo deny check advisories licenses bans sources
